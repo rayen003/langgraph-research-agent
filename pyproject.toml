@@ -1,0 +1,31 @@
+[project]
+name = "lca-reliable-agents"
+version = "0.1.0"
+description = "LangChain Academy: Building Reliable Agents"
+readme = "README.md"
+requires-python = ">=3.12, <=3.13"
+dependencies = [
+    "anthropic",
+    "langsmith>=0.6.0",
+    "langsmith-fetch>=0.3.1",
+    "python-dotenv>=1.0.0",
+    "numpy>=1.24.0",
+    "openai>=2.14.0",
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langchain-tavily>=0.2.0",
+    "rich>=13.0.0",
+    "simpleeval>=1.0.0",
+    "pyppeteer>=2.0.0",
+    "daytona>=0.26.0",
+    "matplotlib>=3.10.8",
+    "fastapi>=0.135.1",
+    "uvicorn[standard]>=0.42.0",
+    "chainlit>=2.10.0",
+    "pandas>=3.0.1",
+    "requests>=2.32.5",
+    "yfinance>=0.2.58",
+    "pytz>=2026.1.post1",
+]

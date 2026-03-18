@@ -1,0 +1,253 @@
+.perplexity-plan-card,
+.perplexity-tracker {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(24, 24, 27, 0.78);
+  backdrop-filter: blur(12px);
+  border-radius: 26px;
+}
+
+.perplexity-card-muted {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.perplexity-status-pill {
+  border-radius: 14px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.perplexity-plan-step {
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 14px 16px;
+}
+
+.perplexity-tracker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.perplexity-tracker-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.perplexity-step-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  column-gap: 16px;
+}
+
+.perplexity-step-rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.perplexity-step-rail::before {
+  content: "";
+  position: absolute;
+  top: 16px;
+  bottom: -28px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.perplexity-step-row:last-child .perplexity-step-rail::before {
+  display: none;
+}
+
+.perplexity-step-node {
+  position: relative;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  margin-top: 8px;
+  background: rgba(255, 255, 255, 0.25);
+  box-shadow: 0 0 0 3px rgba(18, 18, 20, 0.9);
+}
+
+.perplexity-step-node.running {
+  background: #22c7df;
+  box-shadow:
+    0 0 0 3px rgba(18, 18, 20, 0.9),
+    0 0 0 6px rgba(34, 199, 223, 0.12);
+  animation: perplexity-pulse 1.8s ease-in-out infinite;
+}
+
+.perplexity-step-node.completed {
+  background: #22c7df;
+}
+
+.perplexity-step-node.failed {
+  background: #ef4444;
+}
+
+.perplexity-step-content {
+  min-width: 0;
+}
+
+.perplexity-step-sublabel {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 16px;
+  color: rgba(255, 255, 255, 0.48);
+}
+
+.perplexity-step-title {
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.perplexity-step-title.pending {
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.perplexity-step-title.running {
+  color: rgba(194, 241, 255, 0.96);
+}
+
+.perplexity-step-panel {
+  margin-top: 10px;
+}
+
+.perplexity-reasoning {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: rgba(255, 255, 255, 0.5);
+  font-style: italic;
+}
+
+.perplexity-tool-pill-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.perplexity-tool-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 13px;
+  line-height: 18px;
+  transition: all 180ms ease;
+  animation: perplexity-fade-up 180ms ease;
+}
+
+.perplexity-tool-pill.running {
+  border-color: rgba(34, 199, 223, 0.28);
+  background: rgba(34, 199, 223, 0.08);
+  color: rgba(203, 245, 255, 0.96);
+}
+
+.perplexity-tool-pill.done {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.perplexity-tool-pill.error {
+  border-color: rgba(239, 68, 68, 0.28);
+  background: rgba(239, 68, 68, 0.08);
+  color: rgba(254, 202, 202, 0.96);
+}
+
+.perplexity-tool-pill-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 16px;
+  color: rgba(255, 255, 255, 0.56);
+}
+
+.perplexity-tool-pill-detail {
+  margin-top: 8px;
+  margin-left: 18px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(0, 0, 0, 0.22);
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.perplexity-synthesis-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+@keyframes perplexity-pulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 3px rgba(18, 18, 20, 0.9),
+      0 0 0 6px rgba(34, 199, 223, 0.12);
+  }
+  50% {
+    transform: scale(1.08);
+    box-shadow:
+      0 0 0 3px rgba(18, 18, 20, 0.9),
+      0 0 0 9px rgba(34, 199, 223, 0.14);
+  }
+}
+
+@keyframes perplexity-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Plot polishing */
+.MuiBox-root img,
+.MuiCard-root img,
+.MuiPaper-root img {
+  max-width: min(820px, 92vw);
+  width: 100%;
+  height: auto;
+}
+
+/* Try to center image-only assistant messages */
+[data-testid="message"] img,
+[class*="message"] img {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+  border-radius: 12px;
+}
