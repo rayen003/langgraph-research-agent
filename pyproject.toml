@@ -28,4 +28,5 @@ dependencies = [
     "requests>=2.32.5",
     "yfinance>=0.2.58",
     "pytz>=2026.1.post1",
+    "trafilatura>=2.0.0",
 ]

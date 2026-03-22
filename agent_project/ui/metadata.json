@@ -1,0 +1,5 @@
+{
+  "name": "Research Agent",
+  "description": "A conversational AI research agent with multi-step execution visualization.",
+  "requestFramePermissions": []
+}

@@ -1,135 +1,19 @@
-"""Shared utilities for persistence and streaming-friendly rich formatting."""
+"""Rich console formatting helpers."""
 
 import json
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
-from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-console = Console()
-BASE_DIR = Path(__file__).parent
-RUNS_DIR = BASE_DIR / "runs"
-RUNS_DIR.mkdir(exist_ok=True)
+from utils.persistence import console
 
 TOOL_OUTPUT_MAX_LEN = 1000
 TOOL_CALL_ARGS_MAX_LEN = 180
 
-_current_thread_id: str | None = None
-
-# ---------------------------------------------------------------------------
-# UI event hooks (consumed by Chainlit / other frontends)
-# ---------------------------------------------------------------------------
-
-_ui_event_handler: Any = None
-
-
-def set_ui_event_handler(handler: Any) -> None:
-    """Register a callback that receives fine-grained execution events."""
-    global _ui_event_handler  # noqa: PLW0603
-    _ui_event_handler = handler
-
-
-def emit_ui_event(event: dict) -> None:
-    """Fire an event to the registered UI handler, if any."""
-    handler = _ui_event_handler
-    if handler is not None:
-        try:
-            handler(event)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def set_thread_id(thread_id: str) -> Path:
-    """Set the active thread and create its run directory structure."""
-    global _current_thread_id  # noqa: PLW0603
-    _current_thread_id = thread_id
-    run_dir = RUNS_DIR / thread_id
-    (run_dir / "tool_results").mkdir(parents=True, exist_ok=True)
-    (run_dir / "context_items").mkdir(parents=True, exist_ok=True)
-    (run_dir / "plans").mkdir(parents=True, exist_ok=True)
-    (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
-    return run_dir
-
-
-def get_run_dir() -> Path:
-    if _current_thread_id is None:
-        fallback = RUNS_DIR / "_default"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-    return RUNS_DIR / _current_thread_id
-
-
-def save_plan(plan: dict) -> str:
-    plans_dir = get_run_dir() / "plans"
-    plans_dir.mkdir(parents=True, exist_ok=True)
-    path = plans_dir / f"{plan['plan_id']}.json"
-    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
-    return str(path)
-
-
-def get_artifacts_dir() -> Path:
-    artifacts_dir = get_run_dir() / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    return artifacts_dir
-
-
-def save_artifact_file(remote_path: str, content: bytes) -> str:
-    """Persist a downloaded sandbox artifact into the active run directory."""
-    artifacts_dir = get_artifacts_dir()
-    safe_name = remote_path.strip("/").replace("/", "_") or f"artifact_{uuid4().hex[:8]}"
-    destination = artifacts_dir / safe_name
-    if destination.exists():
-        destination = artifacts_dir / f"{destination.stem}_{uuid4().hex[:6]}{destination.suffix}"
-    destination.write_bytes(content)
-    return str(destination)
-
-
-def list_artifact_paths() -> list[str]:
-    """List artifacts relative to the run directory for markdown linking."""
-    run_dir = get_run_dir()
-    artifacts_dir = get_artifacts_dir()
-    return sorted(str(path.relative_to(run_dir)) for path in artifacts_dir.iterdir() if path.is_file())
-
-
-def save_final_report(markdown: str) -> str:
-    path = get_run_dir() / "final_report.md"
-    path.write_text(markdown, encoding="utf-8")
-    return str(path)
-
-
-def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -> str:
-    result_id = f"{tool_name}_{uuid4().hex[:12]}"
-    tool_dir = get_run_dir() / "tool_results"
-    tool_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "tool_result_id": result_id,
-        "tool_name": tool_name,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "args": args,
-        "summary": summary,
-        "result": result,
-    }
-    file_path = tool_dir / f"{result_id}.json"
-    file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    return json.dumps(
-        {
-            "tool_result_id": result_id,
-            "tool_name": tool_name,
-            "summary": summary,
-            "stored_at": str(file_path),
-            "hint": "Call retrieve_tool_result with this tool_result_id to read the full content.",
-        },
-        ensure_ascii=False,
-    )
-
 
 def format_tool_call(tool_name: str, args: dict) -> None:
-    """Print a compact tool-call trace line."""
     args_str = json.dumps(args, ensure_ascii=False)
     if len(args_str) > TOOL_CALL_ARGS_MAX_LEN:
         args_str = args_str[:TOOL_CALL_ARGS_MAX_LEN] + "..."
@@ -137,7 +21,6 @@ def format_tool_call(tool_name: str, args: dict) -> None:
 
 
 def format_tool_result(result_str: str) -> None:
-    """Print a compact tool-result trace line. For retrieve_tool_result, show content snippet."""
     try:
         payload = json.loads(result_str)
     except (json.JSONDecodeError, TypeError):
@@ -146,7 +29,6 @@ def format_tool_result(result_str: str) -> None:
         short = str(result_str).strip().replace("\n", " ")[:200]
         console.print(f"  [dim]  ↳ {short}{'...' if len(result_str) > 200 else ''}[/dim]")
         return
-    # Full retrieval (has "result" field) — show content snippet so user sees retrieval worked
     if "result" in payload:
         raw = payload.get("result", "")
         if isinstance(raw, str):
@@ -155,7 +37,6 @@ def format_tool_result(result_str: str) -> None:
         else:
             console.print(f"  [dim]  ↳ [green]Retrieved:[/green] {str(raw)[:200]}...[/dim]")
         return
-    # Pointer (summary + stored_at)
     summary = payload.get("summary", "")
     stored = payload.get("stored_at", "")
     console.print(f"  [dim]  ↳ {summary}[/dim]")
@@ -164,7 +45,6 @@ def format_tool_result(result_str: str) -> None:
 
 
 def format_tool_error(tool_name: str, error: str) -> None:
-    """Print a tool error trace line."""
     console.print(f"  [red]  ✗ {tool_name} error: {error}[/red]")
 
 
@@ -206,7 +86,6 @@ def _format_tool_pointer(payload: dict) -> str | None:
 
 
 def format_message_content(message: BaseMessage | dict) -> str:
-    """Convert message content to a compact, streaming-friendly display string."""
     parts: list[str] = []
     tool_calls_processed = False
 
@@ -257,7 +136,6 @@ def format_message_content(message: BaseMessage | dict) -> str:
 
 
 def format_messages(messages: list[BaseMessage] | BaseMessage | list[dict] | dict) -> None:
-    """Format and display message(s) with role-aware styling."""
     if not isinstance(messages, list):
         messages = [messages]
     for message in messages:
@@ -309,7 +187,6 @@ _PLAN_STATUS_COLOR = {
 
 
 def format_plan(plan: dict) -> None:
-    """Display a plan with Rich formatting, colour-coded by step status."""
     if not plan:
         return
 
@@ -354,7 +231,6 @@ def format_plan(plan: dict) -> None:
 
 
 def show_prompt(prompt_text: str, title: str = "Prompt", border_style: str = "blue") -> None:
-    """Display a prompt in a Rich panel with lightweight syntax highlighting."""
     formatted = Text(prompt_text)
     formatted.highlight_regex(r"<[^>]+>", style="bold blue")
     formatted.highlight_regex(r"##[^#\n]+", style="bold magenta")
@@ -367,60 +243,6 @@ def show_prompt(prompt_text: str, title: str = "Prompt", border_style: str = "bl
             padding=(1, 2),
         )
     )
-
-
-def has_pending_steps(plan: dict | None) -> bool:
-    if not plan:
-        return False
-    return any(step["status"] == "pending" for step in plan["steps"])
-
-
-def get_next_pending_step(plan: dict) -> dict | None:
-    for step in plan["steps"]:
-        if step["status"] == "pending":
-            return step
-    return None
-
-
-def mark_step(plan: dict, step_id: str, status: str, result: str | None = None) -> dict:
-    for step in plan["steps"]:
-        if step["id"] == step_id:
-            step["status"] = status
-            if result is not None:
-                step["result"] = result
-            break
-    return plan
-
-
-def persist_context_item(
-    title: str,
-    content: str,
-    kind: str,
-    step_id: str | None = None,
-    tool_result_ids: list[str] | None = None,
-) -> dict:
-    """Persist full context content to disk and return stack metadata pointer."""
-    item_id = f"{kind}_{uuid4().hex[:12]}"
-    ctx_dir = get_run_dir() / "context_items"
-    ctx_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "context_item_id": item_id,
-        "kind": kind,
-        "title": title,
-        "step_id": step_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "content": content,
-        "tool_result_ids": tool_result_ids or [],
-    }
-    file_path = ctx_dir / f"{item_id}.json"
-    file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    return {
-        "context_item_id": item_id,
-        "kind": kind,
-        "title": title,
-        "step_id": step_id,
-        "stored_at": str(file_path),
-    }
 
 
 async def stream_agent(agent, query, config=None):

@@ -1,20 +1,23 @@
 # Agent Project — Living Document
 
 > **Purpose:** Single source of truth for architecture, decisions, and next steps.  
-> **Update policy:** Edit this file whenever a feature is completed or a decision changes.
+> **Update policy:** Edit this file whenever a feature is completed or a decision changes.  
+> **Guiding start:** Follow **Guiding roadmap** (below) for implementation order — planner → graph → financial tools / paper trading — with **no real money** and **free-first** data.
 
 ---
 
 ## Project Overview
 
-A LangGraph-based research agent with a plan-then-execute flow, human-in-the-loop (HITL) approval, local Python execution for charts/data fetching, and a Chainlit UI.
+A LangGraph-based agent with a plan-then-execute flow, human-in-the-loop (HITL) approval, local Python execution for charts/data fetching, and a React + FastAPI streaming UI.
+
+**Direction (evolving):** Move from **pure research** (text + citations) toward a **trading-style agent** that can take structured actions (paper orders, fundamentals, charts) and eventually proactive behaviors — always with **no real money** in dev (paper / simulation only) to stress-test **robustness** of the design.
 
 **Stack:**
 - **Orchestration:** LangGraph + LangChain
 - **Model:** OpenAI `gpt-5-nano` (easily swappable)
 - **Search:** Tavily (`search_web` tool)
 - **Python execution:** Local subprocess execution via `execute_python` (`pandas`/`matplotlib`/`requests`/`yfinance`)
-- **UI:** Chainlit 2.10 with custom React elements
+- **UI:** React 19 + Vite + Tailwind + Motion, backed by FastAPI SSE
 - **Package manager:** `uv`
 
 ---
@@ -24,16 +27,13 @@ A LangGraph-based research agent with a plan-then-execute flow, human-in-the-loo
 ```
 lca-reliable-agents/
 ├── agent_project/
-│   ├── file.py          # Core agent: graph, tools, prompts, nodes
-│   ├── utils.py         # Persistence helpers, Rich formatting, UI event hooks
-│   ├── app.py           # Chainlit entrypoint
-│   ├── server.py        # FastAPI backend (artifact serving, plan endpoint)
-│   ├── runs/            # Per-thread run dirs (plans, tool_results, artifacts)
-│   ├── chainlit.md      # Chainlit welcome message
-│   └── public/
-│       └── elements/
-│           ├── PlanCard.jsx     # Collapsible plan card custom element
-│           └── StepTracker.jsx  # Live vertical timeline custom element
+│   ├── agent/           # Graph, nodes, prompts, executor, state
+│   ├── tools/           # Tool modules and registry
+│   ├── memory/          # Session memory node(s)
+│   ├── utils/           # Persistence, formatting, UI event hooks
+│   ├── server.py        # FastAPI backend + SSE orchestration
+│   ├── ui/                # React/Vite frontend (Vite dev → proxies to FastAPI)
+│   └── runs/            # Per-thread run dirs (plans, tool_results, artifacts)
 ├── pyproject.toml       # uv dependencies
 └── AGENT_PROJECT.md     # ← this file
 ```
@@ -78,7 +78,8 @@ class AgentState(TypedDict):
 | `calculator` | Safe math eval via `simpleeval` |
 | `retrieve_context` | Look up a prior step's summary + tool_result_ids from saved plan |
 | `retrieve_tool_result` | Fetch full content of any stored tool result by ID |
-| `execute_python` | Run Python in Daytona sandbox; download artifacts (plots) |
+| `execute_python` | Run local Python for data fetching, analysis, and plot generation |
+| `fetch_url` | Fetch a specific URL, extract main text, and return a pointer |
 
 ### Persistence Layout (per thread)
 
@@ -92,26 +93,23 @@ runs/<thread_id>/
 
 ---
 
-## Chainlit UI
+## React UI
 
-### Custom React Elements (`public/elements/`)
+### Frontend (`agent_project/ui/`)
 
-**`PlanCard.jsx`**
-- Collapsible card: "Execution Plan" + step count badge
-- Status dot: draft (blue) → approved (green) → running (amber pulse) → completed (green)
-- Expands to show numbered step list with dependency annotations
+The React app uses:
+- React 19 + Vite + Tailwind + Motion
+- A Perplexity-style dark layout with:
+  - compact plan review card
+  - live step timeline
+  - nested tool-call rows
+  - streamed final markdown report
+  - inline artifact images served by FastAPI
 
-**`StepTracker.jsx`**
-- Processing-card layout inspired by modern agent UIs
-- Left-side `Step N` labels with color accents + larger right-hand step panels
-- Tool calls live inside each step block, vertically stacked with result summaries and expandable details
-- `args_preview` decoded to show query/expression inline (e.g., `→ "Apple latest news"`)
-- "Show/Hide reasoning" toggle — auto-collapses when report is ready
+### UI Event System (`utils/events.py`)
 
-### UI Event System (`utils.py`)
-
-`emit_ui_event(event)` is called from `file.py` at key points.  
-`set_ui_event_handler(callback)` registers the Chainlit async bridge.
+`emit_ui_event(event)` is called from `agent/executor.py` and `agent/nodes.py`.  
+`server.py` bridges those events into Server-Sent Events (SSE) for the React app.
 
 Events emitted:
 - `step_start` — step begins (step_id, description, index, total)
@@ -121,13 +119,14 @@ Events emitted:
 - `step_complete` — step done (step_id, result_preview, tool_result_ids)
 - `synthesis_start` / `synthesis_complete`
 
-### HITL Flow in app.py
+### HITL Flow
 
-1. `ainvoke` → hits `review_plan` interrupt → renders `PlanCard`
-2. `AskActionMessage` → Approve / Reject buttons
-3. On approve: `ainvoke(Command(resume=...))` via async event loop
-4. Async queue bridges sync graph events → `_process_event()` → `_update_element()` → React re-render
-5. Final report rendered with `cl.Image` elements for any artifacts
+1. `POST /runs` invokes the graph until `review_plan`
+2. Backend returns `{thread_id, plan}`
+3. React shows the draft plan and approval buttons
+4. `POST /runs/{thread_id}/resume` continues execution
+5. `GET /runs/{thread_id}/events` streams step/tool/report events over SSE
+6. React updates the step timeline and final report incrementally
 
 ---
 
@@ -135,13 +134,13 @@ Events emitted:
 
 - [x] Plan-then-execute flow with HITL approval
 - [x] Append-only context stack (Manus-inspired)
-- [x] All 5 tools functional
-- [x] Daytona sandbox for Python/matplotlib execution
+- [x] All current tools functional, including `fetch_url`
+- [x] Local Python execution for data + matplotlib
 - [x] Artifact download + final report as markdown
-- [x] Chainlit UI with live custom elements (PlanCard, StepTracker)
-- [x] Per-step blue highlighting + tool call streaming in UI
+- [x] React UI with plan review, step timeline, tool calls, and streamed report
+- [x] Per-step highlighting + tool call streaming in UI
 - [x] Show/Hide reasoning toggle after report completes
-- [x] FastAPI backend for artifact serving
+- [x] FastAPI backend for run orchestration, artifact serving, and SSE
 - [x] Static system prompt for KV-cache (step 1 complete)
 - [x] Multi-turn session memory (step 2 complete)
 
@@ -151,13 +150,84 @@ Events emitted:
 
 - ~~**KV-cache: NONE.**~~ Fixed in step 1 — static system prompt now fully cache-eligible.
 - ~~**Single-turn only.**~~ Fixed in step 2 — persistent thread_id + session_memory across messages.
-- **No document ingestion.** Agent can only search the web; can't reason over user-provided PDFs/CSVs.
-- **`execute_plan` is one monolithic graph node.** All steps run sequentially inside a single node, so LangGraph can't stream individual step updates — only the whole batch completes at once.
-- **Synthesize node returns final answer but doesn't stream.** The final report appears all at once.
+- **Latency:** Many plans use **4–5 sequential steps**; each step is one LLM+tool loop → total time stacks. Mitigation is in the **Guiding roadmap** (planner first, then graph parallelism).
+- **Tool ceiling:** Complex financial work still often goes through `execute_python`; dedicated market/fundamental tools will improve quality and speed.
+- **No document ingestion.** Agent can search/fetch the web, but still can't reason over uploaded PDFs/CSVs.
+- **Global UI event handler is process-wide.** Fine for one active run, but needs per-thread routing for true concurrency.
 
 ---
 
-## Next Steps
+## Guiding roadmap (implementation order)
+
+> **Use this section as the single checklist for what to build next.** Update checkboxes and notes as work completes.
+
+### Principles
+
+| Principle | Meaning |
+|-----------|--------|
+| **No real money** | Paper trading / simulation / dry-run APIs only. Goal is **robustness** of flows (guards, HITL, audit), not funding a live strategy. |
+| **Data: free → reliable** | Prefer **free** data/APIs first (e.g. `yfinance`, Stooq CSVs). When two free options exist, pick the **more reliable** for the task; document trade-offs in code comments. |
+| **Planner before graph surgery** | Fix **over-decomposition** and step count **before** investing in parallel execution — bad plans get faster, not better, when parallelized. |
+
+### Phase A — Planner & prompts `[DONE — v1]`
+
+**Goal:** Fewer, denser steps; align plan length with task difficulty and available tools (one step can host multiple tool calls).
+
+**Implemented:**
+
+- **`PlanDraft`** (`agent/state.py`): `steps` is constrained to **1–5** items with a schema `description` that tells the model to prefer 2–4 steps and merge logical units.
+- **`plan_node`** (`agent/nodes.py`): Replaced the old “**3–6 steps**” anchor with **`PLANNER_INSTRUCTIONS`** — step budget (2–4 default, 5 max), explicit **merge rules** (search→retrieve, fetch_url→retrieve, data+chart in one `execute_python`), and tool hints aligned with `STATIC_SYSTEM_PROMPT`.
+
+**Still optional (if v1 isn’t enough):**
+
+- Stronger structured fields (e.g. `complexity: low|medium|high` + post-process caps), or a **second-pass compress** if the model still returns 5 thin steps.
+
+**Success:** Lower median wall-clock per run for typical queries **without** changing the graph yet — **measure** on a few representative queries before Phase B.
+
+---
+
+### Phase B — Graph & execution `[AFTER A]`
+
+**Goal:** Cut latency where work is independent.
+
+**Order of attack:**
+
+1. **Parallel tool calls within a step** — when the model emits multiple tool calls in one turn, execute independent tools concurrently (thread pool or `asyncio`), then return all `ToolMessage`s. Big win, localized to `agent/executor.py` (and prompt nudges).
+2. **Parallel steps (LangGraph)** — only where the plan’s dependency graph allows (e.g. two tickers with no shared step ordering). Requires richer routing / fan-out-fan-in; do after (1).
+
+**Success:** Same quality as today with measurably shorter execute phase.
+
+---
+
+### Phase C — Financial & “doing” tools `[AFTER A OR IN PARALLEL WITH SMALL SCOPE]`
+
+**Goal:** First-class primitives so the model rarely hand-writes fragile pandas in `execute_python` for standard tasks.
+
+**Candidate tools (names indicative; refine in implementation):**
+
+| Tool | Role | Data preference |
+|------|------|-----------------|
+| `fetch_stock_prices` | OHLCV for a ticker, date range, frequency | Free: yfinance and/or Stooq; same pointer pattern as other tools |
+| `analyze_financials` (or split) | Key fundamentals / statement-derived metrics as structured JSON | Free tier APIs or yfinance statements; document limitations |
+
+**Paper trading (still no real money):**
+
+- Integrate a **paper** brokerage API (e.g. Alpaca paper) for place/cancel/list orders — only after tools + guards + HITL story are clear.
+- Treat as **robustness** testing: idempotency, error paths, audit logs under `runs/<thread_id>/`.
+
+---
+
+### Phase D — Proactive agent `[DISCUSS BEFORE BUILDING]`
+
+**Goal:** Agent that **initiates** work (watchlists, schedules, alerts), not only answers one-shot queries.
+
+**Implications:** Persistent preferences, cron or event loop, possibly separate “job” graph — **design session recommended** before coding.
+
+---
+
+## Next Steps (historical / backlog)
+
+**Note:** Prefer the **Guiding roadmap** for ordering new work. The sections below document completed milestones and a small backlog (RAG, error context, cost tracking) that can be scheduled alongside or after Phase A–C as needed.
 
 ### 1. ✅ Static system prompt for KV-cache  `[DONE]`
 
@@ -261,6 +331,6 @@ Events emitted:
 | Append-only context_stack (not full message injection) | KV-cache friendly; follows Manus principle |
 | Tool results stored on disk, pointer in message | Keeps context short; full data retrievable on demand |
 | `execute_python` banned from HTTP fetching | Sandbox SSL issues; cleaner separation of concerns |
-| Chainlit over AG-UI/CopilotKit | Pure Python, native LangGraph integration, faster to build |
-| CustomElement (React JSX) over TaskList for tracker | Full control over layout; supports live prop updates via `updateElement` |
+| React + FastAPI UI (primary) over ad-hoc UIs | SSE + typed events; Chainlit-era path removed once parity achieved |
+| React step timeline + plan review | Full control over layout; streaming report and tool rows |
 | FAISS (not ChromaDB) for RAG | Zero infrastructure; in-memory per session is sufficient for educational scope |
