@@ -41,7 +41,9 @@ Standalone LangGraph: `START → normalize_input → hydrate_fundamentals → bu
 - **Assumption merge order:** defaults → web (Exa snippets, optional) → documents (RAG hybrid search) → canonical fundamentals (including Tier B hints such as `fcff_margin`, `tax_rate`) → `assumption_overrides`.
 - **FCFF margin from FMP:** unlevered proxy `FCF + InterestExpense × (1 − effective tax) / revenue` via `_compute_fcff_components`; naive FCF/revenue only as lower-confidence fallback.
 - **Profile priors:** `_classify_profile(sector, market_cap)` → buckets (`mega_cap_tech`, etc.) driving `_check_assumption_plausibility`; output sanity in `_check_valuation_sanity` (e.g. implied vs spot ratio, terminal value share of EV).
-- **Trust outputs:** `assumption_flags`, `valuation_flags`, `confidence_label` (`high`/`medium`/`low`); persisted in `dcf_output.json` and `workflow_complete` SSE; tool wrappers use `summarize_dcf_payload()` so the LLM sees confidence + flag counts in the persisted tool summary.
+- **Feature vector (`state.features`):** Hydration merges FMP/yfinance **`__dcf_extras__`** (beta from FMP key-metrics when available; interest expense, gross debt, cash, market cap) into a compact dict for auditing and downstream models; includes `equity_value_usd`, `effective_tax_rate_hint`, sector labels.
+- **WACC estimation:** After assumption merge + overrides, **`_resolve_wacc_from_features`** sets `wacc` unless the user explicitly overrode it. Primary path **CAPM-style** decomposition (`_estimate_capm_wacc`): \(R_e = R_f + \beta\cdot ERP\), cost of debt from interest/debt when data exists, blended with tax from merged `tax_rate`; components land in **`state.wacc_components`** and **`dcf_output.json`** (`cost_of_equity`, weights, \(R_f\), ERP, beta, etc.). Env: **`DCF_RISK_FREE_RATE`**, **`DCF_EQUITY_RISK_PREMIUM`** (defaults 4.5% / 5.5%). If CAPM inputs are incomplete or clip fails, **`PROFILE_PRIORS` soft-band midpoint** is used (**`profile_prior_mid`** provenance) — static dict stays as deterministic fallback guardrails, not the only story.
+- **Trust outputs:** `assumption_flags`, `valuation_flags`, `confidence_label` (`high`/`medium`/`low`); persisted in `dcf_output.json` and `workflow_complete` SSE; tool wrappers use `summarize_dcf_payload()` so the LLM sees confidence + flag counts plus **`WACC_source=`** (`capm` / `profile_prior_fallback` / `user_override`).
 - **HITL:** `assumption_review_mode` + LangGraph `interrupt`; server resumes via `POST .../assumptions-decision`. Sync agent path (`run_dcf_workflow_sync`) forbids review mode — use the workflow HTTP API for reviewed runs.
 - **Static system prompt** — fully KV-cache eligible; all dynamic context in HumanMessage only
 - **`execute_python` prelude** — `get_stock_data(ticker, period)` helper injected into every script; handles yfinance MultiIndex, auto_adjust, column normalization — model just calls the helper
@@ -101,9 +103,10 @@ Standalone LangGraph: `START → normalize_input → hydrate_fundamentals → bu
 | `MarkdownRenderer.tsx` | Custom ReactMarkdown component map — h1/h2/h3, styled lists, tables, code blocks, links |
 | `ExecutionSidebar.tsx` | Progress bar, step count, current step label, HITL approve/reject footer, error display |
 | `StepCard.tsx` | Timeline step with animated status dot; tool labels via `lib/toolLabels.ts` (`getToolDisplay`, `cleanToolSummary`) |
-| `ActivityTrace.tsx` | Collapsible audit trail for tool calls (chat + nested research tools) |
-| `MessageThread.tsx` | On run completion, snapshots `toolTrace` / `researchSteps` into committed messages for auditing after synthesis |
+| `ActivityTrace.tsx` | Collapsible audit trail for tool calls (chat + nested research tools); accepts both legacy `toolCalls` and unified `activities` (preferred) |
+| `MessageThread.tsx` | On run completion, snapshots `toolTrace` / `researchSteps` / `activity` into committed messages for auditing after synthesis |
 | `lib/toolLabels.ts` | Human-readable labels for all tools and `workflow:*` substeps (e.g. DCF) |
+| `lib/activity.ts` | Unified `ActivityEvent` contract (mirror of `agent_project/activity.py`) + `mergeActivity` reducer for the live store |
 
 #### Key UX details
 - SSE `done` event closes `EventSource` gracefully before `onerror` fires (prevents false "Connection lost")
@@ -117,6 +120,41 @@ Standalone LangGraph: `START → normalize_input → hydrate_fundamentals → bu
 - **No `--reload`** on uvicorn — prevents mid-run restarts when files are saved
 - **`PYTHONUNBUFFERED=1`** — real-time backend logs
 - **`uv`** for Python env management; vite proxy forwards `/runs`, `/artifacts`, `/health` to `:8080`
+
+---
+
+## Unified Activity Contract `[COMPLETE]`
+
+Goal: one telemetry shape for every unit of agent work — chat tool call, research tool call, workflow substep — so the frontend has a single store and a single renderer.
+
+**Contract (kept in lockstep across two files):**
+- Python: `agent_project/activity.py` (`ActivityEvent`, `make_activity`, kind/scope/status literals)
+- TypeScript: `agent_project/frontend/src/lib/activity.ts` (matching types + `mergeActivity` reducer + `activityStatusToToolStatus`)
+
+**Backend helpers (`utils.py`):**
+- `emit_activity(...)` — fire a normalized `type="activity"` envelope.
+- `track_tool(...)` context manager — emits `started → completed | error` automatically with timing + summary.
+- `track_workflow_step(...)` — same shape for workflow substeps (name encoded as `workflow:<wf>:<step>` so existing `getToolDisplay` labels keep working).
+
+**Where activity events are emitted today:**
+- `graphs/research.py::execute_step` — every tool call wrapped in `track_tool(scope="research")`.
+- `graphs/conversational.py::chat_node` — every tool call wrapped in `track_tool(scope="chat")`.
+- `graphs/workflows/dcf.py::_emit_step` — substeps emitted as `kind="workflow_step"` activities with stable `activity_id` per `(parent_step_id, step)` so start/complete merge into a single entry.
+- `graphs/workflows/dcf.py::_emit_workflow_terminal` — workflow root span (`kind="workflow"`, name `workflow:dcf`) carries `confidence_label` and `flag_count` on completion.
+
+**Frontend wiring:**
+- `useAgentRun` intercepts `type="activity"` events first, merges into `state.activity` via `mergeActivity`, and projects research-scoped + workflow-scoped entries back into `step.tool_calls` so existing `StepCard` / `ResearchStepsTrace` renderers keep working without per-event awareness.
+- `ChatBubble`, `ResearchReportCard`, and `ActivityTrace` consume `state.activity` directly; legacy `toolCalls` props remain available only for older committed `SessionMessage`s that pre-date the migration.
+
+**Removed in step 6 (after parity verified end-to-end):**
+- Backend: `emit_ui_event({"type": "tool_call_start|tool_call_end|tool_error"})` in `graphs/research.py` and `graphs/conversational.py`; `emit_ui_event({"type": "workflow_step|workflow_complete"})` in `graphs/workflows/dcf.py`; `_send_event(... "workflow_started" ...)` in `server.py`.
+- Frontend: `case 'workflow_started'`, `case 'workflow_step'`, `case 'tool_call_start'`, `case 'tool_call_end'`, `case 'tool_error'` reducer branches in `useAgentRun.ts`; the `chat_tool_calls` field on `AgentRunState`; the now-unused `findLastRunning` / `parseArgsPreview` / `eventSummary` helpers.
+- Chainlit (`agent_project/app.py`): legacy `tool_call_*` event handlers replaced by a single `activity` handler that updates the tracker by `activity_id`.
+
+**Still kept on purpose (not legacy noise):**
+- `step_start` / `step_reasoning` / `step_complete` — research plan progress, not tool telemetry.
+- `intent_classified`, `chat_start`, `chat_complete`, `chat_token`, `synthesis_*` — content/lifecycle events outside the tool-event scope.
+- `ToolCall` type — still the row shape rendered by `ActivityTrace`; activity entries are converted via `activitiesToToolCalls`.
 
 ---
 
@@ -226,10 +264,17 @@ Standalone LangGraph: `START → normalize_input → hydrate_fundamentals → bu
 
 **Built:**
 - Standalone DCF subgraph + agent tool `run_dcf_workflow`; FMP-first fundamentals; tiered assumption merge; flags + `confidence_label`; UI-friendly workflow step labels and collapsible activity traces.
+- DCF **`features`** carrier + CAPM-style **WACC decomposition** (`wacc_components`) with PROFILE_PRIORS midpoint fallback (see **DCF workflow** above).
+
+**Direction (first principles, not stack-more-nodes blindly):**
+- Treat **`EvidencePack` → semantic synthesis → `AssumptionMemo` → deterministic DCF** as artifact contracts so judgment is grounded and replayable before adding graph surface area.
+- **SEC / filings-first tools** (EDGAR or structured filing API): normalize chunks with source IDs so assumption rationale cites evidence tiers (filings > APIs > news).
 
 **Still needed:**
-- Sector-tuned default WACC / growth when no external hints; richer market snapshot than yfinance-only spot; surface flags/confidence in execution sidebar (data already in events/payload).
-- Additional workflows (comps, LBO, deck generation) reusing `PROFILE_PRIORS`-style patterns.
+- LLM-assisted synthesis + assumption generation with structured schema (rationale + citations + confidence scoring); regenerate loop driven by analyst feedback beyond edit-in-place overrides.
+- Richer market snapshot than yfinance-only spot; surface flags/confidence in execution sidebar (data already in events/payload in many paths).
+- `fetch_sec_filing` wired into research + workflows (listed under Phase 2).
+- Additional workflows (comps, LBO, deck generation) reusing prior + flag patterns.
 
 ---
 
@@ -268,6 +313,7 @@ Standalone LangGraph: `START → normalize_input → hydrate_fundamentals → bu
 | Exa over Tavily | Better semantic search and excerpts; still needs full source-content fetch for deep work |
 | FMP + yfinance for DCF levels | Canonical scale and margins from statements; web/docs only refine rates, not Tier A |
 | Assumption / valuation flags | Deterministic “warn vs block” bands; `confidence_label` gates how hard the LLM should sell the number |
+| DCF CAPM + feature vector | Data-driven discount rate when inputs exist; `PROFILE_PRIORS` midpoint only as explicit fallback |
 
 ---
 
@@ -279,6 +325,10 @@ TAVILY_API_KEY=tvly-...          # legacy; no longer used by current search_web
 EXA_API_KEY=...                  # current search
 FMP_API_KEY=...                  # Financial Modeling Prep (DCF canonical fundamentals; /stable API)
 POLYGON_API_KEY=...              # Phase 2
+
+# Optional: DCF CAPM calibration (defaults 0.045 / 0.055 if unset)
+DCF_RISK_FREE_RATE=0.045
+DCF_EQUITY_RISK_PREMIUM=0.055
 ```
 
 ## Running
@@ -289,6 +339,36 @@ cd /Users/rayengallas/Project/langgraph-research-agent
 # Backend:  http://localhost:8080
 # Frontend: http://localhost:5174
 ```
+
+### LangSmith Studio (visual graphs)
+
+Root `langgraph.json` registers two graphs for **[LangGraph Studio](https://docs.langchain.com/oss/python/langgraph/studio)** (run **`langgraph dev` from the repo root**, not only from `agent_project/`):
+
+| Graph ID | Module | What you see |
+|----------|--------|----------------|
+| **`agent`** | `file.py:app` | **Full agent** — `START → intent →` research path (`plan → review_plan → execute_plan → synthesize → update_memory`) or chat path (`chat → END`). This is what the FastAPI server runs. Pick this in Studio’s graph selector. |
+| **`dcf_workflow`** | `graphs/workflows/dcf.py:dcf_workflow_app` | Standalone DCF subgraph only (same graph the `run_dcf_workflow` tool invokes). Useful for debugging valuation steps in isolation. |
+
+Studio often lists graphs alphabetically; **`dcf_workflow`** used to appear first when the parent was named `research_agent`. **`agent`** is intentionally short so it sorts first and matches the LangGraph docs naming.
+
+Studio draws **one node per `add_node` in `file.py`** — e.g. `execute_plan` is a single visual node even though it runs multi-round tools inside Python. Sub-steps appear in traces/run details, not as extra boxes, unless those steps are modeled as nested compiled subgraphs later.
+
+**Avoid the system / Conda `langgraph` on PATH** if it is an old build: you will get `ImportError: cannot import name 'Auth' from 'langgraph_sdk'` because `langgraph_api` and `langgraph_sdk` versions are out of sync. Use the project’s aligned CLI instead (below), or upgrade both in that env: `pip install -U 'langgraph-cli[inmem]' langgraph-sdk`.
+
+From the **repository root** (recommended):
+
+```bash
+cd langgraph-research-agent   # repo root — must contain langgraph.json
+uv sync --extra studio          # once / when pyproject changes
+uv run --extra studio langgraph validate
+uv run --extra studio langgraph dev
+```
+
+Without `uv`: `uvx --from "langgraph-cli[inmem]" langgraph validate` and `uvx ... langgraph dev` (always fresh, no `validate` on very old global installs).
+
+If your shell `which langgraph` points to Anaconda (`/opt/anaconda3/...`), **do not** rely on that binary for `validate` / `dev` — older CLIs omit `validate` and can load stale `langgraph_sdk`.
+
+Studio UI: `https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024`. Set `LANGSMITH_TRACING=false` in `agent_project/.env` if you do not want traces sent to LangSmith. Safari may need `langgraph dev --tunnel` per the [troubleshooting guide](https://docs.langchain.com/langsmith/troubleshooting-studio).
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph

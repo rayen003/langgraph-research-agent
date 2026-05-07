@@ -134,41 +134,45 @@ async def _process_event(
                 break
         await _update_element(tracker_element, tracker_state)
 
-    elif etype == "tool_call_start":
+    elif etype == "activity" and event.get("kind") == "tool" and event.get("scope") == "research":
+        # Unified activity contract — merges tool_call_start/end/error.
+        # Match by activity_id; create on first sighting, then update on
+        # status transitions.
         sid = event.get("step_id", "")
+        if sid in (None, "", "chat"):
+            return  # chat-scope activities don't belong to a research step
+        activity_id = event.get("activity_id")
+        status_map = {
+            "started": "running",
+            "running": "running",
+            "completed": "done",
+            "skipped": "done",
+            "error": "error",
+            "awaiting_input": "running",
+        }
+        new_status = status_map.get(event.get("status", "started"), "running")
         for s in tracker_state["steps"]:
-            if s["id"] == sid:
+            if s["id"] != sid:
+                continue
+            existing = next(
+                (tc for tc in s["tool_calls"] if tc.get("activity_id") == activity_id),
+                None,
+            )
+            if existing is None:
                 s["tool_calls"].append({
-                    "tool_name": event["tool_name"],
-                    "status": "running",
-                    "summary": "",
+                    "activity_id": activity_id,
+                    "tool_name": event.get("name", ""),
+                    "status": new_status,
+                    "summary": event.get("summary") or event.get("error") or "",
                     "args_preview": event.get("args_preview", ""),
                 })
-                break
-        await _update_element(tracker_element, tracker_state)
-
-    elif etype == "tool_call_end":
-        sid = event.get("step_id", "")
-        for s in tracker_state["steps"]:
-            if s["id"] == sid:
-                for tc in reversed(s["tool_calls"]):
-                    if tc["tool_name"] == event["tool_name"] and tc["status"] == "running":
-                        tc["status"] = "done"
-                        tc["summary"] = event.get("summary", "")
-                        break
-                break
-        await _update_element(tracker_element, tracker_state)
-
-    elif etype == "tool_error":
-        sid = event.get("step_id", "")
-        for s in tracker_state["steps"]:
-            if s["id"] == sid:
-                for tc in reversed(s["tool_calls"]):
-                    if tc["tool_name"] == event["tool_name"] and tc["status"] == "running":
-                        tc["status"] = "error"
-                        tc["summary"] = event.get("error", "")
-                        break
-                break
+            else:
+                existing["status"] = new_status
+                if event.get("summary"):
+                    existing["summary"] = event["summary"]
+                elif event.get("error"):
+                    existing["summary"] = event["error"]
+            break
         await _update_element(tracker_element, tracker_state)
 
     elif etype == "step_complete":

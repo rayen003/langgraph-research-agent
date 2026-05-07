@@ -1,15 +1,26 @@
 """Shared utilities for persistence and streaming-friendly rich formatting."""
 
+import contextlib
+import contextvars
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+
+from activity import (
+    ACTIVITY_EVENT_TYPE,
+    ActivityKind,
+    ActivityScope,
+    ActivityStatus,
+    make_activity,
+)
 
 console = Console()
 BASE_DIR = Path(__file__).parent
@@ -19,24 +30,29 @@ RUNS_DIR.mkdir(exist_ok=True)
 TOOL_OUTPUT_MAX_LEN = 1000
 TOOL_CALL_ARGS_MAX_LEN = 180
 
-_current_thread_id: str | None = None
+_thread_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "thread_id",
+    default=None,
+)
 
 # ---------------------------------------------------------------------------
 # UI event hooks (consumed by Chainlit / other frontends)
 # ---------------------------------------------------------------------------
 
-_ui_event_handler: Any = None
+_ui_event_handler_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "ui_event_handler",
+    default=None,
+)
 
 
 def set_ui_event_handler(handler: Any) -> None:
     """Register a callback that receives fine-grained execution events."""
-    global _ui_event_handler  # noqa: PLW0603
-    _ui_event_handler = handler
+    _ui_event_handler_ctx.set(handler)
 
 
 def emit_ui_event(event: dict) -> None:
     """Fire an event to the registered UI handler, if any."""
-    handler = _ui_event_handler
+    handler = _ui_event_handler_ctx.get()
     if handler is not None:
         try:
             handler(event)
@@ -44,10 +60,206 @@ def emit_ui_event(event: dict) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Activity events — unified contract for tool/workflow/node telemetry.
+#
+# These helpers are additive: they emit the new `type="activity"` envelope
+# defined in agent_project/activity.py. Legacy `tool_call_start/end/error`
+# events are still emitted by call sites during the migration window so
+# the frontend renders identically in both old and new modes.
+# ---------------------------------------------------------------------------
+
+
+def emit_activity(
+    *,
+    activity_id: str,
+    kind: ActivityKind,
+    name: str,
+    scope: ActivityScope,
+    status: ActivityStatus,
+    parent_activity_id: str | None = None,
+    display_label: str | None = None,
+    step_id: str | None = None,
+    started_at: float | None = None,
+    ended_at: float | None = None,
+    summary: str | None = None,
+    args_preview: str | None = None,
+    confidence_label: str | None = None,
+    flag_count: int | None = None,
+    error: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    """Fire a normalized activity event over the UI bus.
+
+    Prefer the `track_tool` / `track_workflow_step` context managers — they
+    handle id generation, lifecycle states, and timing automatically.
+    """
+    payload = make_activity(
+        activity_id=activity_id,
+        kind=kind,
+        name=name,
+        scope=scope,
+        status=status,
+        parent_activity_id=parent_activity_id,
+        display_label=display_label,
+        step_id=step_id,
+        started_at=started_at,
+        ended_at=ended_at,
+        summary=summary,
+        args_preview=args_preview,
+        confidence_label=confidence_label,
+        flag_count=flag_count,
+        error=error,
+        meta=meta,
+    )
+    emit_ui_event(payload)
+
+
+@contextlib.contextmanager
+def track_tool(
+    *,
+    name: str,
+    scope: ActivityScope,
+    step_id: str | None = None,
+    args_preview: str | None = None,
+    parent_activity_id: str | None = None,
+    display_label: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Track a single tool invocation as a unified activity span.
+
+    Emits `started` on entry and either `completed` or `error` on exit.
+    Yields a mutable dict the caller can populate with `summary`, `meta`,
+    or other fields before the closing event is sent.
+
+    Usage:
+        with track_tool(name="search_web", scope="research", step_id=step["id"],
+                        args_preview=preview) as span:
+            result = tool_fn.invoke(args)
+            span["summary"] = parsed_summary
+    """
+    activity_id = f"tool_{uuid4().hex[:12]}"
+    started_at = time.time()
+    span: dict[str, Any] = {
+        "summary": "",
+        "meta": None,
+        "args_preview": args_preview or "",
+    }
+
+    emit_activity(
+        activity_id=activity_id,
+        kind="tool",
+        name=name,
+        scope=scope,
+        status="started",
+        step_id=step_id,
+        started_at=started_at,
+        args_preview=args_preview,
+        parent_activity_id=parent_activity_id,
+        display_label=display_label,
+    )
+
+    try:
+        yield span
+    except Exception as exc:  # noqa: BLE001
+        emit_activity(
+            activity_id=activity_id,
+            kind="tool",
+            name=name,
+            scope=scope,
+            status="error",
+            step_id=step_id,
+            started_at=started_at,
+            ended_at=time.time(),
+            error=str(exc),
+            args_preview=span.get("args_preview"),
+            parent_activity_id=parent_activity_id,
+            display_label=display_label,
+        )
+        raise
+    else:
+        emit_activity(
+            activity_id=activity_id,
+            kind="tool",
+            name=name,
+            scope=scope,
+            status="completed",
+            step_id=step_id,
+            started_at=started_at,
+            ended_at=time.time(),
+            summary=span.get("summary") or "",
+            args_preview=span.get("args_preview"),
+            meta=span.get("meta"),
+            parent_activity_id=parent_activity_id,
+            display_label=display_label,
+        )
+
+
+@contextlib.contextmanager
+def track_workflow_step(
+    *,
+    workflow: str,
+    step: str,
+    parent_activity_id: str | None = None,
+    parent_step_id: str | None = None,
+    summary: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Track a single workflow substep as a unified activity span.
+
+    The `name` is encoded as `workflow:<workflow>:<step>` to match the
+    existing `getToolDisplay` lookup table in `lib/toolLabels.ts`. This
+    keeps the human-readable label working without UI changes.
+    """
+    activity_id = f"wf_{uuid4().hex[:12]}"
+    started_at = time.time()
+    span: dict[str, Any] = {"summary": summary or "", "meta": None}
+
+    emit_activity(
+        activity_id=activity_id,
+        kind="workflow_step",
+        name=f"workflow:{workflow}:{step}",
+        scope="workflow",
+        status="started",
+        step_id=parent_step_id,
+        parent_activity_id=parent_activity_id,
+        started_at=started_at,
+        summary=summary,
+    )
+
+    try:
+        yield span
+    except Exception as exc:  # noqa: BLE001
+        emit_activity(
+            activity_id=activity_id,
+            kind="workflow_step",
+            name=f"workflow:{workflow}:{step}",
+            scope="workflow",
+            status="error",
+            step_id=parent_step_id,
+            parent_activity_id=parent_activity_id,
+            started_at=started_at,
+            ended_at=time.time(),
+            error=str(exc),
+        )
+        raise
+    else:
+        emit_activity(
+            activity_id=activity_id,
+            kind="workflow_step",
+            name=f"workflow:{workflow}:{step}",
+            scope="workflow",
+            status="completed",
+            step_id=parent_step_id,
+            parent_activity_id=parent_activity_id,
+            started_at=started_at,
+            ended_at=time.time(),
+            summary=span.get("summary") or "",
+            meta=span.get("meta"),
+        )
+
+
 def set_thread_id(thread_id: str) -> Path:
     """Set the active thread and create its run directory structure."""
-    global _current_thread_id  # noqa: PLW0603
-    _current_thread_id = thread_id
+    _thread_id_ctx.set(thread_id)
     run_dir = RUNS_DIR / thread_id
     (run_dir / "tool_results").mkdir(parents=True, exist_ok=True)
     (run_dir / "context_items").mkdir(parents=True, exist_ok=True)
@@ -57,11 +269,12 @@ def set_thread_id(thread_id: str) -> Path:
 
 
 def get_run_dir() -> Path:
-    if _current_thread_id is None:
+    current_thread_id = _thread_id_ctx.get()
+    if current_thread_id is None:
         fallback = RUNS_DIR / "_default"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
-    return RUNS_DIR / _current_thread_id
+    return RUNS_DIR / current_thread_id
 
 
 def save_plan(plan: dict) -> str:

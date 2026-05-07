@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background: #0a0a0a;
+  color: #e4e4e7;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* ── Prose (report markdown) ───────────────────────────── */
+.prose {
+  color: #d4d4d8;
+  line-height: 1.75;
+}
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
+  color: #f4f4f5;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+.prose h1 { font-size: 1.35rem; margin-top: 2rem; }
+.prose h2 { font-size: 1.1rem;  margin-top: 1.75rem; }
+.prose h3 { font-size: 0.95rem; margin-top: 1.5rem; }
+.prose p  { margin-top: 0.85rem; }
+.prose strong { color: #e4e4e7; font-weight: 500; }
+.prose em { color: #a1a1aa; }
+.prose a {
+  color: #818cf8;
+  text-decoration: none;
+}
+.prose a:hover {
+  text-decoration: underline;
+}
+.prose code {
+  color: #a5b4fc;
+  background: #18181b;
+  padding: 0.15em 0.45em;
+  border-radius: 4px;
+  font-size: 0.82em;
+  font-family: 'Fira Code', 'JetBrains Mono', 'Menlo', monospace;
+}
+.prose pre {
+  background: #111116;
+  border: 1px solid #27272a;
+  border-radius: 8px;
+  padding: 1rem 1.2rem;
+  overflow-x: auto;
+}
+.prose pre code {
+  background: transparent;
+  padding: 0;
+  color: #e4e4e7;
+  font-size: 0.82rem;
+}
+.prose blockquote {
+  border-left: 2px solid #3f3f46;
+  color: #71717a;
+  margin-left: 0;
+  padding-left: 1rem;
+}
+.prose ul, .prose ol { padding-left: 1.4rem; }
+.prose li { margin-top: 0.3rem; }
+.prose hr {
+  border: none;
+  border-top: 1px solid #27272a;
+  margin: 1.5rem 0;
+}
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.prose th {
+  text-align: left;
+  color: #a1a1aa;
+  font-weight: 500;
+  border-bottom: 1px solid #27272a;
+  padding: 0.5rem 0.75rem;
+}
+.prose td {
+  border-bottom: 1px solid #1e1e1e;
+  padding: 0.5rem 0.75rem;
+  color: #d4d4d8;
+}
+.prose tr:last-child td {
+  border-bottom: none;
+}

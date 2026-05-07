@@ -1,0 +1,217 @@
+import type { RunStatus, StepState } from '../types'
+import { StepCard } from './StepCard'
+
+interface Props {
+  status: RunStatus
+  steps: StepState[]
+  completedSteps: number
+  error: string | null
+  onApprove: () => void
+  onReject: () => void
+}
+
+export function ExecutionSidebar({
+  status,
+  steps,
+  completedSteps,
+  error,
+  onApprove,
+  onReject,
+}: Props) {
+  const totalSteps = steps.length
+  const progress = totalSteps > 0 ? (completedSteps / totalSteps) * 100 : 0
+  const isAwaitingPlan = status === 'awaiting_approval'
+  const isAwaitingAssumptions = status === 'awaiting_assumptions'
+  const isAwaiting = isAwaitingPlan || isAwaitingAssumptions
+  const isSynthesizing = status === 'synthesizing'
+  const isComplete = status === 'complete'
+  const isError = status === 'error'
+  const isRejected = status === 'rejected'
+
+  return (
+    <div className="w-full flex flex-col bg-[#0d0d0d] border-l border-[#1a1a1a] overflow-hidden h-full">
+
+      {/* ── Header ───────────────────────────────────────── */}
+      <div className="px-5 pt-5 pb-4 border-b border-[#161616] flex-shrink-0 space-y-3">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] font-medium text-zinc-600 tracking-widest uppercase">
+            Execution
+          </span>
+          {totalSteps > 0 && (
+            <span className="text-[11px] text-zinc-700 tabular-nums">
+              {completedSteps} / {totalSteps} steps
+            </span>
+          )}
+        </div>
+
+        {/* Progress bar */}
+        <div className="h-[2px] bg-[#1a1a1a] rounded-full overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-700 ease-out ${
+              isComplete
+                ? 'bg-emerald-600'
+                : isError
+                ? 'bg-red-600'
+                : isSynthesizing
+                ? 'bg-violet-500'
+                : 'bg-indigo-500'
+            }`}
+            style={{
+              width: isSynthesizing ? '100%' : isComplete ? '100%' : `${progress}%`,
+            }}
+          />
+        </div>
+
+        {/* Current step label */}
+        <CurrentStepLabel status={status} steps={steps} completedSteps={completedSteps} totalSteps={totalSteps} />
+      </div>
+
+      {/* ── Step list ────────────────────────────────────── */}
+      <div className="flex-1 overflow-y-auto px-5 py-4">
+
+        {status === 'planning' && (
+          <div className="space-y-3 animate-fade-up">
+            <PlanSkeleton />
+          </div>
+        )}
+
+        {steps.map((step, idx) => (
+          <StepCard
+            key={step.id}
+            step={step}
+            index={idx}
+            isLast={idx === steps.length - 1}
+          />
+        ))}
+
+        {isSynthesizing && (
+          <div className="flex items-center gap-2.5 pt-1 animate-fade-up">
+            <div className="w-1.5 h-1.5 rounded-full bg-violet-500 animate-pulse flex-shrink-0" />
+            <span className="text-xs text-zinc-600">Synthesizing report…</span>
+          </div>
+        )}
+
+        {isComplete && (
+          <div className="flex items-center gap-2 pt-1 animate-fade-up">
+            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0" />
+            <span className="text-xs text-zinc-600">Report ready</span>
+          </div>
+        )}
+
+        {isError && (
+          <div className="animate-fade-up space-y-1.5 pt-1">
+            <div className="flex items-center gap-2">
+              <div className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />
+              <span className="text-xs text-red-500 font-medium">Execution failed</span>
+            </div>
+            {error && (
+              <pre className="text-[10px] text-red-700 leading-relaxed whitespace-pre-wrap break-all bg-red-950/20 border border-red-900/30 rounded-md px-2.5 py-2">
+                {error}
+              </pre>
+            )}
+          </div>
+        )}
+
+        {isRejected && (
+          <p className="text-xs text-zinc-600 pt-1 animate-fade-up">
+            Plan rejected. Start a new research query to try again.
+          </p>
+        )}
+      </div>
+
+      {/* ── HITL footer ──────────────────────────────────── */}
+      {isAwaiting && (
+        <div className="flex-shrink-0 px-5 py-4 border-t border-[#161616] space-y-3 animate-fade-up">
+          <p className="text-[11px] text-zinc-600 leading-relaxed">
+            {isAwaitingPlan
+              ? 'Review the plan above. Once approved, execution begins immediately.'
+              : 'Review workflow assumptions. Approve to continue deterministic valuation.'}
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={onApprove}
+              className="
+                flex-1 py-2 rounded-lg text-xs font-medium
+                bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700
+                text-white transition-colors duration-150
+              "
+            >
+              {isAwaitingPlan ? 'Approve & Run' : 'Approve Assumptions'}
+            </button>
+            <button
+              onClick={onReject}
+              className="
+                flex-1 py-2 rounded-lg text-xs font-medium
+                bg-[#161616] hover:bg-[#1e1e1e] active:bg-[#121212]
+                text-zinc-500 border border-[#2a2a2a]
+                transition-colors duration-150
+              "
+            >
+              {isAwaitingPlan ? 'Reject' : 'Reject Assumptions'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CurrentStepLabel({
+  status,
+  steps,
+  completedSteps,
+  totalSteps,
+}: {
+  status: RunStatus
+  steps: StepState[]
+  completedSteps: number
+  totalSteps: number
+}) {
+  if (status === 'planning') {
+    return <p className="text-[11px] text-zinc-700">Building execution plan…</p>
+  }
+  if (status === 'workflow_running') {
+    return <p className="text-[11px] text-indigo-400">Running deterministic workflow…</p>
+  }
+  if (status === 'awaiting_assumptions') {
+    return <p className="text-[11px] text-amber-500">Awaiting assumption validation</p>
+  }
+  if (status === 'awaiting_approval') {
+    return <p className="text-[11px] text-zinc-700">Awaiting your approval</p>
+  }
+  if (status === 'synthesizing') {
+    return <p className="text-[11px] text-violet-500">Writing final report…</p>
+  }
+  if (status === 'complete') {
+    return <p className="text-[11px] text-emerald-600">All steps complete</p>
+  }
+  if (status === 'executing') {
+    const running = steps.find(s => s.status === 'running')
+    if (running) {
+      return (
+        <p className="text-[11px] text-zinc-600 truncate">
+          <span className="text-indigo-400">Step {completedSteps + 1}</span>
+          {' '}—{' '}
+          <span>{running.description.length > 50 ? running.description.slice(0, 50) + '…' : running.description}</span>
+        </p>
+      )
+    }
+  }
+  return null
+}
+
+function PlanSkeleton() {
+  return (
+    <div className="space-y-5">
+      {[70, 85, 60, 75].map((w, i) => (
+        <div key={i} className="flex gap-3 items-start">
+          <div className="w-3.5 h-3.5 rounded-full bg-[#1e1e1e] flex-shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-1.5">
+            <div className="h-2.5 rounded bg-[#1a1a1a]" style={{ width: `${w}%` }} />
+            <div className="h-2 rounded bg-[#161616]" style={{ width: `${w - 20}%` }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
