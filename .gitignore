@@ -81,3 +81,6 @@ node_modules/
 
 # LangGraph local dev checkpoints (don't commit pickle state)
 .langgraph_api/
+
+# Old monolithic DCF backup (use git history if needed)
+agent_project/graphs/workflows/dcf.py.bak

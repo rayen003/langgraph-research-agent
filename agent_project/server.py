@@ -79,6 +79,7 @@ class RunState:
     __slots__ = (
         "thread_id", "loop", "event_queue", "hitl_future",
         "status", "query", "mode", "intent", "created_at", "session_id",
+        "dcf_hitl_payload",
     )
 
     def __init__(self, thread_id: str, loop: asyncio.AbstractEventLoop, query: str, mode: str, session_id: str = "") -> None:
@@ -92,6 +93,7 @@ class RunState:
         self.intent: str | None = None
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.session_id = session_id
+        self.dcf_hitl_payload: dict | None = None
 
 
 _run_registry: dict[str, RunState] = {}
@@ -246,6 +248,19 @@ def _make_event_bridge(rs: RunState):
             rs.intent = event.get("intent")
             rs.status = "planning" if rs.intent == "research" else "chat_responding"
             update_job(rs.thread_id, status=rs.status, intent=rs.intent)
+        elif event.get("type") == "dcf_assumptions_review":
+            # Store HITL payload directly on RunState — safe from any thread
+            # since we're only writing and _run_agent_task reads it after ainvoke.
+            rs.dcf_hitl_payload = {
+                "ticker": event.get("ticker", "?"),
+                "horizon_years": event.get("horizon_years", 5),
+                "assumptions": event.get("assumptions", {}),
+                "assumption_provenance": event.get("assumption_provenance", {}),
+                "memo_proposals": event.get("memo_proposals", {}),
+                "evidence_items": event.get("evidence_items", []),
+            }
+            rs.status = "awaiting_assumptions"
+            update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "synthesis_start":
             rs.status = "synthesizing"
             update_job(rs.thread_id, status=rs.status)
@@ -253,8 +268,10 @@ def _make_event_bridge(rs: RunState):
             rs.status = "complete"
             update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "chat_complete":
-            rs.status = "complete"
-            update_job(rs.thread_id, status=rs.status)
+            # Skip marking complete if DCF HITL is pending — keep SSE alive
+            if not rs.dcf_hitl_payload:
+                rs.status = "complete"
+                update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "execution_started":
             rs.status = "executing"
             update_job(rs.thread_id, status=rs.status)
@@ -291,6 +308,57 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
         )
 
         interrupts = result.get("__interrupt__", ())
+
+        # Check for DCF HITL — payload set by event bridge when dcf_assumptions_review fires
+        if rs.dcf_hitl_payload:
+            dcf_hitl = rs.dcf_hitl_payload
+            rs.hitl_future = rs.loop.create_future()
+            # Event already emitted by run_dcf_workflow tool and bridge set status
+            decision = await rs.hitl_future
+            rs.dcf_hitl_payload = None  # clear for next run
+
+            if not decision.get("approved"):
+                rs.status = "rejected"
+                update_job(thread_id, status=rs.status)
+                _send_event(rs, {"type": "assumptions_rejected", "workflow": "dcf"})
+                rs.event_queue.put_nowait(None)
+                return
+
+            # User approved — resume DCF workflow with overrides if any
+            overrides = decision.get("assumptions_overrides") or {}
+            _send_event(
+                rs,
+                {
+                    "type": "assumptions_submitted",
+                    "workflow": "dcf",
+                    "overrides_applied": bool(overrides),
+                },
+            )
+
+            # Re-invoke chat with approval message to trigger DCF completion
+            rs.status = "chat_responding"
+            update_job(thread_id, status=rs.status)
+            approval_payload = {
+                "ticker": dcf_hitl.get("ticker", "?"),
+                "horizon_years": dcf_hitl.get("horizon_years", 5),
+                "all_assumptions": overrides or dcf_hitl.get("assumptions", {}),
+            }
+            approval_message = f"[DCF_APPROVED]:{json.dumps(approval_payload)}"
+
+            await agent_graph.ainvoke(
+                {
+                    "messages": [HumanMessage(content=approval_message)],
+                    "mode": mode,
+                    "resolved_intent": "chat",
+                    "session_id": session_id,
+                    "session_memory": session_memory,
+                },
+                config=config,
+            )
+            update_job(thread_id, status="complete")
+            _send_event(rs, {"type": "run_complete"})
+            rs.event_queue.put_nowait(None)
+            return
 
         # No interrupt → chat run or plan-less completion
         if not interrupts:
@@ -377,6 +445,9 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
         "parent_step_id": "workflow_dcf",
         "features": {},
         "wacc_components": {},
+        "evidence_pack": {},
+        "company_state": None,
+        "assumption_memo": None,
     }
 
     try:
@@ -824,6 +895,83 @@ async def submit_dcf_assumptions_decision(
                 "assumptions_overrides": body.assumptions_overrides or {},
             }
         )
+    return {"ok": True}
+
+
+class DcfDecisionRequest(BaseModel):
+    approved: bool = True
+    assumptions_overrides: dict[str, float] | None = None
+
+
+class DcfContinueRequest(BaseModel):
+    action: str = "approve"
+    assumptions: dict[str, float] | None = None
+
+
+@app.post("/runs/{thread_id}/dcf-decision")
+async def submit_dcf_decision(
+    thread_id: str,
+    body: DcfDecisionRequest,
+) -> dict:
+    """Submit user decision on DCF assumptions review (approve/edit)."""
+    rs = _run_registry.get(thread_id)
+    if rs is None or rs.status != "awaiting_assumptions":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thread '{thread_id}' is not awaiting assumptions review.",
+        )
+
+    if rs.hitl_future and not rs.hitl_future.done():
+        rs.hitl_future.set_result(
+            {
+                "approved": body.approved,
+                "assumptions_overrides": body.assumptions_overrides or {},
+            }
+        )
+    return {"ok": True}
+
+
+@app.post("/runs/{thread_id}/dcf-continue")
+async def continue_dcf_after_review(thread_id: str, body: DcfContinueRequest) -> dict:
+    """Resume DCF graph from assumption review interrupt."""
+    from graphs.workflows.dcf import dcf_workflow_app  # noqa: PLC0415
+    from langgraph.types import Command  # noqa: PLC0415
+    from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
+
+    # Create or reuse a run state for SSE streaming of valuation events
+    loop = asyncio.get_running_loop()
+    rs = _run_registry.get(thread_id)
+    if rs is None:
+        job = get_job(thread_id)
+        query = job["query"] if job else "DCF valuation"
+        rs = RunState(thread_id, loop, query, "chat", job.get("session_id") or "" if job else "")
+        rs.status = "workflow_running"
+        _run_registry[thread_id] = rs
+
+    set_thread_id(thread_id)
+    set_ui_event_handler(_make_event_bridge(rs))
+    config = {"configurable": {"thread_id": thread_id}}
+
+    if body.action == "edit" and body.assumptions:
+        resume_cmd = Command(resume={"action": "edit", "assumptions": body.assumptions})
+    else:
+        resume_cmd = Command(resume={"action": "approve"})
+
+    rs.status = "workflow_running"
+    try:
+        await loop.run_in_executor(None, lambda: dcf_workflow_app.invoke(resume_cmd, config=config))
+        rs.status = "complete"
+        update_job(thread_id, status="complete")
+        _send_event(rs, {"type": "run_complete"})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        logger.error("DCF resume failed:\n%s", traceback.format_exc())
+        rs.status = "error"
+        _send_event(rs, {"type": "error", "message": str(exc)})
+    finally:
+        rs.event_queue.put_nowait(None)
+        _run_registry.pop(thread_id, None)
+        set_ui_event_handler(None)
     return {"ok": True}
 
 

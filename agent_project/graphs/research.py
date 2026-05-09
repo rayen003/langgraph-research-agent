@@ -276,14 +276,16 @@ def execute_python(code: str, output_paths: list[str] | None = None) -> str:
 def run_dcf_workflow(
     ticker: str,
     horizon_years: int = 5,
-    assumption_review_mode: bool = False,
+    assumption_review_mode: bool = True,
     allow_external_assumptions: bool = True,
     assumption_overrides: dict[str, float] | None = None,
     parent_step_id: str = "workflow_dcf",
 ) -> str:
-    """Run a deterministic DCF workflow and return valuation outputs.
+    """Run a deterministic DCF valuation workflow for a ticker.
 
-    Use for explicit valuation requests (DCF, intrinsic value, sensitivity matrix).
+    Default (assumption_review_mode=True): gathers evidence, proposes
+    assumptions, returns them for review. After user responds, call again
+    with assumption_overrides and assumption_review_mode=False to complete.
     """
     payload = run_dcf_workflow_sync(
         ticker=ticker,
@@ -294,17 +296,81 @@ def run_dcf_workflow(
         parent_step_id=parent_step_id,
         session_id=_session_ctx.get(),
     )
+
+    if payload.get("__dcf_hitl__"):
+        assumptions = payload.get("assumptions", {})
+        provenance = payload.get("assumption_provenance", {})
+        lines = [
+            "⛔ STOP — DO NOT CALL MORE TOOLS. Present these assumptions for review.",
+            "",
+            f"## DCF Assumptions for {payload.get('ticker', '?')} ({payload.get('horizon_years', 5)}yr)",
+            "",
+            "| Field | Value | Source | Confidence |",
+            "|-------|-------|--------|------------|",
+        ]
+        for field in ["revenue_growth", "fcff_margin", "terminal_growth", "tax_rate", "wacc"]:
+            val = assumptions.get(field)
+            if val is None:
+                continue
+            prov = provenance.get(field, {})
+            source = prov.get("source", "?")
+            conf = prov.get("confidence", 0.5)
+            lines.append(f"| {field} | {val:.2%} | {source} | {conf:.0%} |")
+        lines.append("")
+        lines.append("Ask the user to approve, edit values, or reject.")
+        lines.append("After they respond, call again with assumption_overrides and assumption_review_mode=False.")
+        return "\n".join(lines)
+
     summary = summarize_dcf_payload(payload)
     return persist_tool_result(
         "run_dcf_workflow",
         {
             "ticker": ticker,
             "horizon_years": horizon_years,
-            "assumption_review_mode": assumption_review_mode,
             "allow_external_assumptions": allow_external_assumptions,
             "assumption_overrides": assumption_overrides or {},
         },
         json.dumps(payload, ensure_ascii=False),
+        summary,
+    )
+
+
+@tool
+def fetch_sec_filing(ticker: str, filing_type: str = "10-K") -> str:
+    """Fetch recent SEC EDGAR filings (10-K or 10-Q) for a company.
+
+    Returns extracted text from Risk Factors, MD&A, Business overview, and
+    quantitative disclosures sections. Use for any question about a company's
+    financials, risks, business model, or regulatory disclosures.
+    Prefer this over search_web for fundamental company research.
+    """
+    from graphs.workflows.dcf.sec_filings import fetch_sec_filings as _fetch  # noqa: PLC0415
+
+    items = _fetch(ticker.upper().strip(), max_filings=2)
+    if not items:
+        no_result = {"ticker": ticker, "error": f"No SEC filings found for {ticker}"}
+        return persist_tool_result(
+            "fetch_sec_filing", {"ticker": ticker, "filing_type": filing_type},
+            json.dumps(no_result), f"No SEC filings found for {ticker}",
+        )
+    # Limit per-section text to keep context manageable
+    sections = []
+    for item in items[:10]:
+        meta = item.get("metadata", {})
+        sections.append({
+            "filing_type": meta.get("filing_type", "?"),
+            "section": meta.get("section", "?"),
+            "as_of": item.get("as_of", "?"),
+            "text": (item.get("text") or "")[:2000],
+        })
+    filing_types = list({s["filing_type"] for s in sections})
+    summary = (
+        f"SEC filings for {ticker}: {len(sections)} section(s) "
+        f"from {filing_types}"
+    )
+    return persist_tool_result(
+        "fetch_sec_filing", {"ticker": ticker, "filing_type": filing_type},
+        json.dumps({"ticker": ticker, "sections": sections}, ensure_ascii=False),
         summary,
     )
 
@@ -317,6 +383,7 @@ TOOLS = [
     execute_python,
     run_dcf_workflow,
     search_documents,
+    fetch_sec_filing,
 ]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 agent_llm = llm.bind_tools(TOOLS)
@@ -357,12 +424,17 @@ STATIC_SYSTEM_PROMPT = (
     "  Pass the saved filename in output_paths=['plot.png'].\n"
     "- Pre-installed packages: pandas, matplotlib, numpy, requests, yfinance, pytz\n"
     "- ALWAYS set a timeout on requests calls: requests.get(url, timeout=15).\n"
+    "- fetch_sec_filing: fetch 10-K/10-Q filings from SEC EDGAR for a company. "
+    "Use for questions about a company's risks, MD&A, business model, or filings. "
+    "Prefer this over search_web for company-specific fundamental research.\n"
     "- run_dcf_workflow runs a deterministic valuation workflow. Use it when the step asks for "
-    "a DCF/intrinsic value/sensitivity analysis. It can use uploaded session documents and capped web search "
-    "inside its assumptions build. Provide ticker and horizon_years. The tool result reports a "
-    "confidence label (high/medium/low) and any quality flags — when confidence != high, you MUST "
-    "surface the flagged fields and the implied vs spot price gap in the synthesis instead of "
-    "presenting the implied price as authoritative.\n"
+    "a DCF/intrinsic value/sensitivity analysis. It internally gathers evidence from SEC filings, "
+    "FMP/yfinance, and uploaded documents; proposes assumptions; and computes valuation. "
+    "It can use uploaded session documents inside its evidence assembly. Provide ticker and "
+    "horizon_years. The tool result includes a detailed report with assumption provenance, "
+    "WACC decomposition, confidence label (high/medium/low), and quality flags. "
+    "When confidence != high, you MUST surface the flagged fields and the implied vs spot "
+    "price gap in the synthesis instead of presenting the implied price as authoritative.\n"
     "- Stock price / financial data — use the pre-injected get_stock_data() helper:\n"
     "    df = get_stock_data('AAPL', period='5y')  # returns clean DataFrame\n"
     "  NEVER import yfinance directly. NEVER use stooq.com or Yahoo Finance CSV URLs.\n"

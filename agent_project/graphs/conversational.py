@@ -141,11 +141,19 @@ def get_stock_data(ticker, period="1y"):
 def run_dcf_workflow(
     ticker: str,
     horizon_years: int = 5,
-    assumption_review_mode: bool = False,
+    assumption_review_mode: bool = True,
     allow_external_assumptions: bool = True,
     assumption_overrides: dict[str, float] | None = None,
 ) -> str:
-    """Run a deterministic DCF valuation workflow for a ticker."""
+    """Run a deterministic DCF valuation workflow for a ticker.
+
+    Default (assumption_review_mode=True): gathers evidence, proposes
+    assumptions, returns them for your review. Present to user. After
+    user approves/edits, call again with their edits as assumption_overrides
+    AND assumption_review_mode=False to complete the valuation.
+    """
+    from utils import set_dcf_hitl_payload  # noqa: PLC0415
+
     payload = run_dcf_workflow_sync(
         ticker=ticker,
         horizon_years=horizon_years,
@@ -155,13 +163,55 @@ def run_dcf_workflow(
         parent_step_id="chat",
         session_id=_session_ctx.get(),
     )
+
+    if payload.get("__dcf_hitl__"):
+        # Store HITL payload for _run_agent_task to detect and handle
+        set_dcf_hitl_payload({
+            "ticker": payload.get("ticker", "?"),
+            "horizon_years": payload.get("horizon_years", 5),
+            "assumptions": payload.get("assumptions", {}),
+            "assumption_provenance": payload.get("assumption_provenance", {}),
+            "memo_proposals": payload.get("memo_proposals", {}),
+            "evidence_items": payload.get("evidence_items", []),
+        })
+        emit_ui_event({
+            "type": "dcf_assumptions_review",
+            "ticker": payload.get("ticker", "?"),
+            "horizon_years": payload.get("horizon_years", 5),
+            "assumptions": payload.get("assumptions", {}),
+            "assumption_provenance": payload.get("assumption_provenance", {}),
+            "memo_proposals": payload.get("memo_proposals", {}),
+            "evidence_items": payload.get("evidence_items", []),
+        })
+        assumptions = payload.get("assumptions", {})
+        provenance = payload.get("assumption_provenance", {})
+        lines = [
+            "⛔ STOP — DO NOT CALL MORE TOOLS. Present these assumptions for review.",
+            "",
+            f"## DCF Assumptions for {payload.get('ticker', '?')} ({payload.get('horizon_years', 5)}yr)",
+            "",
+            "| Field | Value | Source | Confidence |",
+            "|-------|-------|--------|------------|",
+        ]
+        for field in ["revenue_growth", "fcff_margin", "terminal_growth", "tax_rate", "wacc"]:
+            val = assumptions.get(field)
+            if val is None:
+                continue
+            prov = provenance.get(field, {})
+            source = prov.get("source", "?")
+            conf = prov.get("confidence", 0.5)
+            lines.append(f"| {field} | {val:.2%} | {source} | {conf:.0%} |")
+        lines.append("")
+        lines.append("Ask the user to approve, edit values, or reject.")
+        lines.append("After they respond, call again with assumption_overrides and assumption_review_mode=False.")
+        return "\n".join(lines)
+
     summary = summarize_dcf_payload(payload)
     return persist_tool_result(
         "run_dcf_workflow",
         {
             "ticker": ticker,
             "horizon_years": horizon_years,
-            "assumption_review_mode": assumption_review_mode,
             "allow_external_assumptions": allow_external_assumptions,
             "assumption_overrides": assumption_overrides or {},
         },
@@ -170,7 +220,46 @@ def run_dcf_workflow(
     )
 
 
-CHAT_TOOLS = [calculator, search_web, retrieve_tool_result, execute_python, run_dcf_workflow, search_documents]
+@tool
+def fetch_sec_filing(ticker: str, filing_type: str = "10-K") -> str:
+    """Fetch recent SEC EDGAR filings (10-K or 10-Q) for a company.
+
+    Returns extracted text from Risk Factors, MD&A, Business overview, and
+    quantitative disclosures sections. Use for any question about a company's
+    financials, risks, business model, or regulatory disclosures.
+    Prefer this over search_web for fundamental company research.
+    """
+    from graphs.workflows.dcf.sec_filings import fetch_sec_filings as _fetch  # noqa: PLC0415
+
+    items = _fetch(ticker.upper().strip(), max_filings=2)
+    if not items:
+        no_result = {"ticker": ticker, "error": f"No SEC filings found for {ticker}"}
+        return persist_tool_result(
+            "fetch_sec_filing", {"ticker": ticker, "filing_type": filing_type},
+            json.dumps(no_result), f"No SEC filings found for {ticker}",
+        )
+    sections = []
+    for item in items[:10]:
+        meta = item.get("metadata", {})
+        sections.append({
+            "filing_type": meta.get("filing_type", "?"),
+            "section": meta.get("section", "?"),
+            "as_of": item.get("as_of", "?"),
+            "text": (item.get("text") or "")[:2000],
+        })
+    filing_types = list({s["filing_type"] for s in sections})
+    summary = (
+        f"SEC filings for {ticker}: {len(sections)} section(s) "
+        f"from {filing_types}"
+    )
+    return persist_tool_result(
+        "fetch_sec_filing", {"ticker": ticker, "filing_type": filing_type},
+        json.dumps({"ticker": ticker, "sections": sections}, ensure_ascii=False),
+        summary,
+    )
+
+
+CHAT_TOOLS = [calculator, search_web, execute_python, search_documents, fetch_sec_filing, retrieve_tool_result, run_dcf_workflow]
 CHAT_TOOLS_BY_NAME = {t.name: t for t in CHAT_TOOLS}
 chat_agent_llm = llm.bind_tools(CHAT_TOOLS)
 
@@ -184,17 +273,30 @@ _CHAT_SYSTEM = (
     "- search_documents: search the user's uploaded files (PDFs, spreadsheets, reports). "
     "ALWAYS call this BEFORE search_web for any factual query — documents already uploaded may contain exactly what you need. "
     "Only fall back to search_web if search_documents returns no relevant results.\n"
+    "- fetch_sec_filing: fetch 10-K/10-Q filings from SEC EDGAR. Use for company risks, MD&A, or business overview — prefer over search_web for company fundamentals.\n"
     "- search_web: look up current news, prices, filings, or factual information NOT found in uploaded documents\n"
     "- retrieve_tool_result: read stored execute_python payloads when a tool returns a tool_result_id\n"
     "- calculator: evaluate mathematical expressions\n"
     "- execute_python: run code for data analysis, computations, or quick charts\n\n"
-    "- run_dcf_workflow: deterministic DCF valuation with sensitivity table for explicit intrinsic-value requests; "
-    "it can use uploaded documents and capped web search for assumptions. The tool result includes a "
-    "confidence label and quality flags — when confidence is medium or low, you must explicitly mention the "
-    "flagged assumptions and any implied-vs-spot price gap rather than presenting the result as a clean answer.\n\n"
+    "- run_dcf_workflow: deterministic DCF valuation for explicit intrinsic-value requests. "
+    "**Always call with assumption_review_mode=True first.** "
+    "This presents an interactive assumption review card to the user before computing valuation. "
+    "After the user reviews and approves (or edits) the assumptions, call again with assumption_review_mode=False "
+    "and any assumption_overrides the user specified. "
+    "The result includes full assumption provenance, WACC decomposition, confidence label, and quality flags. "
+    "When confidence is medium or low, mention flagged assumptions and any implied-vs-spot gap.\n\n"
     "## Behaviour\n"
     "- Use tools when the question requires current data or computation — don't guess.\n"
     "- For pure conceptual questions (e.g. 'what is DCF?'), answer directly without tools.\n"
+    "- For DCF/valuation requests: call run_dcf_workflow with assumption_review_mode=True first. "
+    "Wait for user to review the assumptions card. Then call again with assumption_review_mode=False "
+    "and assumption_overrides from user edits. Do NOT search_web for beta, shares outstanding, "
+    "WACC, or other DCF inputs — the workflow handles all of that.\n"
+    "- When user message starts with [DCF_APPROVED], parse the JSON after the colon. "
+    "Immediately call run_dcf_workflow with: ticker, horizon_years from the JSON, "
+    "assumption_review_mode=False, and assumption_overrides set to the 'all_assumptions' dict from the JSON "
+    "(pass ALL fields — this enables the fast valuation path that skips re-running evidence collection). "
+    "Do NOT output any text before calling the tool. Do NOT ask for confirmation. Do NOT modify the assumptions.\n"
     "- Keep answers focused and well-structured. Use markdown when helpful.\n"
     "- For news/current-events questions, produce an analyst brief: one-sentence bottom line, then 3-5 bullets covering what happened, why it matters, dates/numbers, and source names.\n"
     "- Do NOT answer by listing links or saying 'here are sources'. Links are citations, not the answer.\n"
@@ -311,11 +413,35 @@ def chat_node(state: dict) -> dict:
 
             history.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
+            # If the tool returned a HITL result (DCF assumptions for review),
+            # break the ReAct loop immediately — the LLM must present to user.
+            if "⛔ STOP" in str(result) or "DCF Assumptions for" in str(result):
+                break
+        else:
+            continue
+        break  # outer break — exit the for-loop over tool calls, then exit the round loop
+
     # ── Emit final response ───────────────────────────────────────────────────
     last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
     final_text = (last_ai.content if last_ai and isinstance(last_ai.content, str) else "") or ""
 
-    if used_tools:
+    # Detect DCF HITL card — skip verbose synthesis, use a single focused line.
+    _hitl_ticker = None
+    for _m in reversed(history):
+        if isinstance(_m, ToolMessage):
+            content = str(_m.content)
+            if "DCF Assumptions for" in content or "⛔ STOP" in content:
+                import re as _re
+                _match = _re.search(r"DCF Assumptions for (\w+)", content)
+                _hitl_ticker = _match.group(1) if _match else "?"
+                break
+
+    if _hitl_ticker:
+        # Do NOT emit chat_complete here — bridge already set status=awaiting_assumptions
+        # from the dcf_assumptions_review event, and we need the SSE stream to stay open
+        # so the user's /dcf-decision response can stream valuation events back.
+        return {"messages": [AIMessage(content="DCF assumptions ready for review.")]}
+    elif used_tools:
         history.append(HumanMessage(content=(
             "Now write the final answer from the tool results above. "
             "Do not call more tools. Do not list raw sources or links. "

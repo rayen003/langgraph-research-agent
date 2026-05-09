@@ -54,6 +54,11 @@ const TOOL_DISPLAY: Record<string, ToolDisplay> = {
     description: 'Deterministic discounted cash flow valuation',
     group: 'tool',
   },
+  fetch_sec_filing: {
+    label: 'Reading SEC filing',
+    description: 'Fetching 10-K/10-Q from EDGAR',
+    group: 'tool',
+  },
 }
 
 const WORKFLOW_LABEL: Record<string, string> = {
@@ -62,14 +67,15 @@ const WORKFLOW_LABEL: Record<string, string> = {
 
 const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
   dcf: {
-    start: 'Starting workflow',
     normalize_input: 'Resolving ticker & horizon',
-    hydrate_fundamentals: 'Fetching canonical fundamentals',
-    build_assumptions: 'Building assumptions',
+    assemble_evidence: 'Assembling evidence',
+    semantic_synthesis: 'Synthesizing company profile',
+    propose_assumptions: 'Proposing assumptions',
     assumption_review: 'Reviewing assumptions',
     collect_market_data: 'Fetching market data',
     project_cashflows: 'Projecting cash flows',
     compute_valuation: 'Computing valuation',
+    compute_implied_wacc: 'Market-implied WACC check',
     sensitivity: 'Running sensitivity table',
     finalize: 'Finalizing result',
   },

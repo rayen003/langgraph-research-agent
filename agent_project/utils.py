@@ -44,10 +44,25 @@ _ui_event_handler_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar(
     default=None,
 )
 
+_dcf_hitl_payload_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "dcf_hitl_payload",
+    default=None,
+)
+
 
 def set_ui_event_handler(handler: Any) -> None:
     """Register a callback that receives fine-grained execution events."""
     _ui_event_handler_ctx.set(handler)
+
+
+def set_dcf_hitl_payload(payload: dict | None) -> None:
+    """Store DCF HITL payload for inter-thread coordination."""
+    _dcf_hitl_payload_ctx.set(payload)
+
+
+def get_dcf_hitl_payload() -> dict | None:
+    """Retrieve stored DCF HITL payload."""
+    return _dcf_hitl_payload_ctx.get()
 
 
 def emit_ui_event(event: dict) -> None:

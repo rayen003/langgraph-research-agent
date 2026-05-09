@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react'
-import type { AgentRunState, ChatMessage, Mode, StepState, ToolCall } from '../types'
+import type { AgentRunState, ChatMessage, DcfReviewState, Mode, StepState, ToolCall } from '../types'
 import {
   activityStatusToToolStatus,
   isActivityEvent,
@@ -24,6 +24,7 @@ const INITIAL_STATE: AgentRunState = {
   completed_steps: 0,
   chat_messages: [],
   activity: [],
+  dcf_review: null,
 }
 
 /**
@@ -158,11 +159,27 @@ export function useAgentRun() {
         // contract. The workflow span now flows through `kind="workflow"`
         // and `kind="workflow_step"` activity entries instead.
 
-        case 'assumptions_ready':
-          return { ...prev, status: 'awaiting_assumptions' }
+        // NOTE: `workflow_started` and `workflow_step` legacy reducer
+        // branches were removed when DCF migrated to the unified `activity`
+        // contract. The workflow span now flows through `kind="workflow"`
+        // and `kind="workflow_step"` activity entries instead.
+
+        case 'dcf_assumptions_review':
+          return {
+            ...prev,
+            status: 'awaiting_assumptions',
+            dcf_review: {
+              ticker: (data.ticker as string) ?? '',
+              horizon_years: (data.horizon_years as number) ?? 5,
+              assumptions: (data.assumptions as Record<string, number>) ?? {},
+              provenance: (data.assumption_provenance as Record<string, { source?: string; confidence?: number }>) ?? {},
+              memo_proposals: (data.memo_proposals as Record<string, { rationale: string; confidence: number }>) ?? {},
+              evidence_items: (data.evidence_items as import('../types').EvidenceItem[]) ?? [],
+            },
+          }
 
         case 'assumptions_submitted':
-          return { ...prev, status: 'workflow_running' }
+          return { ...prev, status: 'chat_responding', dcf_review: null }
 
         case 'assumptions_rejected':
           return { ...prev, status: 'rejected' }
@@ -249,14 +266,19 @@ export function useAgentRun() {
             ...msgs,
             { id: nextId(), role: 'assistant' as const, content, streaming: false },
           ]
-          return { ...prev, status: 'complete', chat_messages: finalMsgs }
+          // If a DCF HITL card is pending, stay in awaiting_assumptions so
+          // the 150ms reset in App.tsx doesn't wipe dcf_review before the user
+          // sees the card. The next startRun call resets everything cleanly.
+          const nextStatus = prev.dcf_review ? 'awaiting_assumptions' : 'complete'
+          return { ...prev, status: nextStatus, chat_messages: finalMsgs }
         }
-
         // ── Shared terminal states ─────────────────────────────────────────
         case 'run_complete':
           return {
             ...prev,
-            status: prev.report || prev.chat_messages.length || data.workflow ? 'complete' : prev.status,
+            status: prev.dcf_review
+              ? prev.status  // HITL pending — don't complete, card must stay visible
+              : prev.report || prev.chat_messages.length || data.workflow ? 'complete' : prev.status,
           }
 
         case 'rejected':
@@ -344,11 +366,7 @@ export function useAgentRun() {
     const tid = state.thread_id
     if (!tid) return
     if (state.status === 'awaiting_assumptions') {
-      await fetch(`/workflows/dcf/runs/${tid}/assumptions-decision`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approved: true }),
-      })
+      setState(prev => ({ ...prev, status: 'chat_responding', dcf_review: null }))
       return
     }
     await fetch(`/runs/${tid}/decision`, {
@@ -359,16 +377,12 @@ export function useAgentRun() {
   }, [state.status, state.thread_id])
 
   const reject = useCallback(async () => {
-    const tid = state.thread_id
-    if (!tid) return
     if (state.status === 'awaiting_assumptions') {
-      await fetch(`/workflows/dcf/runs/${tid}/assumptions-decision`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approved: false }),
-      })
+      setState(prev => ({ ...prev, status: 'idle', dcf_review: null }))
       return
     }
+    const tid = state.thread_id
+    if (!tid) return
     await fetch(`/runs/${tid}/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

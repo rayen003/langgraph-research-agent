@@ -69,8 +69,10 @@ export default function App() {
     (query: string, selectedMode: Mode) => {
       if (!activeSession) return
 
-      // Add user message to the active session immediately
-      addMessage(activeSession.id, { id: nextMsgId(), type: 'user', content: query })
+      // Add user message to the active session (skip internal approval triggers)
+      if (!query.startsWith('[DCF_APPROVED]')) {
+        addMessage(activeSession.id, { id: nextMsgId(), type: 'user', content: query })
+      }
 
       // Chat queries reuse the session's dedicated chatThreadId for multi-turn context
       const resolvedIsChat =
@@ -106,10 +108,8 @@ export default function App() {
 
   const isRunActive = !['idle', 'complete', 'error', 'rejected'].includes(state.status)
 
-  // Execution panel: show whenever resolved_intent is research AND run is in some stage
-  const showExecutionPanel =
-    (state.resolved_intent === 'research' || state.status === 'awaiting_approval') &&
-    isRunActive
+  // Execution panel: show for ANY active non-idle run (research or chat)
+  const showExecutionPanel = isRunActive
 
   const selectedDoc = docs.find(d => d.doc_id === selectedDocId) ?? null
   // Document preview takes priority over execution sidebar when both could show
@@ -161,6 +161,9 @@ export default function App() {
               steps={state.steps}
               completedSteps={state.completed_steps}
               error={state.error}
+              activity={state.activity}
+              dcfReview={state.dcf_review ?? undefined}
+              threadId={state.thread_id}
               onApprove={approve}
               onReject={reject}
             />

@@ -1,9 +1,9 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MarkdownRenderer } from './MarkdownRenderer'
 import { QueryInput } from './QueryInput'
 import { ActivityTrace, ResearchStepsTrace } from './ActivityTrace'
 import type { ActivityEntry } from '../lib/activity'
-import type { AgentRunState, DocumentInfo, Mode, Session, SessionMessage, StepState, ToolCall } from '../types'
+import type { AgentRunState, DocumentInfo, DcfReviewState, Mode, Session, SessionMessage, StepState, ToolCall } from '../types'
 
 const IMAGE_RE = /\.(png|jpg|jpeg|webp|gif|svg)$/i
 const ARTIFACT_MARKER_RE = /\[ARTIFACTS?\]|\[CHART\]/i
@@ -45,6 +45,11 @@ function ChatBubble({
   toolCalls,
   activities,
   persisted,
+  dcfReview,
+  onDcfApprove,
+  onDcfReject,
+  threadId,
+  hideLabel,
 }: {
   content: string
   streaming?: boolean
@@ -54,6 +59,11 @@ function ChatBubble({
   activities?: ActivityEntry[]
   /** True when rendering a committed message (read-only). */
   persisted?: boolean
+  dcfReview?: DcfReviewState
+  onDcfApprove?: (overrides?: Record<string, number>) => void
+  onDcfReject?: () => void
+  threadId?: string
+  hideLabel?: boolean
 }) {
   const useUnified = !!(activities && activities.length)
   const calls = toolCalls ?? []
@@ -71,14 +81,18 @@ function ChatBubble({
   return (
     <div className="flex justify-start animate-fade-up">
       <div className="max-w-[85%] min-w-0 w-full">
-        <AgentLabel />
+        {!hideLabel && <AgentLabel />}
         <div className="pl-1 space-y-2">
           {hasAnyActivity && (
             <ActivityTrace
               toolCalls={useUnified ? undefined : calls}
               activities={useUnified ? activities : undefined}
               scope={useUnified ? 'chat' : undefined}
-              defaultOpen={defaultOpen}
+              defaultOpen={defaultOpen || !!dcfReview}
+              dcfReview={dcfReview}
+              onDcfApprove={onDcfApprove}
+              onDcfReject={onDcfReject}
+              threadId={threadId}
             />
           )}
 
@@ -235,7 +249,10 @@ function ThinkingDots() {
 // ── Committed message renderer ────────────────────────────────────────────────
 
 function CommittedMessage({ msg }: { msg: SessionMessage }) {
-  if (msg.type === 'user') return <UserBubble content={msg.content} />
+  if (msg.type === 'user') {
+    if (msg.content.startsWith('[DCF_APPROVED]')) return null
+    return <UserBubble content={msg.content} />
+  }
   if (msg.type === 'chat_response') {
     return (
       <ChatBubble
@@ -421,19 +438,39 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
               <CommittedMessage key={msg.id} msg={msg} />
             ))}
 
-            {/* Live: user message before session commit is visible */}
-            {showPendingUser && <UserBubble content={activeRun.query} />}
+            {/* Live: user message before session commit is visible.
+                Hide [DCF_APPROVED] approval triggers — the confirmed card and
+                activity trace make the action visible without a text bubble. */}
+            {showPendingUser && !activeRun.query.startsWith('[DCF_APPROVED]') && (
+              <UserBubble content={activeRun.query} />
+            )}
 
             {/* Live: chat streaming — chat-scoped activities feed the bubble. */}
-            {isChatRun && liveChatMessages.map(m => {
+            {isChatRun && liveChatMessages.map((m, idx) => {
               if (m.role !== 'assistant') return null
-              const chatActivities = activeRun.activity.filter(a => a.scope === 'chat')
+              const assistantMsgs = liveChatMessages.filter(x => x.role === 'assistant')
+              const isLast = idx === liveChatMessages.length - 1 || m.id === assistantMsgs[assistantMsgs.length - 1]?.id
+              const chatActivities = isLast ? activeRun.activity.filter(a => a.scope === 'chat') : []
+              const hasDcf = isLast && !!activeRun.dcf_review
+              const prevMsg = liveChatMessages[idx - 1]
+              const hideLabel = !!prevMsg && prevMsg.role === 'assistant'
               return (
                 <ChatBubble
                   key={m.id}
                   content={m.content}
                   streaming={m.streaming}
                   activities={chatActivities.length > 0 ? chatActivities : undefined}
+                  dcfReview={hasDcf ? activeRun.dcf_review! : undefined}
+                  onDcfApprove={hasDcf ? () => {
+                    // DcfHitlSection calls /dcf-decision endpoint directly when threadId set.
+                    // This callback is a no-op fallback for missing threadId.
+                  } : undefined}
+                  onDcfReject={hasDcf ? () => {
+                    // DcfHitlSection calls /dcf-decision endpoint directly when threadId set.
+                    // No-op fallback.
+                  } : undefined}
+                  threadId={activeRun.thread_id || undefined}
+                  hideLabel={hideLabel}
                 />
               )
             })}

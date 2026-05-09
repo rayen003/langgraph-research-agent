@@ -1,13 +1,18 @@
-import type { RunStatus, StepState } from '../types'
+import type { RunStatus, StepState, DcfReviewState } from '../types'
+import type { ActivityEntry } from '../lib/activity'
 import { StepCard } from './StepCard'
+import { ActivityTrace, DcfHitlSection } from './ActivityTrace'
 
 interface Props {
   status: RunStatus
   steps: StepState[]
   completedSteps: number
   error: string | null
+  activity?: ActivityEntry[]
+  dcfReview?: DcfReviewState
   onApprove: () => void
   onReject: () => void
+  threadId?: string | null
 }
 
 export function ExecutionSidebar({
@@ -15,10 +20,15 @@ export function ExecutionSidebar({
   steps,
   completedSteps,
   error,
+  activity,
+  dcfReview,
   onApprove,
   onReject,
+  threadId,
 }: Props) {
   const totalSteps = steps.length
+  const hasActivity = activity && activity.length > 0
+  const isChatMode = totalSteps === 0 && hasActivity
   const progress = totalSteps > 0 ? (completedSteps / totalSteps) * 100 : 0
   const isAwaitingPlan = status === 'awaiting_approval'
   const isAwaitingAssumptions = status === 'awaiting_assumptions'
@@ -35,7 +45,7 @@ export function ExecutionSidebar({
       <div className="px-5 pt-5 pb-4 border-b border-[#161616] flex-shrink-0 space-y-3">
         <div className="flex items-center justify-between">
           <span className="text-[11px] font-medium text-zinc-600 tracking-widest uppercase">
-            Execution
+            {isChatMode ? 'Workflow' : 'Execution'}
           </span>
           {totalSteps > 0 && (
             <span className="text-[11px] text-zinc-700 tabular-nums">
@@ -63,11 +73,18 @@ export function ExecutionSidebar({
         </div>
 
         {/* Current step label */}
-        <CurrentStepLabel status={status} steps={steps} completedSteps={completedSteps} totalSteps={totalSteps} />
+        {!isChatMode && (
+          <CurrentStepLabel status={status} steps={steps} completedSteps={completedSteps} totalSteps={totalSteps} />
+        )}
       </div>
 
       {/* ── Step list ────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto px-5 py-4">
+
+        {/* Chat mode: render activity trace directly */}
+        {isChatMode && (
+          <ActivityTrace activities={activity!} defaultOpen label="DCF Workflow" />
+        )}
 
         {status === 'planning' && (
           <div className="space-y-3 animate-fade-up">
@@ -122,34 +139,26 @@ export function ExecutionSidebar({
       {/* ── HITL footer ──────────────────────────────────── */}
       {isAwaiting && (
         <div className="flex-shrink-0 px-5 py-4 border-t border-[#161616] space-y-3 animate-fade-up">
-          <p className="text-[11px] text-zinc-600 leading-relaxed">
-            {isAwaitingPlan
-              ? 'Review the plan above. Once approved, execution begins immediately.'
-              : 'Review workflow assumptions. Approve to continue deterministic valuation.'}
-          </p>
-          <div className="flex gap-2">
-            <button
-              onClick={onApprove}
-              className="
-                flex-1 py-2 rounded-lg text-xs font-medium
-                bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700
-                text-white transition-colors duration-150
-              "
-            >
-              {isAwaitingPlan ? 'Approve & Run' : 'Approve Assumptions'}
-            </button>
-            <button
-              onClick={onReject}
-              className="
-                flex-1 py-2 rounded-lg text-xs font-medium
-                bg-[#161616] hover:bg-[#1e1e1e] active:bg-[#121212]
-                text-zinc-500 border border-[#2a2a2a]
-                transition-colors duration-150
-              "
-            >
-              {isAwaitingPlan ? 'Reject' : 'Reject Assumptions'}
-            </button>
-          </div>
+          {isAwaitingAssumptions && dcfReview && threadId && (
+            <DcfHitlSection review={dcfReview} threadId={threadId} onApprove={onApprove} onReject={onReject} />
+          )}
+          {!isAwaitingAssumptions && (
+            <>
+              <p className="text-[11px] text-zinc-600 leading-relaxed">
+                {isAwaitingPlan
+                  ? 'Review the plan above. Once approved, execution begins immediately.'
+                  : 'Review workflow assumptions. Approve to continue deterministic valuation.'}
+              </p>
+              <div className="flex gap-2">
+                <button onClick={onApprove} className="flex-1 py-2 rounded-lg text-xs font-medium bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white transition-colors duration-150">
+                  {isAwaitingPlan ? 'Approve & Run' : 'Approve Assumptions'}
+                </button>
+                <button onClick={onReject} className="flex-1 py-2 rounded-lg text-xs font-medium bg-[#161616] hover:bg-[#1e1e1e] active:bg-[#121212] text-zinc-500 border border-[#2a2a2a] transition-colors duration-150">
+                  {isAwaitingPlan ? 'Reject' : 'Reject Assumptions'}
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

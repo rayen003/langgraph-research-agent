@@ -4,7 +4,7 @@
   ],
   "graphs": {
     "agent": "./agent_project/file.py:studio_app",
-    "dcf_workflow": "./agent_project/graphs/workflows/dcf.py:dcf_workflow_app"
+    "dcf_workflow": "./agent_project/graphs/workflows/dcf:dcf_workflow_app"
   },
   "env": "./agent_project/.env"
 }

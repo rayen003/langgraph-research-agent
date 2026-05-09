@@ -65,6 +65,44 @@ export interface AgentRunState {
    * existing renderers (StepCard, ResearchStepsTrace) keep working.
    */
   activity: ActivityEntry[]
+  dcf_review?: DcfReviewState | null
+}
+
+export interface EvidenceItem {
+  evidence_id: string
+  kind: string
+  source_tier: 'filing' | 'structured_api' | 'document' | 'news' | 'generic_web' | string
+  source: string
+  as_of: string
+  title?: string
+  url?: string
+  text?: string
+  field?: string
+  value?: number
+  section?: string
+  filing_type?: string
+}
+
+export interface ConfidenceComponent {
+  score: number
+  label: 'high' | 'medium' | 'low'
+  reason: string
+}
+
+export interface ConfidenceBreakdown {
+  components: Record<string, ConfidenceComponent>
+  aggregate_score: number
+  label: 'high' | 'medium' | 'low'
+  summary: string
+}
+
+export interface DcfReviewState {
+  ticker: string
+  horizon_years: number
+  assumptions: Record<string, number>
+  provenance: Record<string, { source?: string; confidence?: number }>
+  memo_proposals?: Record<string, { rationale: string; confidence: number }>
+  evidence_items?: EvidenceItem[]
 }
 
 // ── Session / history types ───────────────────────────────────────────────
