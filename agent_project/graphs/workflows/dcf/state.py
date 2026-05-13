@@ -56,6 +56,12 @@ class DCFState(TypedDict):
     confidence_breakdown: dict[str, Any] | None
     # Market-implied WACC vs CAPM sanity check (computed after valuation).
     wacc_sanity: dict[str, Any] | None
+    # Investment thesis (formulated before assumptions).
+    thesis: dict[str, Any] | None
+    # Analysis loop state.
+    analysis_iteration: int
+    critique: dict[str, Any] | None
+    previous_valuation: dict[str, float] | None
 
 
 # ---------------------------------------------------------------------------

@@ -292,14 +292,6 @@ def get_run_dir() -> Path:
     return RUNS_DIR / current_thread_id
 
 
-def save_plan(plan: dict) -> str:
-    plans_dir = get_run_dir() / "plans"
-    plans_dir.mkdir(parents=True, exist_ok=True)
-    path = plans_dir / f"{plan['plan_id']}.json"
-    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
-    return str(path)
-
-
 def get_artifacts_dir() -> Path:
     artifacts_dir = get_run_dir() / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -322,12 +314,6 @@ def list_artifact_paths() -> list[str]:
     run_dir = get_run_dir()
     artifacts_dir = get_artifacts_dir()
     return sorted(str(path.relative_to(run_dir)) for path in artifacts_dir.iterdir() if path.is_file())
-
-
-def save_final_report(markdown: str) -> str:
-    path = get_run_dir() / "final_report.md"
-    path.write_text(markdown, encoding="utf-8")
-    return str(path)
 
 
 def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -> str:
@@ -357,43 +343,42 @@ def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -
 
 
 def format_tool_call(tool_name: str, args: dict) -> None:
-    """Print a compact tool-call trace line."""
+    """Print a structured tool-call trace line via agent_log."""
+    import agent_log  # noqa: PLC0415
     args_str = json.dumps(args, ensure_ascii=False)
     if len(args_str) > TOOL_CALL_ARGS_MAX_LEN:
-        args_str = args_str[:TOOL_CALL_ARGS_MAX_LEN] + "..."
-    console.print(f"  [dim]🔧 {tool_name}({args_str})[/dim]")
+        args_str = args_str[:TOOL_CALL_ARGS_MAX_LEN] + "…"
+    agent_log.tool_call(tool_name, args_str, depth=1)
 
 
 def format_tool_result(result_str: str) -> None:
-    """Print a compact tool-result trace line. For retrieve_tool_result, show content snippet."""
+    """Extract a human-readable summary from a tool result and log it."""
+    import agent_log  # noqa: PLC0415
     try:
         payload = json.loads(result_str)
     except (json.JSONDecodeError, TypeError):
         payload = None
-    if not isinstance(payload, dict):
-        short = str(result_str).strip().replace("\n", " ")[:200]
-        console.print(f"  [dim]  ↳ {short}{'...' if len(result_str) > 200 else ''}[/dim]")
+
+    if isinstance(payload, dict):
+        if "result" in payload:
+            raw = payload.get("result", "")
+            snippet = str(raw).strip().replace("\n", " ")[:160]
+            agent_log.info(f"↳ [green]retrieved[/green] {snippet}{'…' if len(str(raw)) > 160 else ''}", depth=2)
+            return
+        summary = payload.get("summary", "")
+        stored = payload.get("stored_at", "")
+        if summary:
+            agent_log.info(f"↳ {summary}" + (f"  [dim]{stored}[/dim]" if stored else ""), depth=2)
         return
-    # Full retrieval (has "result" field) — show content snippet so user sees retrieval worked
-    if "result" in payload:
-        raw = payload.get("result", "")
-        if isinstance(raw, str):
-            snippet = raw.strip().replace("\n", " ")[:280]
-            console.print(f"  [dim]  ↳ [green]Retrieved:[/green] {snippet}{'...' if len(raw) > 280 else ''}[/dim]")
-        else:
-            console.print(f"  [dim]  ↳ [green]Retrieved:[/green] {str(raw)[:200]}...[/dim]")
-        return
-    # Pointer (summary + stored_at)
-    summary = payload.get("summary", "")
-    stored = payload.get("stored_at", "")
-    console.print(f"  [dim]  ↳ {summary}[/dim]")
-    if stored:
-        console.print(f"  [dim]    📁 {stored}[/dim]")
+
+    short = str(result_str).strip().replace("\n", " ")[:160]
+    agent_log.info(f"↳ {short}{'…' if len(result_str) > 160 else ''}", depth=2)
 
 
 def format_tool_error(tool_name: str, error: str) -> None:
-    """Print a tool error trace line."""
-    console.print(f"  [red]  ✗ {tool_name} error: {error}[/red]")
+    """Print a tool error trace line via agent_log."""
+    import agent_log  # noqa: PLC0415
+    agent_log.tool_error(tool_name, error, depth=1)
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -618,37 +603,6 @@ def mark_step(plan: dict, step_id: str, status: str, result: str | None = None) 
                 step["result"] = result
             break
     return plan
-
-
-def persist_context_item(
-    title: str,
-    content: str,
-    kind: str,
-    step_id: str | None = None,
-    tool_result_ids: list[str] | None = None,
-) -> dict:
-    """Persist full context content to disk and return stack metadata pointer."""
-    item_id = f"{kind}_{uuid4().hex[:12]}"
-    ctx_dir = get_run_dir() / "context_items"
-    ctx_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "context_item_id": item_id,
-        "kind": kind,
-        "title": title,
-        "step_id": step_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "content": content,
-        "tool_result_ids": tool_result_ids or [],
-    }
-    file_path = ctx_dir / f"{item_id}.json"
-    file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    return {
-        "context_item_id": item_id,
-        "kind": kind,
-        "title": title,
-        "step_id": step_id,
-        "stored_at": str(file_path),
-    }
 
 
 async def stream_agent(agent, query, config=None):

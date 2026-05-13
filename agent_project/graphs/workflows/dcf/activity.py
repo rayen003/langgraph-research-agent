@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import agent_log
 from utils import emit_activity, emit_ui_event
 
 # Map internal step-status strings to the ActivityStatus literal.
@@ -47,6 +48,13 @@ def emit_step(
         elif "implied_share_price" in payload:
             summary = f"implied ${payload['implied_share_price']:.2f}"
         meta = dict(payload)
+
+    # ── Terminal log ────────────────────────────────────────────────────────
+    if status == "start":
+        agent_log.dcf_step_start(step, parent_step_id, summary)
+    else:
+        agent_log.dcf_step_done(step, parent_step_id, summary, activity_status)
+
     emit_activity(
         activity_id=f"dcf_{parent_step_id}_{step}",
         kind="workflow_step",

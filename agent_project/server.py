@@ -30,6 +30,7 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+import agent_log
 import dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +41,7 @@ dotenv.load_dotenv(Path(__file__).parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from plan_store import save_plan as save_plan_to_store  # noqa: E402
 from storage import (  # noqa: E402
     append_job_event,
     get_job,
@@ -48,7 +50,6 @@ from storage import (  # noqa: E402
     list_job_events,
     list_jobs as list_stored_jobs,
     mark_stale_running_jobs,
-    sync_job_steps,
     update_job,
     upsert_job,
 )
@@ -164,7 +165,7 @@ def _prepare_plan_for_resume(plan: dict) -> dict:
 
 
 async def _resume_research_task(thread_id: str, session_id: str = "") -> None:
-    from graphs.research import execute_plan_node, synthesize_node, update_memory_node  # noqa: PLC0415
+    from graphs.research import execute_one_step_node, route_after_step, synthesize_node, update_memory_node  # noqa: PLC0415
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     loop = asyncio.get_running_loop()
@@ -188,8 +189,7 @@ async def _resume_research_task(thread_id: str, session_id: str = "") -> None:
             raise RuntimeError(f"No persisted plan found for '{thread_id}'.")
 
         plan = _prepare_plan_for_resume(plan)
-        plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-        sync_job_steps(thread_id, plan)
+        save_plan_to_store(thread_id, plan)
 
         rs.status = "executing"
         update_job(thread_id, status="executing", intent="research")
@@ -204,8 +204,13 @@ async def _resume_research_task(thread_id: str, session_id: str = "") -> None:
             "session_memory": get_session_memory(session_id),
         }
 
-        executed = await asyncio.to_thread(execute_plan_node, state)
-        state.update(executed)
+        # Execute steps one at a time via the new per-step node so each step
+        # is a real LangGraph node invocation → checkpointing, streaming.
+        while True:
+            executed = await asyncio.to_thread(execute_one_step_node, state)
+            state.update(executed)
+            if route_after_step(state) != "execute_one_step":
+                break
 
         synthesized = await asyncio.to_thread(synthesize_node, state)
         state.update(synthesized)
@@ -238,6 +243,34 @@ def _should_auto_resume(job: dict) -> bool:
     if plan.get("status") not in {"approved", "in_progress"}:
         return False
     return any(step.get("status") != "completed" for step in plan.get("steps", []))
+
+
+async def _handle_dcf_hitl(rs: RunState, thread_id: str, dcf_data: dict) -> dict | None:
+    """Common DCF HITL handler used by both chat and research paths.
+
+    Creates a future, waits for the user to approve/reject, and returns
+    the assumption overrides (or None if rejected).  Callers decide how
+    to resume execution (new ainvoke vs Command(resume)).
+    """
+    rs.hitl_future = rs.loop.create_future()
+    decision = await rs.hitl_future
+
+    if not decision.get("approved"):
+        rs.status = "rejected"
+        update_job(thread_id, status=rs.status)
+        _send_event(rs, {"type": "assumptions_rejected", "workflow": "dcf"})
+        return None
+
+    overrides = decision.get("assumptions_overrides") or {}
+    _send_event(
+        rs,
+        {
+            "type": "assumptions_submitted",
+            "workflow": "dcf",
+            "overrides_applied": bool(overrides),
+        },
+    )
+    return overrides
 
 
 def _make_event_bridge(rs: RunState):
@@ -293,6 +326,7 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
     set_thread_id(thread_id)
     set_ui_event_handler(_make_event_bridge(rs))
     session_memory = get_session_memory(session_id)
+    _run_t = agent_log.run_start(thread_id, query, mode)
 
     try:
         # Phase 1 — intent + (plan for research | chat for conversational)
@@ -310,38 +344,22 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
         interrupts = result.get("__interrupt__", ())
 
         # Check for DCF HITL — payload set by event bridge when dcf_assumptions_review fires
+        # (chat mode: tool emitted event, chat_node broke its ReAct loop).
         if rs.dcf_hitl_payload:
-            dcf_hitl = rs.dcf_hitl_payload
-            rs.hitl_future = rs.loop.create_future()
-            # Event already emitted by run_dcf_workflow tool and bridge set status
-            decision = await rs.hitl_future
-            rs.dcf_hitl_payload = None  # clear for next run
-
-            if not decision.get("approved"):
-                rs.status = "rejected"
-                update_job(thread_id, status=rs.status)
-                _send_event(rs, {"type": "assumptions_rejected", "workflow": "dcf"})
+            dcf_data = rs.dcf_hitl_payload
+            rs.dcf_hitl_payload = None  # consumed
+            overrides = await _handle_dcf_hitl(rs, thread_id, dcf_data)
+            if overrides is None:
                 rs.event_queue.put_nowait(None)
                 return
 
-            # User approved — resume DCF workflow with overrides if any
-            overrides = decision.get("assumptions_overrides") or {}
-            _send_event(
-                rs,
-                {
-                    "type": "assumptions_submitted",
-                    "workflow": "dcf",
-                    "overrides_applied": bool(overrides),
-                },
-            )
-
-            # Re-invoke chat with approval message to trigger DCF completion
+            # User approved — re-invoke chat with approval message to trigger DCF completion
             rs.status = "chat_responding"
             update_job(thread_id, status=rs.status)
             approval_payload = {
-                "ticker": dcf_hitl.get("ticker", "?"),
-                "horizon_years": dcf_hitl.get("horizon_years", 5),
-                "all_assumptions": overrides or dcf_hitl.get("assumptions", {}),
+                "ticker": dcf_data.get("ticker", "?"),
+                "horizon_years": dcf_data.get("horizon_years", 5),
+                "all_assumptions": overrides or dcf_data.get("assumptions", {}),
             }
             approval_message = f"[DCF_APPROVED]:{json.dumps(approval_payload)}"
 
@@ -369,7 +387,7 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
 
         # Interrupt → research HITL flow
         plan = interrupts[0].value.get("plan", {})
-        sync_job_steps(thread_id, plan)
+        save_plan_to_store(thread_id, plan)
         rs.status = "awaiting_approval"
         update_job(thread_id, status=rs.status)
         rs.hitl_future = rs.loop.create_future()
@@ -388,14 +406,36 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
         update_job(thread_id, status=rs.status)
         _send_event(rs, {"type": "execution_started"})
 
-        # Phase 2 — execute + synthesize
-        await agent_graph.ainvoke(
-            Command(resume={"action": "yes", "feedback": None}),
-            config=config,
-        )
+        # Phase 2 — execute + synthesize (with DCF HITL support)
+        # The graph may hit DCF review interrupts while executing steps.
+        # Loop: invoke → check for interrupts → handle → resume → repeat.
+        resume_value = {"action": "yes", "feedback": None}
+        while True:
+            result = await agent_graph.ainvoke(
+                Command(resume=resume_value),
+                config=config,
+            )
+            interrupts = result.get("__interrupt__", ())
+            if not interrupts:
+                break  # done — graph reached END
+
+            # Check if this interrupt is a DCF assumption review
+            value = interrupts[0].value if hasattr(interrupts[0], "value") else {}
+            if isinstance(value, dict) and value.get("type") == "dcf_review":
+                overrides = await _handle_dcf_hitl(rs, thread_id, value)
+                if overrides is None:
+                    rs.event_queue.put_nowait(None)
+                    return
+                resume_value = {"approved": True, "assumption_overrides": overrides}
+                continue
+
+            # Unknown interrupt — shouldn't happen in Phase 2, but surface it
+            logger.warning("Unexpected interrupt in Phase 2: %s", value)
+            break
 
         update_job(thread_id, status="complete")
         _send_event(rs, {"type": "run_complete"})
+        agent_log.run_done(thread_id, _run_t, "done")
 
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
@@ -403,6 +443,7 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
         rs.status = "error"
         update_job(thread_id, status=rs.status, error=f"{type(exc).__name__}: {exc}")
         _send_event(rs, {"type": "error", "message": f"{type(exc).__name__}: {exc}\n\n{tb}"})
+        agent_log.run_done(thread_id, _run_t, "error")
     finally:
         rs.event_queue.put_nowait(None)  # sentinel — closes SSE stream
         if rs.status not in _RUNNING_STATUSES:
@@ -448,6 +489,12 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
         "evidence_pack": {},
         "company_state": None,
         "assumption_memo": None,
+        "confidence_breakdown": None,
+        "wacc_sanity": None,
+        "thesis": None,
+        "analysis_iteration": 0,
+        "critique": None,
+        "previous_valuation": None,
     }
 
     try:

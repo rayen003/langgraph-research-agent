@@ -7,14 +7,16 @@
 
 ## Project Overview
 
-A LangGraph-based research agent with a plan-then-execute flow, human-in-the-loop (HITL) approval, local Python execution for charts/data fetching, and a Chainlit UI.
+A LangGraph-based research agent with a plan-then-execute flow, human-in-the-loop (HITL) approval, multi-turn conversational chat, local Python execution, DCF valuation workflow, and a React frontend.
 
 **Stack:**
 - **Orchestration:** LangGraph + LangChain
 - **Model:** OpenAI `gpt-5-nano` (easily swappable)
-- **Search:** Tavily (`search_web` tool)
-- **Python execution:** Local subprocess execution via `execute_python` (`pandas`/`matplotlib`/`requests`/`yfinance`)
-- **UI:** Chainlit 2.10 with custom React elements
+- **Search:** Exa (`search_web` tool)
+- **Python execution:** Local subprocess via `execute_python` (`pandas`/`matplotlib`/`requests`/`yfinance`)
+- **Documents:** ChromaDB + BM25 hybrid RAG
+- **DCF valuation:** Deterministic subgraph with SEC EDGAR, FMP/yfinance, CAPM WACC, sensitivity
+- **UI:** Vite + React + TypeScript + Tailwind CSS
 - **Package manager:** `uv`
 
 ---
@@ -22,20 +24,44 @@ A LangGraph-based research agent with a plan-then-execute flow, human-in-the-loo
 ## Repository Layout
 
 ```
-lca-reliable-agents/
-├── agent_project/
-│   ├── file.py          # Core agent: graph, tools, prompts, nodes
-│   ├── utils.py         # Persistence helpers, Rich formatting, UI event hooks
-│   ├── app.py           # Chainlit entrypoint
-│   ├── server.py        # FastAPI backend (artifact serving, plan endpoint)
-│   ├── runs/            # Per-thread run dirs (plans, tool_results, artifacts)
-│   ├── chainlit.md      # Chainlit welcome message
-│   └── public/
-│       └── elements/
-│           ├── PlanCard.jsx     # Collapsible plan card custom element
-│           └── StepTracker.jsx  # Live vertical timeline custom element
-├── pyproject.toml       # uv dependencies
-└── AGENT_PROJECT.md     # ← this file
+agent_project/
+├── file.py                # Parent graph: intent routing, state, compilation
+├── tools.py               # Canonical tool definitions (shared by all subgraphs)
+├── plan_store.py          # Single seam for plan persistence (disk + SQLite)
+├── activity.py            # Unified activity-event contract
+├── utils.py               # UI event bridge, tool result persistence, formatting
+├── storage.py             # SQLite persistence (jobs, events, steps, sessions, docs)
+├── documents.py           # RAG pipeline: upload → chunk → embed → ChromaDB
+├── web_search.py          # Exa search client
+├── server.py              # FastAPI backend (SSE, HITL, artifacts, jobs, DCF workflow endpoint)
+├── app.py                 # Chainlit entrypoint
+├── graphs/
+│   ├── __init__.py
+│   ├── research.py        # Research subgraph: plan, HITL review, execute, synthesize, memory
+│   ├── conversational.py  # Chat subgraph: ReAct loop with streaming
+│   └── workflows/
+│       └── dcf/           # DCF valuation subgraph (13 modules)
+│           ├── graph.py   # Graph wiring + public API
+│           ├── state.py   # DCFState TypedDict + constants
+│           ├── evidence.py    # Evidence assembly (5 tiers: filing > api > doc > news > web)
+│           ├── fundamentals.py # FMP/yfinance fetchers
+│           ├── sec_filings.py  # SEC EDGAR integration
+│           ├── synthesis.py    # LLM semantic synthesis (CompanyState)
+│           ├── memo.py         # LLM assumption memo (proposals + rationale)
+│           ├── wacc.py         # CAPM WACC estimation
+│           ├── valuation.py    # Deterministic FCFF math (project → PV → TV → equity)
+│           ├── priors.py       # Profile priors + confidence breakdown
+│           ├── review.py       # HITL assumption review gate
+│           ├── assumptions.py  # Legacy regex-merge heuristics (unused)
+│           └── activity.py     # DCF workflow activity emitters
+├── frontend/              # Vite + React + TypeScript + Tailwind
+│   └── src/
+│       ├── App.tsx        # Root: idle hero vs two-pane
+│       ├── types.ts       # Shared TypeScript contracts
+│       └── components/    # QueryInput, ReportPane, ExecutionSidebar, StepCard,
+│                           # ActivityTrace, DcfHitlSection, MessageThread, ChatBubble…
+└── public/
+    └── elements/          # Chainlit custom React elements (legacy)
 ```
 
 ---
@@ -45,24 +71,51 @@ lca-reliable-agents/
 ### Graph Flow
 
 ```
-START → plan → review_plan (HITL interrupt) → execute_plan → synthesize → update_memory → END
-                    ↓ (rejected)
-                   END
+START → intent
+          │
+      route_intent
+        ↙         ↘
+     chat        plan
+      │            │
+     END       review_plan (HITL interrupt)
+                  │
+            route_after_review
+               ↙            ↘
+       execute_one_step     END (rejected)
+              │
+        route_after_step
+         ↙              ↘
+  execute_one_step   synthesize
+  (more pending)          │
+                     update_memory → END
 ```
+
+Each `execute_one_step` is a real LangGraph node invocation → per-step checkpointing, streaming, and interrupt support.
 
 ### AgentState
 
 ```python
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    # Routing
+    mode: str           # "auto" | "research" | "chat" — user's selected mode
+    resolved_intent: str | None  # "research" | "chat" — set by intent_node
+    # Research subgraph fields
     plan: dict | None
     plan_path: str | None
     objective: str
     approved: bool
     review_feedback: str | None
     context_stack: list[dict]   # append-only per plan; reset on new plan
-    session_memory: str          # persists across plans within a session
+    # Shared memory (persists across turns in the same LangGraph thread)
+    session_memory: str
+    # RAG session scope — used to filter uploaded documents
+    session_id: str
 ```
+
+### Intent Classification
+
+`intent_node` uses `gpt-4o-mini` for auto-classification (fast, cheap). User can force `"research"` or `"chat"` mode via a pill selector. Auto mode classifies from the last 6 messages of conversation history.
 
 ### Context Management (Manus-inspired)
 
@@ -70,15 +123,41 @@ class AgentState(TypedDict):
 - **Full results on disk:** tool outputs saved as JSON under `runs/<thread_id>/tool_results/`.
 - **Pointer pattern:** tools return a `tool_result_id` pointer; agent calls `retrieve_tool_result(id)` to fetch the full payload only when needed.
 
-### Tools
+### Tools (canonical definitions in `tools.py`, shared by all subgraphs)
 
 | Tool | Purpose |
 |---|---|
-| `search_web` | Tavily web search → persists result, returns pointer |
+| `search_web` | Exa semantic search → persists result, returns pointer |
+| `search_documents` | ChromaDB + BM25 hybrid retrieval over uploaded PDFs/CSVs |
+| `fetch_sec_filing` | Free SEC EDGAR 10-K/10-Q section extraction |
 | `calculator` | Safe math eval via `simpleeval` |
-| `retrieve_context` | Look up a prior step's summary + tool_result_ids from saved plan |
+| `retrieve_context` | Look up a prior step's summary + tool_result_ids from saved plan (research-only) |
 | `retrieve_tool_result` | Fetch full content of any stored tool result by ID |
-| `execute_python` | Run Python in Daytona sandbox; download artifacts (plots) |
+| `execute_python` | Run Python locally with `yfinance`/`matplotlib`/`pandas`/`requests` |
+| `run_dcf_workflow` | Deterministic DCF valuation subgraph (shared across chat and research) |
+
+### DCF Workflow — Unified Across Chat and Research
+
+The canonical `run_dcf_workflow` tool (in `tools.py`) emits `dcf_assumptions_review` SSE events on HITL, storing the payload via `set_dcf_hitl_payload()`. Both chat and research modes use the **same** tool instance — zero duplication.
+
+| Mode | Pause mechanism | Resume |
+|------|----------------|--------|
+| Chat | ReAct loop detects `"⛔ STOP"` in tool output → breaks loop | Server injects `[DCF_APPROVED]` message → new `ainvoke` |
+| Research | `execute_one_step_node` detects `get_dcf_hitl_payload()` → calls `interrupt()` | `Command(resume={"approved": True, "assumption_overrides": {...}})` |
+
+Both show the same `DcfHitlSection` component (assumptions table, EvidencePanel, ConfidenceBreakdownPanel, ImpliedWaccDetail, approve/reject buttons) via the shared `dcf_assumptions_review` SSE event on the frontend.
+
+### PlanStore — Single Seam for Persistence
+
+`plan_store.py` unifies the dual-write pattern (disk JSON + SQLite) behind three functions:
+
+| Function | Does |
+|----------|------|
+| `save_plan(thread_id, plan)` | Disk write + SQLite `sync_job_steps` |
+| `update_step(thread_id, plan, step_id, *, status, result, tool_result_ids)` | Mutates plan dict, saves to disk, updates SQLite row |
+| `save_report(thread_id, session_id, objective, content)` | Disk write + SQLite `store_report` |
+
+Callers never know about disk vs SQLite — one call does both. Tool results stay disk-only (`utils.persist_tool_result`), session memory stays SQLite-only.
 
 ### Persistence Layout (per thread)
 
@@ -88,169 +167,46 @@ runs/<thread_id>/
 ├── tool_results/        # full tool output payloads (JSON, one file per call)
 ├── artifacts/           # downloaded sandbox files (PNG plots, etc.)
 └── final_report.md      # synthesized markdown report
+
+runs/agent.db            # SQLite: jobs, job_events, job_steps, reports, session_memory, documents
+runs/chroma/             # ChromaDB: document embeddings
 ```
 
----
+### Activity Telemetry
 
-## Chainlit UI
-
-### Custom React Elements (`public/elements/`)
-
-**`PlanCard.jsx`**
-- Collapsible card: "Execution Plan" + step count badge
-- Status dot: draft (blue) → approved (green) → running (amber pulse) → completed (green)
-- Expands to show numbered step list with dependency annotations
-
-**`StepTracker.jsx`**
-- Processing-card layout inspired by modern agent UIs
-- Left-side `Step N` labels with color accents + larger right-hand step panels
-- Tool calls live inside each step block, vertically stacked with result summaries and expandable details
-- `args_preview` decoded to show query/expression inline (e.g., `→ "Apple latest news"`)
-- "Show/Hide reasoning" toggle — auto-collapses when report is ready
-
-### UI Event System (`utils.py`)
-
-`emit_ui_event(event)` is called from `file.py` at key points.  
-`set_ui_event_handler(callback)` registers the Chainlit async bridge.
-
-Events emitted:
-- `step_start` — step begins (step_id, description, index, total)
-- `tool_call_start` — tool invoked (tool_name, args_preview)
-- `tool_call_end` — tool returned (tool_name, summary)
-- `tool_error` — tool failed (tool_name, error)
-- `step_complete` — step done (step_id, result_preview, tool_result_ids)
-- `synthesis_start` / `synthesis_complete`
-
-### HITL Flow in app.py
-
-1. `ainvoke` → hits `review_plan` interrupt → renders `PlanCard`
-2. `AskActionMessage` → Approve / Reject buttons
-3. On approve: `ainvoke(Command(resume=...))` via async event loop
-4. Async queue bridges sync graph events → `_process_event()` → `_update_element()` → React re-render
-5. Final report rendered with `cl.Image` elements for any artifacts
+Unified `ActivityEvent` contract (`activity.py`) describes every unit of agent work. Legacy `tool_call_start/end/error` and `workflow_step` events have been removed — the frontend has a single store and renderer (`ActivityTrace`).
 
 ---
 
 ## What's Working
 
+- [x] Intent router with auto/forced research/chat modes
 - [x] Plan-then-execute flow with HITL approval
+- [x] Per-step LangGraph node execution → checkpointing, streaming, resume
+- [x] Multi-turn chat with streaming tokens
 - [x] Append-only context stack (Manus-inspired)
-- [x] All 5 tools functional
-- [x] Daytona sandbox for Python/matplotlib execution
-- [x] Artifact download + final report as markdown
-- [x] Chainlit UI with live custom elements (PlanCard, StepTracker)
-- [x] Per-step blue highlighting + tool call streaming in UI
-- [x] Show/Hide reasoning toggle after report completes
-- [x] FastAPI backend for artifact serving
-- [x] Static system prompt for KV-cache (step 1 complete)
-- [x] Multi-turn session memory (step 2 complete)
+- [x] All 8 tools functional, defined once in `tools.py`, shared by all subgraphs
+- [x] DCF valuation workflow with unified HITL across chat and research
+- [x] PlanStore — single seam for plan persistence (disk + SQLite)
+- [x] SEC EDGAR integration for free 10-K/10-Q extraction
+- [x] Session-doc RAG (ChromaDB + BM25 hybrid)
+- [x] Python execution with matplotlib artifacts
+- [x] React frontend with streaming reports, DcfHitlSection, ActivityTrace, jobs panel
+- [x] FastAPI backend with SSE, HITL endpoints, job resume on restart
+- [x] Static system prompt for KV-cache
+- [x] Multi-turn session memory
+- [x] Unified activity contract (single event store/renderer)
 
 ---
 
 ## Known Issues / Limitations
 
-- ~~**KV-cache: NONE.**~~ Fixed in step 1 — static system prompt now fully cache-eligible.
-- ~~**Single-turn only.**~~ Fixed in step 2 — persistent thread_id + session_memory across messages.
-- **No document ingestion.** Agent can only search the web; can't reason over user-provided PDFs/CSVs.
-- **`execute_plan` is one monolithic graph node.** All steps run sequentially inside a single node, so LangGraph can't stream individual step updates — only the whole batch completes at once.
-- **Synthesize node returns final answer but doesn't stream.** The final report appears all at once.
-
----
-
-## Next Steps
-
-### 1. ✅ Static system prompt for KV-cache  `[DONE]`
-
-**Goal:** Separate stable rules (system prompt, never changes) from dynamic context (human message, changes per step).
-
-**What changed in `file.py`:**
-- Removed `build_system_prompt()` — it was fully dynamic, invalidating cache on every step.
-- Added `STATIC_SYSTEM_PROMPT` module-level constant — identity, tool rules, output rules. Never changes at runtime. Fully KV-cache eligible.
-- Added `build_step_message()` — all dynamic context (objective, plan trajectory, step info, context stack, feedback) formatted into the HumanMessage only.
-- `execute_step()` now sends `[SystemMessage(STATIC_SYSTEM_PROMPT), HumanMessage(step_message)]`.
-
-**Effect:** The system prompt prefix is identical across every step call in every run → near-100% KV-cache hit on the static prefix → ~10x cost reduction on cached tokens (e.g. Claude Sonnet: $0.30/MTok cached vs $3/MTok uncached).
-
----
-
-### 2. ✅ Multi-turn session memory  `[DONE]`
-
-**Goal:** Agent remembers prior research within a chat session; planner avoids repeating work.
-
-**What changed:**
-
-`file.py`:
-- Added `session_memory: str` field to `AgentState` — persists across plans via MemorySaver.
-- Added `update_memory_node` after `synthesize`: compresses the completed plan's objective + step findings into structured text (no LLM call; bounded to ~2000 chars).
-- Graph edge: `synthesize → update_memory → END`.
-- `plan_node` now reads `session_memory` and injects it into the planner prompt: *"Prior research completed in this session (use as context if relevant, don't repeat work already done)"*.
-
-`app.py`:
-- `thread_id` created once in `on_chat_start`, stored in `cl.user_session`, reused across all messages.
-- Same `config` (same LangGraph thread) used for every `ainvoke` in the session.
-- Each message still triggers a fresh plan (context_stack resets) but the planner sees prior findings.
-
-**Design choices:**
-- Memory is structured text, not an LLM summarization — zero latency, zero cost, deterministic.
-- Truncation from the front keeps the most recent entries when memory exceeds 2000 chars.
-- The planner is the gatekeeper: it decides what prior context is relevant to the new plan. Execution nodes never see raw memory — only what the planner chose to embed in step descriptions.
-
----
-
-### 2b. Streaming UI  `[DONE]`
-
-**Goal:** Stream the final report token-by-token into Chainlit, and make sure tool call events appear live during execution.
-
-**What changed:**
-
-`file.py` — `synthesize_node`:
-- Replaced `llm.invoke()` with `llm.stream()` — iterates over chunks as they arrive.
-- Each chunk emits a `synthesis_token` event via `emit_ui_event`.
-
-`app.py`:
-- `_process_event` now accepts a `ui_state` dict to track mutable state across events (e.g., the streamed report message).
-- `synthesis_start` creates a `cl.Message` and stores it in `ui_state["report_msg"]`.
-- `synthesis_token` calls `msg.stream_token(token)` to append each token live.
-- `synthesis_complete` can now split the final report into `before artifacts` / `after artifacts` sections and place generated chart images between them.
-- Approval prompt bubble is removed immediately after user action (`AskActionMessage.remove()`), so no extra "Selected: Approve" message remains in chat.
-- Fallback logic still creates a regular report if streaming wasn't used.
-
-**Design choices:**
-- Report streaming is the highest-value UX improvement — users see the report build token-by-token.
-- Tool-call/step events stream into `StepTracker` continuously through the event bridge.
-- Artifact placement uses an explicit `[ARTIFACTS]` anchor when available, with a `before Limitations` fallback, so charts appear mid-report rather than only at the end.
-
----
-
-### 3. Session-doc RAG  `[PENDING]`
-
-**Goal:** Let users attach PDFs/CSVs in Chainlit; agent can search them with a new tool.
-
-**Approach:**
-- Chainlit file upload → LangChain document loaders → FAISS in-memory index per session
-- New tool: `search_documents(query: str) → str` — same pointer pattern as `search_web`
-- Store FAISS index in `cl.user_session`
-- Tool description added to static system prompt
-
-**Files to change:** `file.py` (new tool), `app.py` (file upload handling, index creation).
-
----
-
-### 4. Error recovery in context  `[PENDING]`
-
-**Goal:** Per Manus blog — leave failed tool calls in context rather than silently retrying. Improves self-correction.
-
-**Approach:** Currently errors produce a JSON error payload that goes into `ToolMessage`. This is already correct — the issue is that failed steps set `step["status"] = "failed"` but don't influence future steps' context_stack. Add failed step summaries to context_stack with a `failed:` prefix so downstream steps know what was attempted.
-
-**Files to change:** `file.py` — `execute_plan_node`.
-
----
-
-### 5. Token / cost tracking  `[PENDING]`
-
-**Goal:** Know how much each run costs.
-
-**Approach:** `ChatOpenAI` returns `response.usage_metadata`. Accumulate across all LLM calls in a thread-local counter. Print at end of run. Optionally save to `runs/<thread_id>/usage.json`.
+- **No doc generation.** No PPTX, DOCX, or XLSX output yet.
+- **Standalone DCF endpoint (`POST /workflows/dcf/runs`) HITL resume is broken.** The dedicated HTTP endpoint's `Command(resume=...)` path may not find saved interrupt state in MemorySaver. The agent-tool path (chat and research) works correctly.
+- **Completed job report opens in new tab.** Clicking a completed job in `JobsPanel` opens a Blob URL; not yet loaded into the main research view.
+- **Worker model is single-process.** No DB claim lock / multi-worker coordination yet.
+- **Document ingestion does not resume.** Uploads interrupted mid-embedding may remain `processing`/`error`; no retry queue yet.
+- **Exa search is good but not deep enough for financial research.** Still needs full source-content fetching and citations for deep work.
 
 ---
 
@@ -260,7 +216,78 @@ Events emitted:
 |---|---|
 | Append-only context_stack (not full message injection) | KV-cache friendly; follows Manus principle |
 | Tool results stored on disk, pointer in message | Keeps context short; full data retrievable on demand |
-| `execute_python` banned from HTTP fetching | Sandbox SSL issues; cleaner separation of concerns |
-| Chainlit over AG-UI/CopilotKit | Pure Python, native LangGraph integration, faster to build |
-| CustomElement (React JSX) over TaskList for tracker | Full control over layout; supports live prop updates via `updateElement` |
-| FAISS (not ChromaDB) for RAG | Zero infrastructure; in-memory per session is sufficient for educational scope |
+| Static system prompt | Identical across all steps → near-100% KV-cache hit |
+| Deterministic memory compression | Zero latency, zero cost, no LLM summarisation |
+| One tool definition in `tools.py`, shared by all subgraphs | Eliminates duplication; single source of truth |
+| `execute_one_step_node` loop in parent graph (not subgraph) | Per-step checkpointing, streaming, and interrupt — not possible with monolithic node |
+| PlanStore wraps disk + SQLite behind one seam | No dual-write bugs; swap adapter for tests or Postgres |
+| DCF HITL unified across chat and research | Same tool, same events, same frontend components — different pause/resume mechanism per mode |
+| Chat uses ReAct break for DCF HITL; research uses `interrupt()` | Chat is free-form conversation; research is step-based. Both benefit from their native pause pattern |
+| Exa over Tavily | Better semantic search and excerpts |
+| FMP + yfinance for DCF levels | Canonical scale and margins from statements; web/docs only refine rates |
+
+---
+
+## Environment Variables
+
+`.env` in `agent_project/`:
+
+```
+OPENAI_API_KEY=sk-proj-...
+EXA_API_KEY=...                    # web search
+FMP_API_KEY=...                    # Financial Modeling Prep (DCF fundamentals)
+# Optional — DCF CAPM calibration (defaults 0.045 / 0.055 if unset)
+DCF_RISK_FREE_RATE=0.045
+DCF_EQUITY_RISK_PREMIUM=0.055
+# Optional — DCF LLM model overrides (defaults to gpt-4o)
+DCF_SYNTHESIS_MODEL=gpt-4o
+DCF_MEMO_MODEL=gpt-4o
+```
+
+---
+
+## Running
+
+```bash
+cd /Users/rayengallas/Project/langgraph-research-agent
+./start.sh
+# Backend:  http://localhost:8080
+# Frontend: http://localhost:5174
+```
+
+`start.sh` launches the FastAPI backend (`:8080`) and Vite dev server (`:5174`) with colored prefixed logs, auto npm install, and graceful `Ctrl+C` shutdown. `PYTHONUNBUFFERED=1` for real-time backend logs. No `--reload` on uvicorn — prevents mid-run restarts.
+
+### LangSmith Studio
+
+Root `langgraph.json` registers two graphs. From the **repo root**:
+
+```bash
+uv sync --extra studio
+uv run --extra studio langgraph dev
+```
+
+| Graph ID | Module | What you see |
+|----------|--------|--------------|
+| `agent` | `file.py:app` | Full agent — intent → research path or chat path |
+| `dcf_workflow` | `graphs/workflows/dcf:dcf_workflow_app` | Standalone DCF subgraph |
+
+Studio UI: `https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024`. Set `LANGSMITH_TRACING=false` in `agent_project/.env` if you don't want traces sent to LangSmith.
+
+---
+
+## MCP Tools: code-review-graph
+
+**IMPORTANT: This project has a knowledge graph. ALWAYS use the code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore the codebase.** The graph is faster, cheaper (fewer tokens), and gives you structural context (callers, dependents, test coverage) that file scanning cannot.
+
+| Tool | Use when |
+|------|----------|
+| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
+| `get_review_context` | Need source snippets for review — token-efficient |
+| `get_impact_radius` | Understanding blast radius of a change |
+| `get_affected_flows` | Finding which execution paths are impacted |
+| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
+| `semantic_search_nodes` | Finding functions/classes by name or keyword |
+| `get_architecture_overview` | Understanding high-level codebase structure |
+| `refactor_tool` | Planning renames, finding dead code |
+
+Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.

@@ -318,6 +318,7 @@ def sensitivity_node(state: dict) -> dict:
 def finalize_node(state: dict) -> dict:
     """Persist the full DCF output to disk and emit the terminal workflow span."""
     parent_step_id = state.get("parent_step_id") or "workflow_dcf"
+    logger.info("DCF finalize_node RUNNING thread=%s", get_run_dir().name if get_run_dir() else "?")
     emit_step("finalize", "start", parent_step_id)
     run_dir = get_run_dir()
     out_path = Path(run_dir) / "dcf_output.json"
@@ -346,6 +347,9 @@ def finalize_node(state: dict) -> dict:
         # ── Confidence decomposition & WACC sanity ──
         "confidence_breakdown": state.get("confidence_breakdown") or {},
         "wacc_sanity": state.get("wacc_sanity") or {},
+        # ── Thesis & analysis loop (new) ──
+        "thesis": state.get("thesis") or {},
+        "critique": state.get("critique") or {},
         # ── Evidence items (for human-readable ref resolution) ──
         "_evidence_items": (state.get("evidence_pack") or {}).get("items", []),
     }

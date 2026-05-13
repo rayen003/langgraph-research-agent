@@ -5,14 +5,19 @@ import os
 
 import dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from simpleeval import simple_eval
 
 from documents import search_documents, _session_ctx
-from graphs.workflows.dcf import run_dcf_workflow_sync, summarize_dcf_payload
-from utils import console, emit_ui_event, get_run_dir, persist_tool_result, track_tool
-from web_search import search_exa
+from tools import (
+    calculator,
+    execute_python,
+    fetch_sec_filing,
+    retrieve_tool_result,
+    run_dcf_workflow,
+    search_web,
+)
+import agent_log
+from utils import console, emit_ui_event, get_run_dir, track_tool
 
 dotenv.load_dotenv()
 
@@ -22,244 +27,18 @@ llm = ChatOpenAI(model="gpt-5-nano", api_key=os.getenv("OPENAI_API_KEY"), timeou
 MAX_CHAT_ROUNDS = 4
 
 # ---------------------------------------------------------------------------
-# Tools available in chat (no plan-step retrieval tools — those are research-only)
+# Tools (canonical definitions in tools.py)
 # ---------------------------------------------------------------------------
 
-@tool
-def calculator(expression: str) -> str:
-    """Evaluate a mathematical expression such as '2 + 3 * 4'."""
-    try:
-        value = str(simple_eval(expression))
-        return persist_tool_result(
-            "calculator", {"expression": expression},
-            value, f"Calculated '{expression}' = {value}",
-        )
-    except Exception as exc:  # noqa: BLE001
-        return persist_tool_result(
-            "calculator", {"expression": expression},
-            f"Error: {exc}", f"Calculator failed for '{expression}'",
-        )
-
-
-@tool
-def search_web(query: str) -> str:
-    """Search the web with Exa for current information, news, prices, or factual queries."""
-    raw, summary = search_exa(
-        query,
-        num_results=6,
-        search_type="auto",
-        max_characters=4_000,
-    )
-    return json.dumps(
-        {
-            "tool_name": "search_web",
-            "summary": summary,
-            "usage_hint": (
-                "Synthesize an answer from these excerpts. Do not list sources as a directory. "
-                "Explain what happened, why it matters, and cite source names inline."
-            ),
-            "result": json.loads(raw),
-        },
-        ensure_ascii=False,
-    )
-
-
-@tool
-def retrieve_tool_result(tool_result_id: str) -> str:
-    """Read the full content of a previously stored tool result by its tool_result_id."""
-    tool_dir = get_run_dir() / "tool_results"
-    file_path = tool_dir / f"{tool_result_id}.json"
-    if not file_path.exists():
-        return json.dumps({"error": f"No result found for id '{tool_result_id}'", "tool_result_id": tool_result_id})
-    try:
-        payload = json.loads(file_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return json.dumps({"error": "Corrupt file", "tool_result_id": tool_result_id})
-    return json.dumps(payload, ensure_ascii=False)
-
-
-@tool
-def execute_python(code: str) -> str:
-    """Run Python for calculations, data fetching, or quick analysis.
-
-    get_stock_data(ticker, period='1y') is pre-imported and returns a clean
-    DataFrame [Date, Open, High, Low, Close, Volume].
-    ARTIFACTS_DIR env var is set — save any plots there.
-    """
-    import subprocess, sys, tempfile, pathlib as _pl
-
-    from utils import get_artifacts_dir as _gad
-
-    _PRELUDE = '''
-import os, warnings
-warnings.filterwarnings("ignore")
-artifacts_dir = os.environ.get("ARTIFACTS_DIR", ".")
-import matplotlib; matplotlib.use("Agg")
-
-def get_stock_data(ticker, period="1y"):
-    import yfinance as yf, pandas as pd
-    df = yf.download(ticker, period=period, auto_adjust=True,
-                     multi_level_index=False, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.reset_index()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
-    for col in ["Open","High","Low","Close","Volume"]:
-        if col in df.columns: df[col] = df[col].squeeze()
-    return df
-'''
-    artifacts_dir = _gad()
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    script = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-            f.write(_PRELUDE + "\n" + code)
-            script = f.name
-        env = {**os.environ, "ARTIFACTS_DIR": str(artifacts_dir)}
-        proc = subprocess.run(
-            [sys.executable, script],
-            capture_output=True, text=True, timeout=30, env=env,
-        )
-        stdout, stderr, code_val = proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired:
-        stdout, stderr, code_val = "", "Timed out after 30s", -1
-    except Exception as e:
-        stdout, stderr, code_val = "", str(e), -1
-    finally:
-        if script:
-            try: os.unlink(script)
-            except Exception: pass
-
-    payload = {"exit_code": code_val, "stdout": stdout[:3000], "stderr": stderr[:1000]}
-    ok = code_val == 0
-    summary = f"Python {'succeeded' if ok else 'failed'} (exit {code_val}). stdout: {stdout[:200]}"
-    return persist_tool_result("execute_python", {"code": code}, json.dumps(payload), summary)
-
-
-@tool
-def run_dcf_workflow(
-    ticker: str,
-    horizon_years: int = 5,
-    assumption_review_mode: bool = True,
-    allow_external_assumptions: bool = True,
-    assumption_overrides: dict[str, float] | None = None,
-) -> str:
-    """Run a deterministic DCF valuation workflow for a ticker.
-
-    Default (assumption_review_mode=True): gathers evidence, proposes
-    assumptions, returns them for your review. Present to user. After
-    user approves/edits, call again with their edits as assumption_overrides
-    AND assumption_review_mode=False to complete the valuation.
-    """
-    from utils import set_dcf_hitl_payload  # noqa: PLC0415
-
-    payload = run_dcf_workflow_sync(
-        ticker=ticker,
-        horizon_years=horizon_years,
-        assumption_review_mode=assumption_review_mode,
-        allow_external_assumptions=allow_external_assumptions,
-        assumption_overrides=assumption_overrides,
-        parent_step_id="chat",
-        session_id=_session_ctx.get(),
-    )
-
-    if payload.get("__dcf_hitl__"):
-        # Store HITL payload for _run_agent_task to detect and handle
-        set_dcf_hitl_payload({
-            "ticker": payload.get("ticker", "?"),
-            "horizon_years": payload.get("horizon_years", 5),
-            "assumptions": payload.get("assumptions", {}),
-            "assumption_provenance": payload.get("assumption_provenance", {}),
-            "memo_proposals": payload.get("memo_proposals", {}),
-            "evidence_items": payload.get("evidence_items", []),
-        })
-        emit_ui_event({
-            "type": "dcf_assumptions_review",
-            "ticker": payload.get("ticker", "?"),
-            "horizon_years": payload.get("horizon_years", 5),
-            "assumptions": payload.get("assumptions", {}),
-            "assumption_provenance": payload.get("assumption_provenance", {}),
-            "memo_proposals": payload.get("memo_proposals", {}),
-            "evidence_items": payload.get("evidence_items", []),
-        })
-        assumptions = payload.get("assumptions", {})
-        provenance = payload.get("assumption_provenance", {})
-        lines = [
-            "⛔ STOP — DO NOT CALL MORE TOOLS. Present these assumptions for review.",
-            "",
-            f"## DCF Assumptions for {payload.get('ticker', '?')} ({payload.get('horizon_years', 5)}yr)",
-            "",
-            "| Field | Value | Source | Confidence |",
-            "|-------|-------|--------|------------|",
-        ]
-        for field in ["revenue_growth", "fcff_margin", "terminal_growth", "tax_rate", "wacc"]:
-            val = assumptions.get(field)
-            if val is None:
-                continue
-            prov = provenance.get(field, {})
-            source = prov.get("source", "?")
-            conf = prov.get("confidence", 0.5)
-            lines.append(f"| {field} | {val:.2%} | {source} | {conf:.0%} |")
-        lines.append("")
-        lines.append("Ask the user to approve, edit values, or reject.")
-        lines.append("After they respond, call again with assumption_overrides and assumption_review_mode=False.")
-        return "\n".join(lines)
-
-    summary = summarize_dcf_payload(payload)
-    return persist_tool_result(
-        "run_dcf_workflow",
-        {
-            "ticker": ticker,
-            "horizon_years": horizon_years,
-            "allow_external_assumptions": allow_external_assumptions,
-            "assumption_overrides": assumption_overrides or {},
-        },
-        json.dumps(payload, ensure_ascii=False),
-        summary,
-    )
-
-
-@tool
-def fetch_sec_filing(ticker: str, filing_type: str = "10-K") -> str:
-    """Fetch recent SEC EDGAR filings (10-K or 10-Q) for a company.
-
-    Returns extracted text from Risk Factors, MD&A, Business overview, and
-    quantitative disclosures sections. Use for any question about a company's
-    financials, risks, business model, or regulatory disclosures.
-    Prefer this over search_web for fundamental company research.
-    """
-    from graphs.workflows.dcf.sec_filings import fetch_sec_filings as _fetch  # noqa: PLC0415
-
-    items = _fetch(ticker.upper().strip(), max_filings=2)
-    if not items:
-        no_result = {"ticker": ticker, "error": f"No SEC filings found for {ticker}"}
-        return persist_tool_result(
-            "fetch_sec_filing", {"ticker": ticker, "filing_type": filing_type},
-            json.dumps(no_result), f"No SEC filings found for {ticker}",
-        )
-    sections = []
-    for item in items[:10]:
-        meta = item.get("metadata", {})
-        sections.append({
-            "filing_type": meta.get("filing_type", "?"),
-            "section": meta.get("section", "?"),
-            "as_of": item.get("as_of", "?"),
-            "text": (item.get("text") or "")[:2000],
-        })
-    filing_types = list({s["filing_type"] for s in sections})
-    summary = (
-        f"SEC filings for {ticker}: {len(sections)} section(s) "
-        f"from {filing_types}"
-    )
-    return persist_tool_result(
-        "fetch_sec_filing", {"ticker": ticker, "filing_type": filing_type},
-        json.dumps({"ticker": ticker, "sections": sections}, ensure_ascii=False),
-        summary,
-    )
-
-
-CHAT_TOOLS = [calculator, search_web, execute_python, search_documents, fetch_sec_filing, retrieve_tool_result, run_dcf_workflow]
+CHAT_TOOLS = [
+    calculator,
+    search_web,
+    execute_python,
+    search_documents,
+    fetch_sec_filing,
+    retrieve_tool_result,
+    run_dcf_workflow,
+]
 CHAT_TOOLS_BY_NAME = {t.name: t for t in CHAT_TOOLS}
 chat_agent_llm = llm.bind_tools(CHAT_TOOLS)
 
@@ -274,8 +53,9 @@ _CHAT_SYSTEM = (
     "ALWAYS call this BEFORE search_web for any factual query — documents already uploaded may contain exactly what you need. "
     "Only fall back to search_web if search_documents returns no relevant results.\n"
     "- fetch_sec_filing: fetch 10-K/10-Q filings from SEC EDGAR. Use for company risks, MD&A, or business overview — prefer over search_web for company fundamentals.\n"
-    "- search_web: look up current news, prices, filings, or factual information NOT found in uploaded documents\n"
-    "- retrieve_tool_result: read stored execute_python payloads when a tool returns a tool_result_id\n"
+    "- search_web: look up current news, prices, filings, or factual information NOT found in uploaded documents. "
+    "Returns a tool_result_id pointer + one-line summary — you MUST call retrieve_tool_result to read the full content.\n"
+    "- retrieve_tool_result: read the full content of any tool result by its tool_result_id (search_web, execute_python, etc.)\n"
     "- calculator: evaluate mathematical expressions\n"
     "- execute_python: run code for data analysis, computations, or quick charts\n\n"
     "- run_dcf_workflow: deterministic DCF valuation for explicit intrinsic-value requests. "
@@ -331,6 +111,21 @@ def _fallback_answer_from_tool_results(history: list) -> str:
         except (json.JSONDecodeError, TypeError):
             continue
 
+        if not isinstance(payload, dict):
+            continue
+
+        # Handle pointer format: read full result from disk
+        if payload.get("tool_result_id"):
+            tool_dir = get_run_dir() / "tool_results"
+            file_path = tool_dir / f"{payload['tool_result_id']}.json"
+            if file_path.exists():
+                try:
+                    payload = json.loads(file_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+            else:
+                continue
+
         result = payload.get("result") if isinstance(payload, dict) else None
         if not isinstance(result, dict) or result.get("provider") != "exa":
             continue
@@ -366,7 +161,7 @@ def chat_node(state: dict) -> dict:
 
     history = [SystemMessage(content=system_content)] + messages[-20:]
 
-    console.print("[bold cyan]💬 Chat (ReAct)...[/bold cyan]")
+    _chat_t = agent_log.chat_start()
     emit_ui_event({"type": "chat_start"})
     used_tools = False
 
@@ -440,6 +235,7 @@ def chat_node(state: dict) -> dict:
         # Do NOT emit chat_complete here — bridge already set status=awaiting_assumptions
         # from the dcf_assumptions_review event, and we need the SSE stream to stay open
         # so the user's /dcf-decision response can stream valuation events back.
+        agent_log.chat_hitl(_hitl_ticker)
         return {"messages": [AIMessage(content="DCF assumptions ready for review.")]}
     elif used_tools:
         history.append(HumanMessage(content=(
@@ -459,7 +255,7 @@ def chat_node(state: dict) -> dict:
     if not final_text.strip():
         final_text = "I could not generate a final answer from the tool results. Check the backend log at agent_project/runs/server.log."
 
-    console.print(f"[dim]Chat: {final_text[:80]}...[/dim]")
+    agent_log.chat_done(final_text, _chat_t)
     emit_ui_event({"type": "chat_complete", "content": final_text})
 
     return {"messages": [AIMessage(content=final_text)]}

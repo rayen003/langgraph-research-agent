@@ -14,11 +14,13 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Command
 from rich.panel import Panel
 
+import agent_log
 from utils import console, emit_ui_event, format_plan, get_run_dir, set_thread_id
 from graphs.research import (
     plan_node,
     review_plan_node,
-    execute_plan_node,
+    execute_one_step_node,
+    route_after_step,
     synthesize_node,
     update_memory_node,
 )
@@ -89,7 +91,7 @@ def intent_node(state: AgentState) -> dict:
         ])
         raw = (response.content or "").strip().lower()
         intent = "research" if "research" in raw else "chat"
-        console.print(f"[dim]Intent classified: {intent} (mode=auto)[/dim]")
+        agent_log.intent_classified(intent, "auto")
 
     emit_ui_event({"type": "intent_classified", "intent": intent, "mode": mode})
     return {"resolved_intent": intent}
@@ -100,7 +102,7 @@ def route_intent(state: AgentState) -> str:
 
 
 def route_after_review(state: AgentState) -> str:
-    return "execute_plan" if state.get("approved") else END
+    return "execute_one_step" if state.get("approved") else END
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,7 @@ graph = StateGraph(AgentState)
 graph.add_node("intent", intent_node)
 graph.add_node("plan", plan_node)
 graph.add_node("review_plan", review_plan_node)
-graph.add_node("execute_plan", execute_plan_node)
+graph.add_node("execute_one_step", execute_one_step_node)
 graph.add_node("synthesize", synthesize_node)
 graph.add_node("update_memory", update_memory_node)
 graph.add_node("chat", chat_node)
@@ -120,8 +122,8 @@ graph.add_node("chat", chat_node)
 graph.add_edge(START, "intent")
 graph.add_conditional_edges("intent", route_intent, {"research": "plan", "chat": "chat"})
 graph.add_edge("plan", "review_plan")
-graph.add_conditional_edges("review_plan", route_after_review, {"execute_plan": "execute_plan", END: END})
-graph.add_edge("execute_plan", "synthesize")
+graph.add_conditional_edges("review_plan", route_after_review, {"execute_one_step": "execute_one_step", END: END})
+graph.add_conditional_edges("execute_one_step", route_after_step, {"execute_one_step": "execute_one_step", "synthesize": "synthesize"})
 graph.add_edge("synthesize", "update_memory")
 graph.add_edge("update_memory", END)
 graph.add_edge("chat", END)
@@ -142,14 +144,14 @@ def run_agent(query: str, mode: str = "auto") -> None:
     thread_id = f"thread_{uuid4().hex[:8]}"
     set_thread_id(thread_id)
     config = {"configurable": {"thread_id": thread_id}}
-    console.print(f"[dim]Thread: {thread_id} | Mode: {mode}[/dim]")
+    agent_log.run_start(thread_id, query, mode)
 
     first = app.invoke(
         {"messages": [HumanMessage(content=query)], "mode": mode, "resolved_intent": None},
         config=config,
     )
     resolved = first.get("resolved_intent", "research")
-    console.print(f"[dim]Resolved intent: {resolved}[/dim]")
+    agent_log.intent_classified(resolved, mode)
 
     if resolved == "chat":
         # Chat response is already emitted via events; print last message

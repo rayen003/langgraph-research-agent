@@ -488,6 +488,96 @@ function MarketDataDetail({ meta }: { meta: Record<string, unknown> }) {
   )
 }
 
+function ThesisDetail({ meta }: { meta: Record<string, unknown> }) {
+  const bull = meta.bull_thesis as string | undefined
+  const bear = meta.bear_thesis as string | undefined
+  const narrative = meta.narrative as string | undefined
+  const drivers = meta.key_drivers as Array<{ driver: string; direction: string; conviction: string }> | undefined
+  if (!bull && !bear && !narrative && !drivers?.length) return null
+  return (
+    <div className="space-y-2 text-[11px]">
+      {bull && (
+        <div>
+          <span className="text-emerald-500/80 font-medium">Bull case </span>
+          <span className="text-zinc-400">{bull}</span>
+        </div>
+      )}
+      {bear && (
+        <div>
+          <span className="text-red-400/80 font-medium">Bear case </span>
+          <span className="text-zinc-400">{bear}</span>
+        </div>
+      )}
+      {drivers && drivers.length > 0 && (
+        <div>
+          <span className="text-zinc-600">Key drivers </span>
+          <div className="flex flex-wrap gap-1 mt-0.5">
+            {drivers.map((d, i) => (
+              <span key={i} className={`px-1.5 py-0.5 rounded text-[10px] ${
+                d.direction === 'positive' ? 'bg-emerald-500/10 text-emerald-400' :
+                d.direction === 'negative' ? 'bg-red-500/10 text-red-400' :
+                'bg-zinc-500/10 text-zinc-400'
+              }`}>
+                {d.driver} ({d.conviction})
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {narrative && (
+        <div>
+          <span className="text-zinc-600">Narrative </span>
+          <span className="text-zinc-400">{narrative}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AnalysisDetail({ meta }: { meta: Record<string, unknown> }) {
+  const severe = meta.severe_count as number | undefined
+  const warnings = meta.warning_count as number | undefined
+  const stop = meta.stop_reason as string | undefined
+  const interpretation = meta.interpretation as string | undefined
+  const flags = meta.flags as Array<{ signal: string; severity: string; value: unknown }> | undefined
+  if (severe == null && warnings == null) return null
+  return (
+    <div className="space-y-1.5 text-[11px]">
+      <div className="flex gap-3">
+        <div>
+          <span className={`font-medium ${severe ? 'text-red-400' : 'text-zinc-500'}`}>{severe ?? 0} severe</span>
+        </div>
+        <div>
+          <span className={`font-medium ${warnings ? 'text-amber-400' : 'text-zinc-500'}`}>{warnings ?? 0} warnings</span>
+        </div>
+      </div>
+      {stop && <div><span className="text-zinc-600">Stop: </span><span className="text-zinc-400">{stop}</span></div>}
+      {interpretation && <div><span className="text-zinc-400">{interpretation}</span></div>}
+      {flags && flags.length > 0 && (
+        <div className="space-y-0.5">
+          {flags.map((f, i) => (
+            <div key={i} className="flex items-center gap-1.5">
+              <span className={`w-1 h-1 rounded-full ${
+                f.severity === 'severe' ? 'bg-red-500' :
+                f.severity === 'warning' ? 'bg-amber-500' :
+                'bg-zinc-600'
+              }`} />
+              <span className="text-zinc-500">{f.signal.replace(/_/g, ' ')}:</span>
+              <span className="text-zinc-400">{String(f.value ?? '?')}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RefineDetail({ meta }: { meta: Record<string, unknown> }) {
+  const summary = meta.summary_line as string | undefined
+  if (!summary) return null
+  return <div className="text-[11px] text-zinc-400">{summary}</div>
+}
+
 function ImpliedWaccDetail({ meta }: { meta: Record<string, unknown> }) {
   const capm = meta.capm_wacc as number | undefined
   const implied = meta.implied_wacc as number | undefined
@@ -526,6 +616,9 @@ function DcfStepDetail({ stepName, meta }: { stepName: string; meta: Record<stri
     case 'sensitivity': return <SensitivityDetail meta={meta} />
     case 'collect_market_data': return <MarketDataDetail meta={meta} />
     case 'finalize': return <FinalizeDetail meta={meta} />
+    case 'formulate_thesis': return <ThesisDetail meta={meta} />
+    case 'analyze_result': return <AnalysisDetail meta={meta} />
+    case 'refine_assumptions': return <RefineDetail meta={meta} />
     default: return null
   }
 }

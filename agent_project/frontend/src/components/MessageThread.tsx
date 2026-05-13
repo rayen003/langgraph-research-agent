@@ -98,7 +98,7 @@ function ChatBubble({
 
           {hasContent ? (
             <MarkdownRenderer content={content} streaming={streaming} />
-          ) : !hasRunning && !persisted ? (
+          ) : !hasAnyActivity && !persisted ? (
             <ThinkingDots />
           ) : null}
         </div>
@@ -396,8 +396,9 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
   const isChatRun = activeRun.resolved_intent === 'chat' || activeRun.status === 'chat_responding'
   const isSynthesizing = activeRun.status === 'synthesizing'
 
-  // Determine if we're in a "pre-research" status (planning/executing — before synthesis)
-  const showResearchStatus = runActive && isResearchRun && !isSynthesizing
+  const showResearchStatus =
+    runActive && isResearchRun && !isSynthesizing &&
+    ['classifying', 'planning', 'workflow_running'].includes(activeRun.status)
 
   // Live chat messages (streaming)
   const liveChatMessages = isChatRun ? activeRun.chat_messages : []

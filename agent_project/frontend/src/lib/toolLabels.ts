@@ -70,6 +70,7 @@ const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
     normalize_input: 'Resolving ticker & horizon',
     assemble_evidence: 'Assembling evidence',
     semantic_synthesis: 'Synthesizing company profile',
+    formulate_thesis: 'Formulating investment thesis',
     propose_assumptions: 'Proposing assumptions',
     assumption_review: 'Reviewing assumptions',
     collect_market_data: 'Fetching market data',
@@ -77,6 +78,8 @@ const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
     compute_valuation: 'Computing valuation',
     compute_implied_wacc: 'Market-implied WACC check',
     sensitivity: 'Running sensitivity table',
+    analyze_result: 'Analyzing valuation quality',
+    refine_assumptions: 'Refining assumptions',
     finalize: 'Finalizing result',
   },
 }
