@@ -402,6 +402,103 @@ def assemble_evidence_node(state: dict) -> dict:
     )
 
     status = "complete" if pack["total_items"] > 0 else "fallback"
+
+    # ── KG write-back: persist filing + news items as Layer 1 anchored facts ──
+    # Anchored types use infinite TTL — once written, never overwritten.
+    # Re-runs are ADDITIVE: new items grow the corpus; existing items stay.
+    try:
+        import hashlib
+        from kg import get_cache  # noqa: PLC0415
+        cache = get_cache()
+        # Ensure company anchor exists (cheap, idempotent)
+        cache.put(
+            ticker=ticker, node_type="company", field="anchor",
+            value={"ticker": ticker},
+            source="agent_inferred", confidence=1.0, session_id=session_id,
+        )
+        written_filing = 0
+        written_news = 0
+        for item in pack.get("items", []):
+            kind = item.get("kind", "")
+            text = (item.get("text") or "")[:8000]
+            if not text:
+                continue
+            if kind == "filing_excerpt":
+                meta_ = item.get("metadata") or {}
+                filing_type = meta_.get("filing_type") or "filing"
+                section = meta_.get("section") or "body"
+                as_of = item.get("as_of") or meta_.get("as_of") or "unknown"
+                # Deterministic field: filing_type::as_of::section
+                field_key = f"{filing_type}::{as_of}::{section}"
+                cache.put(
+                    ticker=ticker,
+                    node_type="filing",
+                    field=field_key,
+                    value={
+                        "filing_type": filing_type,
+                        "section": section,
+                        "as_of": as_of,
+                        "text": text,
+                        "url": item.get("url", ""),
+                        "evidence_id": item.get("evidence_id", ""),
+                    },
+                    source="sec_edgar",
+                    confidence=0.95,
+                    session_id=session_id,
+                )
+                written_filing += 1
+            elif kind in ("web_excerpt",):
+                url = item.get("url", "")
+                title = item.get("title") or ""
+                published = item.get("as_of") or ""
+                # Deterministic field: hash of URL (unique per article)
+                url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12] if url else hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]
+                field_key = f"{published or 'undated'}::{url_hash}"
+                cache.put(
+                    ticker=ticker,
+                    node_type="news_item",
+                    field=field_key,
+                    value={
+                        "title": title,
+                        "url": url,
+                        "published_at": published,
+                        "text": text,
+                        "source": item.get("source", "web"),
+                        "evidence_id": item.get("evidence_id", ""),
+                    },
+                    source="web_search",
+                    confidence=0.7,
+                    session_id=session_id,
+                )
+                written_news += 1
+        logger.info(
+            "DCF evidence KG write-back ticker=%s filings=%d news=%d",
+            ticker, written_filing, written_news,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "DCF evidence KG write-back failed ticker=%s err=%s", ticker, exc,
+        )
+
+    # Build lightweight item previews for the UI detail panel
+    item_previews = []
+    for item in pack.get("items", []):
+        preview = {
+            "evidence_id": item.get("evidence_id", "?"),
+            "kind": item.get("kind", "?"),
+            "source_tier": item.get("source_tier", "?"),
+            "source": item.get("source", "?"),
+            "title": (item.get("title") or "")[:120],
+            "url": item.get("url", ""),
+            "text": (item.get("text") or "")[:300],
+            "as_of": item.get("as_of", ""),
+        }
+        meta = item.get("metadata")
+        if isinstance(meta, dict):
+            preview["filing_type"] = meta.get("filing_type", "")
+            preview["section"] = meta.get("section", "")
+        item_previews.append(preview)
+
     emit_step(
         "assemble_evidence",
         status,
@@ -411,6 +508,7 @@ def assemble_evidence_node(state: dict) -> dict:
             "tier_summary": pack["tier_summary"],
             "profile": pack["profile"],
             "features_summary": sorted(pack["features"].keys()),
+            "items": item_previews,
             "summary_line": f"{pack['total_items']} items ({_fmt_tier_summary(pack['tier_summary'])}), profile={pack['profile']}",
         },
     )

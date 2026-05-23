@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 _memo_model_name = os.getenv(
     "DCF_MEMO_MODEL",
-    os.getenv("DCF_SYNTHESIS_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o")),
+    os.getenv("DCF_SYNTHESIS_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
 )
 memo_llm = ChatOpenAI(
     model=_memo_model_name,
@@ -57,12 +57,26 @@ MAX_MEMO_RETRIES = 2
 
 # Tier B fields the LLM is allowed to propose.
 # Tier A fields and WACC are handled deterministically.
-_TIER_B_PROPOSABLE = frozenset({
+#
+# REQUIRED: every memo must propose these (legacy 4).
+# OPTIONAL: LLM proposes when the company state warrants modelling them
+#           explicitly (e.g., buybacks > 0 for capital-returning companies,
+#           SBC > 2% for tech, margin glide for businesses in transition,
+#           growth fade for hypergrowth names). Missing optional fields
+#           default to backward-compatible behavior in valuation.py.
+_TIER_B_REQUIRED = frozenset({
     "revenue_growth",
     "fcff_margin",
     "terminal_growth",
     "tax_rate",
 })
+_TIER_B_OPTIONAL = frozenset({
+    "buyback_yield",           # annual share reduction rate
+    "sbc_pct_revenue",         # SBC as % of revenue (real economic cost)
+    "revenue_growth_terminal", # Y5 fade growth (2-stage model)
+    "fcff_margin_terminal",    # Y5 terminal margin (margin glide)
+})
+_TIER_B_PROPOSABLE = _TIER_B_REQUIRED | _TIER_B_OPTIONAL
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +89,10 @@ class AssumptionProposal(BaseModel):
 
     field: str = Field(
         description=(
-            "One of: revenue_growth, fcff_margin, terminal_growth, tax_rate. "
+            "REQUIRED fields: revenue_growth, fcff_margin, terminal_growth, tax_rate. "
+            "OPTIONAL fields (propose when company state warrants): "
+            "buyback_yield (annual share reduction), sbc_pct_revenue (SBC % of revenue), "
+            "revenue_growth_terminal (Y5 fade growth), fcff_margin_terminal (Y5 margin). "
             "Do NOT propose base_revenue, shares_outstanding, net_debt, or wacc — "
             "those are set deterministically from canonical data."
         )
@@ -118,7 +135,12 @@ class AssumptionMemo(BaseModel):
     ticker: str = Field(description="Ticker symbol")
     horizon_years: int = Field(description="Forecast horizon in years")
     proposals: list[AssumptionProposal] = Field(
-        description="One proposal per Tier B field (revenue_growth, fcff_margin, terminal_growth, tax_rate)"
+        description=(
+            "Proposals for Tier B fields. MUST include the 4 required fields "
+            "(revenue_growth, fcff_margin, terminal_growth, tax_rate). MAY include "
+            "optional fields (buyback_yield, sbc_pct_revenue, revenue_growth_terminal, "
+            "fcff_margin_terminal) when company state warrants explicit modelling."
+        )
     )
     overall_narrative: str = Field(
         description=(
@@ -152,19 +174,39 @@ class AssumptionMemo(BaseModel):
 _MEMO_SYSTEM_PROMPT = """You are an expert equity research analyst producing a DCF assumption memo.
 
 ## Your Task
-Propose DCF assumptions (revenue_growth, fcff_margin, terminal_growth, tax_rate) for a company based on an evidence pack and a synthesized company profile. Your assumptions will directly drive a deterministic DCF valuation.
+Propose DCF assumptions for a company based on an evidence pack and a synthesized company profile. Your assumptions drive a deterministic DCF valuation.
 
 ## Rules
 
-### What you propose (Tier B — judgment calls)
-- **revenue_growth**: annual growth rate over the forecast horizon. Ground in historical trends from fundamentals, forward guidance from filings, and sector outlook. Consider deceleration if the company is large/mature.
-- **fcff_margin**: free cash flow to firm as % of revenue. Derive from historical margins (evidence pack has FMP margins), trend direction from company state, and capital intensity from filings. FCFF margin differs from net margin — account for capex and working capital needs.
-- **terminal_growth**: perpetuity growth rate. Must be ≤ risk-free rate + inflation expectation (~3-4.5%). Typically 2-3.5% for stable companies. Higher only with strong structural growth arguments.
-- **tax_rate**: effective tax rate. Use the canonical tax rate from fundamentals if available; otherwise estimate from sector/geography. Account for known tax policy changes mentioned in filings.
+### REQUIRED proposals (always include all 4 — Tier B core)
+- **revenue_growth**: annual growth rate for years 1-2 of the forecast (near-term). Ground in historical trends, forward guidance, sector outlook. For hypergrowth names use the analyst consensus near-term rate; deceleration is captured separately via `revenue_growth_terminal`.
+- **fcff_margin**: free cash flow to firm as % of revenue at the START of the horizon (year 1). Derive from historical margins, trend direction, capital intensity. FCFF margin differs from net margin — account for capex + working capital. If a margin transition is expected, also propose `fcff_margin_terminal`.
+- **terminal_growth**: perpetuity growth rate (post-horizon, beyond year N). Must be ≤ risk-free rate + ~50 bps. Typically 2-3% for stable companies. Higher only with very strong structural arguments.
+- **tax_rate**: effective tax rate. Use canonical tax rate from fundamentals; otherwise estimate from sector/geography.
+
+### OPTIONAL proposals (include WHEN the company state warrants — skip otherwise)
+Only propose these if there is real signal in the evidence. Do not pad the memo with optional fields when defaults are appropriate.
+
+- **buyback_yield**: ANNUAL share reduction rate (e.g., 0.035 = 3.5% fewer shares per year). Compute from announced/historical buyback programs (e.g., AAPL ~$110B/yr / ~$3T market cap = 3.5%). Propose when:
+    - Filings disclose an active buyback authorization, OR
+    - Trailing share count declines >0.5% per year.
+  Skip (omit) when buybacks are immaterial or net issuance is offset by SBC.
+
+- **sbc_pct_revenue**: stock-based comp as % of revenue. Extract directly from cash flow statement (SBC line item in OCF reconciliation). SBC is a real economic cost that OCF math hides — subtracting it gives a more honest FCF. Propose for ANY technology / software / internet name (typically 3-10%). Skip for industrials / retail / consumer staples where SBC is <1% and immaterial.
+
+- **revenue_growth_terminal**: revenue growth rate IN YEAR N (the final forecast year), used to model 2-stage fade. Propose when:
+    - Near-term growth > 15% (mandatory fade — law of large numbers), OR
+    - Lifecycle is "hypergrowth" or "scaling" per company state.
+  For mature companies with stable growth, omit (defaults to revenue_growth).
+
+- **fcff_margin_terminal**: FCFF margin in year N. Propose when:
+    - Business model is transitioning (e.g., adding ads/subscriptions = margin expansion; commodity pressure = compression), OR
+    - Company state signals margin trajectory direction.
+  For stable margin businesses, omit.
 
 ### What you DO NOT propose (Tier A — locked from canonical data)
-- base_revenue, shares_outstanding, net_debt — these are FIXED from audited financial statements
-- wacc — this is computed deterministically from CAPM using observable market data (beta, debt, equity value)
+- base_revenue, shares_outstanding, net_debt — FIXED from audited statements.
+- wacc — computed deterministically from CAPM using market data.
 
 ### Citation discipline
 - Every proposal must cite specific evidence_ids from the evidence pack.
@@ -253,7 +295,12 @@ def _build_memo_user_message(
     state_lines = ["## Company State (from Semantic Synthesis)", ""]
     if company_state and isinstance(company_state, dict):
         for key in (
-            "business_summary", "growth_outlook", "growth_drivers",
+            "business_summary",
+            # Lifecycle signals — read these FIRST when deciding optional Tier B fields
+            "lifecycle_stage", "margin_trajectory",
+            "capital_return_policy", "sbc_intensity",
+            # Narrative supporting context
+            "growth_outlook", "growth_drivers",
             "margin_trend", "margin_narrative", "key_risks",
             "competitive_position", "macro_context", "conflicts",
             "confidence_self_assessment",
@@ -276,7 +323,14 @@ def _build_memo_user_message(
         "## Your Task",
         f"Propose DCF assumptions for {ticker} over a {horizon_years}-year horizon.",
         "",
-        "Propose EXACTLY these fields: revenue_growth, fcff_margin, terminal_growth, tax_rate.",
+        "**REQUIRED (always 4)**: revenue_growth, fcff_margin, terminal_growth, tax_rate.",
+        "",
+        "**OPTIONAL (include when warranted by company state — see system prompt)**:",
+        "- buyback_yield (when active buyback program exists)",
+        "- sbc_pct_revenue (for tech/software names — typically 3-10%)",
+        "- revenue_growth_terminal (when near-term growth >15% or hypergrowth lifecycle)",
+        "- fcff_margin_terminal (when margin trajectory is non-flat — expansion or compression)",
+        "",
         "Do NOT propose: base_revenue, shares_outstanding, net_debt, wacc.",
         "",
         "For each proposal, provide:",
@@ -334,7 +388,11 @@ def _validate_memo_refs(
 
 
 def _validate_proposal_fields(memo: AssumptionMemo) -> list[str]:
-    """Check that proposals only target allowed Tier B fields."""
+    """Check that proposals only target allowed Tier B fields.
+
+    Required fields MUST be present. Optional fields MAY be present but
+    are not required (math layer defaults handle their absence).
+    """
     errors: list[str] = []
     proposed_fields = {p.field for p in memo.proposals}
 
@@ -342,12 +400,15 @@ def _validate_proposal_fields(memo: AssumptionMemo) -> list[str]:
         if field not in _TIER_B_PROPOSABLE:
             errors.append(
                 f"proposal field '{field}' is not allowed. "
-                f"Only propose: {', '.join(sorted(_TIER_B_PROPOSABLE))}"
+                f"Allowed (required): {', '.join(sorted(_TIER_B_REQUIRED))}. "
+                f"Allowed (optional): {', '.join(sorted(_TIER_B_OPTIONAL))}."
             )
 
-    missing = _TIER_B_PROPOSABLE - proposed_fields
-    if missing:
-        errors.append(f"Missing proposals for: {', '.join(sorted(missing))}")
+    missing_required = _TIER_B_REQUIRED - proposed_fields
+    if missing_required:
+        errors.append(
+            f"Missing REQUIRED proposals for: {', '.join(sorted(missing_required))}"
+        )
 
     return errors
 
@@ -363,14 +424,45 @@ def _fmt_assumptions_line(
 ) -> str:
     """One-line summary of key assumptions for activity trace display."""
     parts: list[str] = []
-    for field in ("revenue_growth", "fcff_margin", "terminal_growth", "tax_rate"):
+
+    # Growth (with terminal glide if present)
+    g = assumptions.get("revenue_growth")
+    g_term = assumptions.get("revenue_growth_terminal")
+    if g is not None:
+        if g_term is not None and abs(g_term - g) > 1e-6:
+            parts.append(f"growth={g:.1%}→{g_term:.1%}")
+        else:
+            parts.append(f"growth={g:.2%}")
+
+    # Margin (with terminal glide if present)
+    m = assumptions.get("fcff_margin")
+    m_term = assumptions.get("fcff_margin_terminal")
+    if m is not None:
+        if m_term is not None and abs(m_term - m) > 1e-6:
+            parts.append(f"margin={m:.1%}→{m_term:.1%}")
+        else:
+            parts.append(f"margin={m:.2%}")
+
+    # Other required fields
+    for field in ("terminal_growth", "tax_rate"):
         v = assumptions.get(field)
         if v is not None:
             parts.append(f"{field}={v:.2%}")
+
+    # WACC
     wacc = assumptions.get("wacc")
     if wacc is not None:
         wacc_src = wacc_components.get("method", "?")
         parts.append(f"wacc={wacc:.2%}({wacc_src})")
+
+    # Optional capital return / SBC
+    buyback = assumptions.get("buyback_yield")
+    if buyback is not None and abs(buyback) > 1e-6:
+        parts.append(f"buyback={buyback:.1%}")
+    sbc = assumptions.get("sbc_pct_revenue")
+    if sbc is not None and sbc > 1e-6:
+        parts.append(f"sbc={sbc:.1%}")
+
     return ", ".join(parts) if parts else "assumptions built"
 
 
@@ -507,6 +599,7 @@ def propose_assumptions_node(state: dict) -> dict:
                 "source": "llm_memo",
                 "evidence": proposal.rationale,
                 "reference": ", ".join(proposal.evidence_refs),
+                "evidence_refs": list(proposal.evidence_refs),
                 "confidence": proposal.confidence,
                 "range_low": proposal.range_low,
                 "range_high": proposal.range_high,
@@ -523,10 +616,9 @@ def propose_assumptions_node(state: dict) -> dict:
             "DCF memo failed after %d attempts, using profile-prior midpoints for Tier B: %s",
             1 + MAX_MEMO_RETRIES, last_error,
         )
-        # Fall back to profile-prior midpoints (sector-appropriate) instead of
-        # hardcoded defaults. Each field gets the midpoint of its soft band for
-        # the classified profile.
-        for field in sorted(_TIER_B_PROPOSABLE):
+        # Fall back to profile-prior midpoints (sector-appropriate) for REQUIRED
+        # fields only. Optional fields stay unset — math layer defaults apply.
+        for field in sorted(_TIER_B_REQUIRED):
             if field in assumptions:
                 continue
             mid = prior_band_midpoint(profile, field)

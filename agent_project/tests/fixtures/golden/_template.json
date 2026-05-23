@@ -1,0 +1,97 @@
+{
+  "ticker": "TICK",
+  "as_of": "YYYY-MM-DD",
+  "fiscal_year": "FYxxxx",
+  "horizon_years": 5,
+  "model_variant": "mature_megacap",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 0.0,
+      "tier": "factual",
+      "source": "10-K FYxxxx Income Statement",
+      "url": "",
+      "note": "Total net sales ($M)"
+    },
+    "revenue_growth": {
+      "value": 0.0,
+      "tier": "consensus",
+      "source": "Yahoo Finance Analysis tab",
+      "url": "",
+      "note": "Y1-Y2 near-term growth (analyst consensus). For stable businesses, set same as revenue_growth_terminal or omit terminal"
+    },
+    "revenue_growth_terminal": {
+      "value": 0.0,
+      "tier": "consensus",
+      "source": "Y5 fade — lifecycle mean-reversion",
+      "url": "",
+      "note": "Y5 growth after fade. Hypergrowth → mature decay; mature → unchanged. Omit field for stable businesses (defaults to revenue_growth)"
+    },
+    "fcff_margin": {
+      "value": 0.0,
+      "tier": "derived",
+      "source": "10-K FYxxxx Cash Flow Statement",
+      "url": "",
+      "note": "(Operating cash flow - CapEx) / Total revenue"
+    },
+    "wacc": {
+      "value": 0.0,
+      "tier": "industry",
+      "source": "Damodaran NYU - <industry> sector WACC",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: cost of equity (Rf+β·ERP) weighted by E/(D+E), plus after-tax cost of debt weighted by D/(D+E)"
+    },
+    "terminal_growth": {
+      "value": 0.025,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "Below long-run US GDP ~2.5%; never above Rf"
+    },
+    "net_debt": {
+      "value": 0.0,
+      "tier": "factual",
+      "source": "10-K FYxxxx Balance Sheet",
+      "url": "",
+      "note": "Total debt (current+non-current+CP) - (Cash + marketable securities). Negative = net cash."
+    },
+    "shares_outstanding": {
+      "value": 0.0,
+      "tier": "factual",
+      "source": "10-K FYxxxx Income Statement",
+      "url": "",
+      "note": "Diluted weighted-average shares ($M)"
+    },
+    "tax_rate": {
+      "value": 0.0,
+      "tier": "factual",
+      "source": "10-K FYxxxx Income Statement",
+      "url": "",
+      "note": "Provision for income taxes / Income before tax"
+    },
+    "buyback_yield": {
+      "value": 0.0,
+      "tier": "derived",
+      "source": "10-K capital allocation",
+      "url": "",
+      "note": "Annual share reduction rate: $ buybacks per year / market cap. Negative = net issuance (SBC > buybacks). Default 0 for businesses without programs."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.0,
+      "tier": "derived",
+      "source": "10-K Cash Flow Statement",
+      "url": "",
+      "note": "Stock-based comp / revenue. SBC is real economic cost OCF math hides. Tech 3-10%, industrials <1%, retail ~0.1%. Subtracted from FCFF margin per year."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 0.0,
+      "high": 0.0
+    },
+    "analyst_consensus_target": 0.0,
+    "target_source": "Yahoo Finance / stockanalysis.com / TipRanks",
+    "tolerance_rationale": "±50% around hand-DCF — wide because DCF inherently imprecise vs market multiples"
+  }
+}

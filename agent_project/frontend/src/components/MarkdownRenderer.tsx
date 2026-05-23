@@ -125,12 +125,12 @@ const components: Components = {
     <thead className="bg-[#111116]">{children}</thead>
   ),
   th: ({ children }) => (
-    <th className="px-4 py-2.5 text-left text-[11px] font-semibold text-zinc-500 uppercase tracking-wider border-b border-[#222]">
+    <th className="px-3 py-2 text-left text-[11px] font-semibold text-zinc-500 uppercase tracking-wider border-b border-[#222] align-top">
       {children}
     </th>
   ),
   td: ({ children }) => (
-    <td className="px-4 py-2.5 text-sm text-zinc-300 border-b border-[#1a1a1a] last:border-none">
+    <td className="px-3 py-2 text-sm text-zinc-300 border-b border-[#1a1a1a] last:border-none align-top break-words whitespace-normal">
       {children}
     </td>
   ),

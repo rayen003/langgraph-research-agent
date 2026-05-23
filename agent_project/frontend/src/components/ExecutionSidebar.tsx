@@ -29,6 +29,18 @@ export function ExecutionSidebar({
   const totalSteps = steps.length
   const hasActivity = activity && activity.length > 0
   const isChatMode = totalSteps === 0 && hasActivity
+
+  // Phase 2: surface DCF model_validity from the live workflow activity so
+  // the user sees a red banner the moment convergence_gate emits invalid.
+  const workflowEntry = activity?.find(
+    a => a.kind === 'workflow' && a.meta && typeof a.meta === 'object',
+  )
+  const wfMeta = (workflowEntry?.meta ?? {}) as Record<string, unknown>
+  const liveValidity = typeof wfMeta.model_validity === 'string'
+    ? (wfMeta.model_validity as string) : null
+  const liveInvalidationReason = typeof wfMeta.invalidation_reason === 'string'
+    ? wfMeta.invalidation_reason as string : ''
+  const isDegraded = liveValidity === 'invalid'
   const progress = totalSteps > 0 ? (completedSteps / totalSteps) * 100 : 0
   const isAwaitingPlan = status === 'awaiting_approval'
   const isAwaitingAssumptions = status === 'awaiting_assumptions'
@@ -58,7 +70,9 @@ export function ExecutionSidebar({
         <div className="h-[2px] bg-[#1a1a1a] rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-700 ease-out ${
-              isComplete
+              isComplete && isDegraded
+                ? 'bg-amber-500'
+                : isComplete
                 ? 'bg-emerald-600'
                 : isError
                 ? 'bg-red-600'
@@ -79,7 +93,22 @@ export function ExecutionSidebar({
       </div>
 
       {/* ── Step list ────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+
+        {/* Degraded banner (Phase 2) */}
+        {isDegraded && (
+          <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-200">
+            <div className="font-semibold flex items-center gap-1.5">
+              <span>⚠</span>
+              <span>Model invalid — degraded run</span>
+            </div>
+            {liveInvalidationReason && (
+              <div className="mt-1 text-[11px] text-red-300/90 leading-snug">
+                {liveInvalidationReason}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Chat mode: render activity trace directly */}
         {isChatMode && (

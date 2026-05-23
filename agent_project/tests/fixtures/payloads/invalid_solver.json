@@ -1,0 +1,1010 @@
+{
+  "workflow": "dcf",
+  "generated_at": 1779137482.812463,
+  "ticker": "AAPL",
+  "horizon_years": 5,
+  "profile": "mega_cap_tech",
+  "profile_meta": {
+    "sector": "Technology",
+    "industry": "Consumer Electronics",
+    "market_cap_usd": 4374482111040,
+    "spot_price": 297.84,
+    "currency": "USD",
+    "company_name": "Apple Inc."
+  },
+  "confidence_label": "low",
+  "assumptions": {
+    "net_debt": 76443.0,
+    "base_revenue": 416161.0,
+    "shares_outstanding": 15004.697,
+    "revenue_growth": 0.12,
+    "fcff_margin": 0.255,
+    "terminal_growth": 0.02,
+    "tax_rate": 0.156,
+    "wacc": 0.1014036539037902
+  },
+  "assumption_provenance": {
+    "net_debt": {
+      "source": "fmp",
+      "evidence": "FMP annual balance sheet net debt.",
+      "confidence": 0.9
+    },
+    "base_revenue": {
+      "source": "fmp",
+      "evidence": "FMP annual revenue.",
+      "confidence": 0.97
+    },
+    "shares_outstanding": {
+      "source": "fmp",
+      "evidence": "FMP annual statement share count.",
+      "confidence": 0.97
+    },
+    "revenue_growth": {
+      "source": "llm_memo",
+      "evidence": "We propose a revenue growth rate of 12% for AAPL over the next five years. This is supported by the recent quarterly revenue growth of 17% and strong demand for the iPhone 17 series, as well as sustained growth in the Services segment at 16%. While management guidance indicates a more conservative mid-single-digit growth, the current momentum suggests the potential for continued strong performance, especially with new product launches and an expanding customer base.",
+      "reference": "ev_web_0_evb_1779137402211, ev_web_2_evb_1779137402211, ev_sec_0000320193260000_risk_factors",
+      "confidence": 0.85,
+      "range_low": 0.1,
+      "range_high": 0.14
+    },
+    "fcff_margin": {
+      "source": "llm_memo",
+      "evidence": "The free cash flow to firm margin is proposed at 24%, reflecting AAPL's improving trends in profitability and operational efficiencies. Historical data shows a FCFF margin around this level, and with increasing gross margins, the company can expect sustained cash flow generation given its scale and established product ecosystems. Additionally, the transition towards higher-margin services supports this margin outlook.",
+      "reference": "ev_fmp+fallback:yfinance_fcff_margin, ev_web_2_evb_1779137402211",
+      "confidence": 0.85,
+      "range_low": 0.22,
+      "range_high": 0.26
+    },
+    "terminal_growth": {
+      "source": "llm_memo",
+      "evidence": "A terminal growth rate of 2% is proposed, which aligns with the expectations for stable long-term growth in a mature company like AAPL. Given the company's strong competitive position and continually innovative product approach, we believe a growth rate at the lower end of the risk-free rate plus inflation expectations is justified, as it reflects both the mature nature of the business and typical long-term growth rates for established technology firms.",
+      "reference": "ev_sec_0000320193260000_risk_factors",
+      "confidence": 0.9,
+      "range_low": 0.01,
+      "range_high": 0.03
+    },
+    "tax_rate": {
+      "source": "llm_memo",
+      "evidence": "The tax rate is projected at 15.6%, consistent with Apple's effective tax rate reported in the most recent financial filings. This rate has shown consistency in the past, and given the current tax policies, it is reasonable to expect this level will continue in the near future. Additionally, no significant changes in tax policy have been indicated that would impact this rate significantly.",
+      "reference": "ev_fmp+fallback:yfinance_tax_rate, ev_feature_effective_tax_rate_hint",
+      "confidence": 0.85,
+      "range_low": 0.15,
+      "range_high": 0.17
+    },
+    "wacc": {
+      "source": "capm",
+      "evidence": "WACC = w_e * (Rf + beta*ERP) + w_d * Rd * (1-T); Rf/ERP from env DCF_RISK_FREE_RATE / DCF_EQUITY_RISK_PREMIUM.",
+      "confidence": 0.78
+    }
+  },
+  "fundamentals": {
+    "shares_outstanding": {
+      "value": 15004.697,
+      "source": "fmp",
+      "field": "weightedAverageShsOutDil",
+      "raw_value": 15004697000.0,
+      "raw_unit": "shares",
+      "as_of": "2025-09-27",
+      "confidence": 0.97,
+      "evidence": "FMP annual statement share count."
+    },
+    "base_revenue": {
+      "value": 416161.0,
+      "source": "fmp",
+      "field": "revenue",
+      "raw_value": 416161000000.0,
+      "raw_unit": "USD",
+      "as_of": "2025-09-27",
+      "confidence": 0.97,
+      "evidence": "FMP annual revenue."
+    },
+    "net_debt": {
+      "value": 76443.0,
+      "source": "fmp",
+      "field": "totalDebt - cashAndCashEquivalents",
+      "raw_value": 76443000000.0,
+      "raw_unit": "USD",
+      "as_of": "2025-09-27",
+      "confidence": 0.9,
+      "evidence": "FMP annual balance sheet net debt."
+    },
+    "fcff_margin": {
+      "value": 0.23732882225869315,
+      "source": "fmp",
+      "field": "(freeCashFlow + interestExpense*(1-tax)) / revenue",
+      "raw_value": 0.23732882225869315,
+      "raw_unit": "ratio",
+      "as_of": "2025-09-27",
+      "confidence": 0.85,
+      "evidence": "FMP unlevered FCF margin: FCF + after-tax interest, divided by revenue."
+    },
+    "tax_rate": {
+      "value": 0.15610002335586043,
+      "source": "fmp",
+      "field": "incomeTaxExpense / incomeBeforeTax",
+      "raw_value": 0.15610002335586043,
+      "raw_unit": "ratio",
+      "as_of": "2025-09-27",
+      "confidence": 0.85,
+      "evidence": "FMP effective tax rate from income statement."
+    }
+  },
+  "assumption_conflicts": [],
+  "assumption_flags": [
+    {
+      "code": "wacc_above_soft_max",
+      "severity": "warn",
+      "field": "wacc",
+      "value": 0.1014036539037902,
+      "expected": {
+        "min": 0.07,
+        "max": 0.1
+      },
+      "profile": "mega_cap_tech",
+      "message": "wacc=0.1014 is above typical range 0.07-0.1 for profile 'mega_cap_tech'."
+    }
+  ],
+  "valuation_flags": [],
+  "market_snapshot": {},
+  "valuation": {
+    "pv_cash_flows": 525265.5222203417,
+    "terminal_value": 2205560.6564809736,
+    "terminal_pv": 1360775.3747928303,
+    "enterprise_value": 1886040.897013172,
+    "equity_value": 1809597.897013172,
+    "implied_share_price": 30.0,
+    "current_price": 0.0
+  },
+  "sensitivity_table": [
+    {
+      "wacc": 0.0914,
+      "terminal_growth": 0.015,
+      "implied_share_price": 131.5348
+    },
+    {
+      "wacc": 0.0914,
+      "terminal_growth": 0.02,
+      "implied_share_price": 139.1124
+    },
+    {
+      "wacc": 0.0914,
+      "terminal_growth": 0.025,
+      "implied_share_price": 147.8311
+    },
+    {
+      "wacc": 0.1014,
+      "terminal_growth": 0.015,
+      "implied_share_price": 114.9352
+    },
+    {
+      "wacc": 0.1014,
+      "terminal_growth": 0.02,
+      "implied_share_price": 120.6021
+    },
+    {
+      "wacc": 0.1014,
+      "terminal_growth": 0.025,
+      "implied_share_price": 127.0107
+    },
+    {
+      "wacc": 0.1114,
+      "terminal_growth": 0.015,
+      "implied_share_price": 101.8046
+    },
+    {
+      "wacc": 0.1114,
+      "terminal_growth": 0.02,
+      "implied_share_price": 106.1674
+    },
+    {
+      "wacc": 0.1114,
+      "terminal_growth": 0.025,
+      "implied_share_price": 111.0351
+    }
+  ],
+  "features": {
+    "ticker": "AAPL",
+    "profile_bucket": "mega_cap_tech",
+    "sector": "Technology",
+    "industry": "Consumer Electronics",
+    "beta": 1.065,
+    "market_cap_usd": 4374482111040.0,
+    "total_debt_usd": 112377000000.0,
+    "cash_usd": 35934000000.0,
+    "interest_expense_usd": 0.0,
+    "effective_tax_rate_hint": 0.15610002335586043,
+    "equity_value_usd": 4374482111040.0,
+    "net_debt_usd": 76443000000.0
+  },
+  "wacc_components": {
+    "risk_free_rate": 0.045,
+    "equity_risk_premium": 0.055,
+    "marginal_tax_rate": 0.156,
+    "beta": 1.065,
+    "cost_of_equity": 0.103575,
+    "pre_tax_cost_of_debt": 0.02,
+    "after_tax_cost_of_debt": 0.01688,
+    "equity_weight": 0.9749541946339491,
+    "debt_weight": 0.0250458053660509,
+    "equity_value_usd": 4374482111040.0,
+    "debt_value_usd": 112377000000.0,
+    "enterprise_value_usd": 4486859111040.0,
+    "method": "capm",
+    "wacc_pre_clip": 0.1014036539037902
+  },
+  "assumption_memo": {
+    "ticker": "AAPL",
+    "horizon_years": 5,
+    "proposals": [
+      {
+        "field": "revenue_growth",
+        "value": 0.12,
+        "rationale": "We propose a revenue growth rate of 12% for AAPL over the next five years. This is supported by the recent quarterly revenue growth of 17% and strong demand for the iPhone 17 series, as well as sustained growth in the Services segment at 16%. While management guidance indicates a more conservative mid-single-digit growth, the current momentum suggests the potential for continued strong performance, especially with new product launches and an expanding customer base.",
+        "evidence_refs": [
+          "ev_web_0_evb_1779137402211",
+          "ev_web_2_evb_1779137402211",
+          "ev_sec_0000320193260000_risk_factors"
+        ],
+        "confidence": 0.85,
+        "range_low": 0.1,
+        "range_high": 0.14
+      },
+      {
+        "field": "fcff_margin",
+        "value": 0.24,
+        "rationale": "The free cash flow to firm margin is proposed at 24%, reflecting AAPL's improving trends in profitability and operational efficiencies. Historical data shows a FCFF margin around this level, and with increasing gross margins, the company can expect sustained cash flow generation given its scale and established product ecosystems. Additionally, the transition towards higher-margin services supports this margin outlook.",
+        "evidence_refs": [
+          "ev_fmp+fallback:yfinance_fcff_margin",
+          "ev_web_2_evb_1779137402211"
+        ],
+        "confidence": 0.85,
+        "range_low": 0.22,
+        "range_high": 0.26
+      },
+      {
+        "field": "terminal_growth",
+        "value": 0.02,
+        "rationale": "A terminal growth rate of 2% is proposed, which aligns with the expectations for stable long-term growth in a mature company like AAPL. Given the company's strong competitive position and continually innovative product approach, we believe a growth rate at the lower end of the risk-free rate plus inflation expectations is justified, as it reflects both the mature nature of the business and typical long-term growth rates for established technology firms.",
+        "evidence_refs": [
+          "ev_sec_0000320193260000_risk_factors"
+        ],
+        "confidence": 0.9,
+        "range_low": 0.01,
+        "range_high": 0.03
+      },
+      {
+        "field": "tax_rate",
+        "value": 0.156,
+        "rationale": "The tax rate is projected at 15.6%, consistent with Apple's effective tax rate reported in the most recent financial filings. This rate has shown consistency in the past, and given the current tax policies, it is reasonable to expect this level will continue in the near future. Additionally, no significant changes in tax policy have been indicated that would impact this rate significantly.",
+        "evidence_refs": [
+          "ev_fmp+fallback:yfinance_tax_rate",
+          "ev_feature_effective_tax_rate_hint"
+        ],
+        "confidence": 0.85,
+        "range_low": 0.15,
+        "range_high": 0.17
+      }
+    ],
+    "overall_narrative": "Apple is positioned for sustained growth driven by robust demand for its innovative new products, including the iPhone 17 lineup and expansions in its Services segment. Our revenue growth assumption reflects the company's historical performance and current momentum, while a consistent free cash flow margin indicates operational efficiencies and profitability. With a terminal growth rate grounded in macroeconomic expectations for stable growth and a reasonable tax rate reflecting the company's established standing, these assumptions paint a picture of a strong and resilient cash flow generation landscape. However, the intense competitive landscape and dependency on continuous innovation pose risks to sustained performance.",
+    "key_uncertainties": [
+      "Intense price competition in the consumer electronics market could press margins and impact growth rates.",
+      "Global supply chain constraints, particularly in semiconductor availability, may affect production capabilities and sales.",
+      "Transition in leadership with Tim Cook stepping down could influence future corporate strategies and operational direction.",
+      "Fluctuations in economic conditions impacting consumer spending could adversely affect product sales and service growth."
+    ],
+    "overall_confidence": 0.83,
+    "evidence_refs": [
+      "ev_web_0_evb_1779137402211",
+      "ev_web_2_evb_1779137402211",
+      "ev_sec_0000320193260000_risk_factors",
+      "ev_fmp+fallback:yfinance_fcff_margin",
+      "ev_fmp+fallback:yfinance_tax_rate",
+      "ev_feature_effective_tax_rate_hint"
+    ]
+  },
+  "company_state": {
+    "ticker": "AAPL",
+    "business_summary": "Apple Inc. operates in the Technology sector, primarily designing, manufacturing, and selling consumer electronics, software, and services.",
+    "growth_outlook": "For the fiscal year 2026, Apple reported a revenue growth of 17% year-over-year, reaching $111.2 billion per web excerpt (ev_web_0_evb_1779137402211), with management highlighting strong demand for the iPhone 17 lineup and record services revenue. The company is guiding for continued mid-single-digit revenue growth moving forward, influenced by product launches and a growing installed user base per 10-Q filings (ev_sec_0000320193260000_risk_factors).",
+    "growth_drivers": [
+      "Increased demand for the new iPhone 17 lineup, as evidenced by 22% revenue growth in iPhone sales year-over-year per web excerpt (ev_web_2_evb_1779137402211).",
+      "Strong performance in the Services segment, which saw a year-over-year growth of around 16%, driven by a large base of active devices, as detailed in the earnings report (ev_web_2_evb_1779137402211).",
+      "Introduction of new products such as the iPhone 17e and M4-powered iPad Air, which are expected to attract more customers per quarterly financial results (ev_web_0_evb_1779137402211).",
+      "Continuous improvement in gross margins, with the latest reported figure at 49.3%, up from 48.2% in the previous quarter, indicating better profitability per web excerpt (ev_web_2_evb_1779137402211).",
+      "Global market presence with over 2.5 billion active devices, providing a sustained revenue stream from services (ev_web_2_evb_1779137402211)."
+    ],
+    "margin_trend": "improving",
+    "margin_narrative": "Apple's gross margin has demonstrated an improving trend, increasing to 49.3% in the latest quarter from 48.2%, reflecting operational efficiencies and higher-margin services revenue contributing to overall profitability, according to web excerpts (ev_web_2_evb_1779137402211).",
+    "key_risks": [
+      "Intense competition in the consumer electronics space, characterized by price pressure and rapid product lifecycle changes as noted in the risk factors (ev_web_1_evb_1779137402211).",
+      "Potential supply chain constraints due to global memory shortages impacting production costs and availability per web excerpt (ev_web_2_evb_1779137402211).",
+      "The transition in leadership with Tim Cook stepping down as CEO may introduce uncertainties in strategic direction (ev_web_2_evb_1779137402211).",
+      "Dependence on continuous product innovation and the challenge of keeping pace with competitor advancements per web excerpt (ev_web_1_evb_1779137402211).",
+      "Economic factors affecting consumer spending could influence product sales and services adoption.",
+      "Regulatory challenges in international markets that could impact operations and profitability, as suggested in recent filings (ev_sec_0000320193260000_risk_factors)."
+    ],
+    "competitive_position": "Apple maintains a strong competitive position characterized by high brand loyalty, an extensive ecosystem of products and services, and a substantial market share within the smartphone and computing markets, combined with notable pricing power due to its brand reputation.",
+    "macro_context": "Apple operates in a macroeconomic environment influenced by global supply chain dynamics and consumer spending trends, with a recent focus on AI advancements indicating a strategic pivot in technology offerings.",
+    "conflicts": [
+      "Management's guidance for mid-single-digit growth conflicts with the recent strong revenue growth reported of 17% year-over-year, indicating a potentially more optimistic immediate outlook compared to future projections.",
+      "Despite reported strong sales, expectations for iPhone performance did not meet street estimates, suggesting a potential disconnect between current sales momentum and future projections (ev_web_2_evb_1779137402211)."
+    ],
+    "evidence_refs": [
+      {
+        "evidence_id": "ev_web_0_evb_1779137402211",
+        "relevance": "This excerpt highlights key aspects of recent performance, including revenue growth and operational achievements."
+      },
+      {
+        "evidence_id": "ev_web_2_evb_1779137402211",
+        "relevance": "The source provides concrete numerical results and future guidance related to growth, margins, and overall business performance."
+      },
+      {
+        "evidence_id": "ev_sec_0000320193260000_risk_factors",
+        "relevance": "Filing details risks that could materially impact Apple's competitive landscape and financial performance."
+      },
+      {
+        "evidence_id": "ev_web_1_evb_1779137402211",
+        "relevance": "Provides context on competition and innovation challenges that Apple faces, relevant for assessing risks."
+      },
+      {
+        "evidence_id": "ev_fmp+fallback:yfinance_base_revenue",
+        "relevance": "Base revenue data supports claims about current financial performance."
+      },
+      {
+        "evidence_id": "ev_fmp+fallback:yfinance_fcff_margin",
+        "relevance": "Financial data on margins is critical for understanding profitability trends."
+      }
+    ],
+    "confidence_self_assessment": "high"
+  },
+  "confidence_breakdown": {
+    "components": {
+      "data_quality": {
+        "score": 1.0,
+        "label": "high",
+        "reason": "All fields from canonical/API sources"
+      },
+      "revenue_growth": {
+        "score": 0.85,
+        "label": "high",
+        "reason": "LLM memo (85%)"
+      },
+      "margin_stability": {
+        "score": 0.85,
+        "label": "high",
+        "reason": "LLM memo (85%)"
+      },
+      "wacc_reliability": {
+        "score": 0.3,
+        "label": "low",
+        "reason": "CAPM, 1 flag(s); implied-WACC solver failed"
+      },
+      "terminal_assumptions": {
+        "score": 0.9,
+        "label": "high",
+        "reason": "LLM memo (90%)"
+      },
+      "validity_penalty": {
+        "score": 0.25,
+        "label": "low",
+        "reason": "model invalid (\u00d70.30); 1 unexplained divergence(s) (\u22120.05)"
+      }
+    },
+    "aggregate_score": 0.175,
+    "label": "low",
+    "summary": "Model marked invalid \u2014 wacc carries meaningful uncertainty."
+  },
+  "wacc_sanity": {
+    "method": "capm_vs_implied",
+    "capm_wacc": 0.1014036539037902,
+    "implied_wacc": null,
+    "gap_bps": 450,
+    "direction": "neutral",
+    "flag": "severe",
+    "solver_status": "no_convergence",
+    "interpretation": "Solver skipped: market_price=0.0, implied_ev_M=0, projection_rows=5"
+  },
+  "thesis": {
+    "bull_thesis": "Apple could outperform due to strong demand for the iPhone 17 lineup and consistent double-digit growth in its Services segment, which leverages its vast ecosystem of active devices. Additionally, improving gross margins indicate enhanced operational efficiency, supporting overall profitability.",
+    "bear_thesis": "The stock could underperform if intense competition leads to pricing pressure and impacts product sales, particularly in the face of leadership changes that may affect strategic direction. Furthermore, global supply chain constraints and economic factors could hinder revenue growth prospects.",
+    "key_drivers": [
+      {
+        "driver": "Increased demand for the iPhone 17 lineup",
+        "direction": "positive",
+        "conviction": "high"
+      },
+      {
+        "driver": "Strong growth in Services revenue",
+        "direction": "positive",
+        "conviction": "high"
+      },
+      {
+        "driver": "Improving gross margins",
+        "direction": "positive",
+        "conviction": "medium"
+      },
+      {
+        "driver": "Intense competition in consumer electronics",
+        "direction": "negative",
+        "conviction": "high"
+      },
+      {
+        "driver": "Potential supply chain constraints",
+        "direction": "negative",
+        "conviction": "medium"
+      }
+    ],
+    "narrative": "Overall, Apple's robust product lineup and strong growth in services position it favorably in the market, despite facing significant competitive pressures and potential operational risks. The ability to sustain innovation and manage supply chain challenges will be critical to maintaining its growth trajectory and optimizing profitability in the long term."
+  },
+  "critique": {
+    "iteration": 0,
+    "flags": [
+      {
+        "signal": "terminal_weight",
+        "value": 72.1,
+        "threshold": "> 70% is concerning",
+        "severity": "warning"
+      },
+      {
+        "signal": "implied_vs_spot",
+        "value": 11960.2,
+        "threshold": "> \u00b150% is extreme",
+        "severity": "severe"
+      },
+      {
+        "signal": "wacc_sanity_gap",
+        "value_bps": 0,
+        "threshold": "> 200 bps is concerning",
+        "severity": "ok"
+      },
+      {
+        "signal": "wacc_sensitivity",
+        "value_pct": 38.2,
+        "threshold": "> 30% swing is high sensitivity",
+        "severity": "warning"
+      },
+      {
+        "signal": "confidence",
+        "value": "high",
+        "severity": "ok"
+      },
+      {
+        "signal": "tgr_vs_rf",
+        "value": 2.0,
+        "threshold": "TGR should not exceed Rf (4.50%) by more than 50 bps",
+        "severity": "ok"
+      }
+    ],
+    "review_summary": "Review iteration 1 for AAPL. Total findings: 12 (12 high-confidence/high-severity). Top finding: [base] revenue_growth should be neutral \u2014 The proposed revenue growth of 12% lacks clear support from the Cited 10-Q, which emphasizes a mid-single-digit growth outlook. Anchoring flags: revenue_growth=0.120 is a suspiciously round number; fcff_margin=0.240 is a suspiciously round number; terminal_growth=0.020 is a suspiciously round number Adjustments queued: {\"bear\": [\"fcff_margin\", \"revenue_growth\"], \"base\": [\"fcff_margin\"], \"bull\": [\"fcff_margin\", \"revenue_growth\"]}",
+    "findings": [
+      {
+        "scenario": "base",
+        "field": "revenue_growth",
+        "direction": "neutral",
+        "confidence": 0.85,
+        "severity": "high",
+        "layer": "evidence_memo",
+        "reasoning": "The proposed revenue growth of 12% lacks clear support from the Cited 10-Q, which emphasizes a mid-single-digit growth outlook.",
+        "evidence_refs": [
+          "ev_sec_0000320193260000_risk_factors"
+        ],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "base",
+        "field": "fcff_margin",
+        "direction": "higher",
+        "confidence": 0.85,
+        "severity": "high",
+        "layer": "evidence_memo",
+        "reasoning": "The FCFF margin of 24% is not sufficiently substantiated by the cited evidence which mentions a trend but does not confirm this specific level.",
+        "evidence_refs": [
+          "ev_fmp+fallback:yfinance_fcff_margin",
+          "ev_web_2_evb_1779137402211"
+        ],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "base",
+        "field": "terminal_growth",
+        "direction": "neutral",
+        "confidence": 0.9,
+        "severity": "high",
+        "layer": "evidence_memo",
+        "reasoning": "The terminal growth rate of 2% does not align with the risk factors suggesting stable long-term growth is more uncertain.",
+        "evidence_refs": [
+          "ev_sec_0000320193260000_risk_factors"
+        ],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "base",
+        "field": "tax_rate",
+        "direction": "neutral",
+        "confidence": 0.85,
+        "severity": "high",
+        "layer": "evidence_memo",
+        "reasoning": "While the 15.6% tax rate is cited, the rationale does not clearly justify maintaining this rate given the context of competitive pressures.",
+        "evidence_refs": [
+          "ev_fmp+fallback:yfinance_tax_rate",
+          "ev_feature_effective_tax_rate_hint"
+        ],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "bear",
+        "field": "fcff_margin",
+        "direction": "lower",
+        "confidence": 0.75,
+        "severity": "high",
+        "layer": "thesis_assumptions",
+        "reasoning": "The bear case assumes a 20% margin which contradicts the base case FCFF margin of 24% without clear justification.",
+        "evidence_refs": [],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "bear",
+        "field": "revenue_growth",
+        "direction": "lower",
+        "confidence": 0.75,
+        "severity": "high",
+        "layer": "thesis_assumptions",
+        "reasoning": "The bear scenario\u2019s revenue growth of 5% appears inconsistent with the base scenario\u2019s 12% growth assumption.",
+        "evidence_refs": [],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "bull",
+        "field": "fcff_margin",
+        "direction": "higher",
+        "confidence": 0.75,
+        "severity": "high",
+        "layer": "thesis_assumptions",
+        "reasoning": "The bull case assumes a 28% FCFF margin, significantly higher than the base case without a strong basis in evidence.",
+        "evidence_refs": [],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "bull",
+        "field": "revenue_growth",
+        "direction": "higher",
+        "confidence": 0.75,
+        "severity": "high",
+        "layer": "thesis_assumptions",
+        "reasoning": "The proposed 18% revenue growth in the bull case does not align with operational forecasts provided in risk factors.",
+        "evidence_refs": [],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "all",
+        "field": "wacc",
+        "direction": "neutral",
+        "confidence": 0.8,
+        "severity": "high",
+        "layer": "consistency",
+        "reasoning": "The high degree of net debt vs market cap suggests the WACC may be unreasonably low given the leverage, contradicting standard valuation frameworks.",
+        "evidence_refs": [
+          "ev_feature_net_debt_usd",
+          "ev_feature_equity_value_usd"
+        ],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "all",
+        "field": "fcff_margin",
+        "direction": "neutral",
+        "confidence": 0.85,
+        "severity": "high",
+        "layer": "consistency",
+        "reasoning": "FCFF margin trends should logically follow revenue growth, thus the proposed base margin of 24% alongside growth of 12% raises concerns of inconsistency.",
+        "evidence_refs": [
+          "ev_web_2_evb_1779137402211"
+        ],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "bear",
+        "field": "revenue_growth",
+        "direction": "neutral",
+        "confidence": 0.85,
+        "severity": "high",
+        "layer": "scenario_distinguishability",
+        "reasoning": "The bear scenario revenue growth of 5% does not sufficiently distinguish it from the base growth of 12% \u2014 it needs to reflect more serious downside risk.",
+        "evidence_refs": [],
+        "is_unanchored": true
+      },
+      {
+        "scenario": "bull",
+        "field": "revenue_growth",
+        "direction": "higher",
+        "confidence": 0.85,
+        "severity": "high",
+        "layer": "scenario_distinguishability",
+        "reasoning": "The bull scenario growth of 18% fails to represent a meaningful upside from the base case, suggesting superficial differentiation.",
+        "evidence_refs": [],
+        "is_unanchored": true
+      }
+    ],
+    "changes": [
+      "base.fcff_margin: 0.2400 \u2192 0.2550",
+      "bear.fcff_margin: 0.2000 \u2192 0.1850",
+      "bear.revenue_growth: 0.0500 \u2192 0.0300",
+      "base.fcff_margin: 0.2400 \u2192 0.2550",
+      "bull.fcff_margin: 0.2800 \u2192 0.2950",
+      "bull.revenue_growth: 0.1800 \u2192 0.2000"
+    ],
+    "should_refine": true,
+    "stop_reason": ""
+  },
+  "divergences": [
+    {
+      "id": "wacc_solver_failure",
+      "kind": "solver_failure",
+      "severity": "critical",
+      "details": {
+        "solver_status": "no_input",
+        "interpretation": "Solver skipped: market_price=0.0, implied_ev_M=0, projection_rows=5"
+      },
+      "summary": "Implied WACC solver failed (no_input). Market signal unavailable."
+    }
+  ],
+  "analysis_positions": [
+    {
+      "divergence_id": "wacc_solver_failure",
+      "position": "UNEXPLAINED",
+      "explanation": "The absence of market price data due to the solver failure indicates that there is insufficient information to assess the implied WACC accurately. The existing evidence does not provide sufficient context or precise figures to close the gap left by the solver's inability to generate necessary inputs for WACC calculation.",
+      "evidence_used": [
+        "ev_web_0_evb_1779137402211",
+        "ev_web_1_evb_1779137402211",
+        "ev_web_2_evb_1779137402211",
+        "ev_analysis_wacc_solver_failure_0",
+        "ev_analysis_wacc_solver_failure_1",
+        "ev_analysis_wacc_solver_failure_2",
+        "ev_analysis_wacc_solver_failure_3"
+      ],
+      "adjustment": null,
+      "uncertainty_note": "The divergence regarding implied WACC remains unresolved due to the lack of market price input for the DCF model.",
+      "divergence_summary": "Implied WACC solver failed (no_input). Market signal unavailable.",
+      "divergence_severity": "critical",
+      "new_evidence_fetched": [
+        "ev_analysis_wacc_solver_failure_0",
+        "ev_analysis_wacc_solver_failure_1",
+        "ev_analysis_wacc_solver_failure_2",
+        "ev_analysis_wacc_solver_failure_3"
+      ]
+    }
+  ],
+  "model_validity": "invalid",
+  "invalidation_reason": "Critical divergence: WACC solver failed to converge. Model results are unreliable.",
+  "effective_confidence": 0.425,
+  "scenarios": [
+    {
+      "name": "bear",
+      "probability": 0.25,
+      "assumptions": {
+        "net_debt": 76443.0,
+        "base_revenue": 416161.0,
+        "shares_outstanding": 15004.697,
+        "revenue_growth": 0.03,
+        "fcff_margin": 0.185,
+        "terminal_growth": 0.02,
+        "tax_rate": 0.3,
+        "wacc": 0.1014036539037902
+      },
+      "rationale": "The bear case reflects potential underperformance due to intense competition leading to pricing pressures, alongside possible operational challenges that could hurt revenue growth."
+    },
+    {
+      "name": "base",
+      "probability": 0.5,
+      "assumptions": {
+        "net_debt": 76443.0,
+        "base_revenue": 416161.0,
+        "shares_outstanding": 15004.697,
+        "revenue_growth": 0.12,
+        "fcff_margin": 0.255,
+        "terminal_growth": 0.02,
+        "tax_rate": 0.156,
+        "wacc": 0.1014036539037902
+      },
+      "rationale": "Base case from proposed assumptions."
+    },
+    {
+      "name": "bull",
+      "probability": 0.25,
+      "assumptions": {
+        "net_debt": 76443.0,
+        "base_revenue": 416161.0,
+        "shares_outstanding": 15004.697,
+        "revenue_growth": 0.2,
+        "fcff_margin": 0.295,
+        "terminal_growth": 0.035,
+        "tax_rate": 0.28,
+        "wacc": 0.1014036539037902
+      },
+      "rationale": "The bull case assumes strong demand for the iPhone 17 and robust growth in Services will drive sustained revenue growth and improved margins, enhancing overall profitability."
+    }
+  ],
+  "scenario_results": [
+    {
+      "name": "bear",
+      "probability": 0.25,
+      "assumptions": {
+        "net_debt": 76443.0,
+        "base_revenue": 416161.0,
+        "shares_outstanding": 15004.697,
+        "revenue_growth": 0.05,
+        "fcff_margin": 0.2,
+        "terminal_growth": 0.02,
+        "tax_rate": 0.3,
+        "wacc": 0.1014036539037902
+      },
+      "rationale": "The bear case reflects potential underperformance due to intense competition leading to pricing pressures, alongside possible operational challenges that could hurt revenue growth.",
+      "valuation": {
+        "pv_cash_flows": 361394.3366625139,
+        "terminal_value": 1331049.3020337732,
+        "terminal_pv": 821223.89494046,
+        "enterprise_value": 1182618.2316029738,
+        "equity_value": 1106175.2316029738,
+        "implied_share_price": 73.7219306463152,
+        "current_price": 297.8399963378906
+      }
+    },
+    {
+      "name": "base",
+      "probability": 0.5,
+      "assumptions": {
+        "net_debt": 76443.0,
+        "base_revenue": 416161.0,
+        "shares_outstanding": 15004.697,
+        "revenue_growth": 0.12,
+        "fcff_margin": 0.24,
+        "terminal_growth": 0.02,
+        "tax_rate": 0.156,
+        "wacc": 0.1014036539037902
+      },
+      "rationale": "Base case from proposed assumptions.",
+      "valuation": {
+        "pv_cash_flows": 525265.5222203417,
+        "terminal_value": 2205560.6564809736,
+        "terminal_pv": 1360775.3747928303,
+        "enterprise_value": 1886040.897013172,
+        "equity_value": 1809597.897013172,
+        "implied_share_price": 120.60209526478089,
+        "current_price": 297.8399963378906
+      }
+    },
+    {
+      "name": "bull",
+      "probability": 0.25,
+      "assumptions": {
+        "net_debt": 76443.0,
+        "base_revenue": 416161.0,
+        "shares_outstanding": 15004.697,
+        "revenue_growth": 0.18,
+        "fcff_margin": 0.28,
+        "terminal_growth": 0.035,
+        "tax_rate": 0.28,
+        "wacc": 0.1014036539037902
+      },
+      "rationale": "The bull case assumes strong demand for the iPhone 17 and robust growth in Services will drive sustained revenue growth and improved margins, enhancing overall profitability.",
+      "valuation": {
+        "pv_cash_flows": 719875.1822800005,
+        "terminal_value": 4155064.967940008,
+        "terminal_pv": 2563570.4338589334,
+        "enterprise_value": 3283445.616138934,
+        "equity_value": 3207002.616138934,
+        "implied_share_price": 213.73324740505817,
+        "current_price": 297.8399963378906
+      }
+    }
+  ],
+  "_evidence_items": [
+    {
+      "evidence_id": "ev_sec_0000320193260000_risk_factors",
+      "kind": "filing_excerpt",
+      "source_tier": "filing",
+      "source": "sec_edgar",
+      "as_of": "2026-05-01",
+      "section": "Risk Factors (Item 1A)",
+      "filing_type": "10-Q",
+      "accession_number": "0000320193-26-000013",
+      "ticker": "AAPL",
+      "text": "Item 1A. Risk Factors 21",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019326000013/aapl-20260328.htm"
+    },
+    {
+      "evidence_id": "ev_sec_0000320193260000_risk_factors",
+      "kind": "filing_excerpt",
+      "source_tier": "filing",
+      "source": "sec_edgar",
+      "as_of": "2026-01-30",
+      "section": "Risk Factors (Item 1A)",
+      "filing_type": "10-Q",
+      "accession_number": "0000320193-26-000006",
+      "ticker": "AAPL",
+      "text": "Item 1A. Risk Factors 20",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019326000006/aapl-20251227.htm"
+    },
+    {
+      "evidence_id": "ev_fmp+fallback:yfinance_shares_outstanding",
+      "kind": "structured_fundamental",
+      "source_tier": "structured_api",
+      "source": "fmp+fallback:yfinance",
+      "as_of": "2025-09-27",
+      "field": "shares_outstanding",
+      "value": 15004.697,
+      "raw_value": 15004697000.0,
+      "raw_unit": "shares",
+      "confidence": 0.97,
+      "evidence": "FMP annual statement share count."
+    },
+    {
+      "evidence_id": "ev_fmp+fallback:yfinance_base_revenue",
+      "kind": "structured_fundamental",
+      "source_tier": "structured_api",
+      "source": "fmp+fallback:yfinance",
+      "as_of": "2025-09-27",
+      "field": "base_revenue",
+      "value": 416161.0,
+      "raw_value": 416161000000.0,
+      "raw_unit": "USD",
+      "confidence": 0.97,
+      "evidence": "FMP annual revenue."
+    },
+    {
+      "evidence_id": "ev_fmp+fallback:yfinance_net_debt",
+      "kind": "structured_fundamental",
+      "source_tier": "structured_api",
+      "source": "fmp+fallback:yfinance",
+      "as_of": "2025-09-27",
+      "field": "net_debt",
+      "value": 76443.0,
+      "raw_value": 76443000000.0,
+      "raw_unit": "USD",
+      "confidence": 0.9,
+      "evidence": "FMP annual balance sheet net debt."
+    },
+    {
+      "evidence_id": "ev_fmp+fallback:yfinance_fcff_margin",
+      "kind": "structured_fundamental",
+      "source_tier": "structured_api",
+      "source": "fmp+fallback:yfinance",
+      "as_of": "2025-09-27",
+      "field": "fcff_margin",
+      "value": 0.23732882225869315,
+      "raw_value": 0.23732882225869315,
+      "raw_unit": "ratio",
+      "confidence": 0.85,
+      "evidence": "FMP unlevered FCF margin: FCF + after-tax interest, divided by revenue."
+    },
+    {
+      "evidence_id": "ev_fmp+fallback:yfinance_tax_rate",
+      "kind": "structured_fundamental",
+      "source_tier": "structured_api",
+      "source": "fmp+fallback:yfinance",
+      "as_of": "2025-09-27",
+      "field": "tax_rate",
+      "value": 0.15610002335586043,
+      "raw_value": 0.15610002335586043,
+      "raw_unit": "ratio",
+      "confidence": 0.85,
+      "evidence": "FMP effective tax rate from income statement."
+    },
+    {
+      "evidence_id": "ev_profile_classification",
+      "kind": "profile",
+      "source_tier": "structured_api",
+      "source": "derived",
+      "as_of": "2026-05-18",
+      "profile": "mega_cap_tech",
+      "sector": "Technology",
+      "industry": "Consumer Electronics",
+      "market_cap_usd": 4374482111040,
+      "spot_price": 297.84,
+      "company_name": "Apple Inc."
+    },
+    {
+      "evidence_id": "ev_feature_beta",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "beta",
+      "value": 1.065
+    },
+    {
+      "evidence_id": "ev_feature_equity_value_usd",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "equity_value_usd",
+      "value": 4374482111040.0
+    },
+    {
+      "evidence_id": "ev_feature_total_debt_usd",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "total_debt_usd",
+      "value": 112377000000.0
+    },
+    {
+      "evidence_id": "ev_feature_cash_usd",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "cash_usd",
+      "value": 35934000000.0
+    },
+    {
+      "evidence_id": "ev_feature_interest_expense_usd",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "interest_expense_usd",
+      "value": 0.0
+    },
+    {
+      "evidence_id": "ev_feature_net_debt_usd",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "net_debt_usd",
+      "value": 76443000000.0
+    },
+    {
+      "evidence_id": "ev_feature_effective_tax_rate_hint",
+      "kind": "market_data",
+      "source_tier": "structured_api",
+      "source": "fmp+yfinance",
+      "as_of": "2026-05-18",
+      "field": "effective_tax_rate_hint",
+      "value": 0.15610002335586043
+    },
+    {
+      "evidence_id": "ev_web_0_evb_1779137402211",
+      "kind": "web_excerpt",
+      "source_tier": "generic_web",
+      "source": "exa",
+      "as_of": "2026-04-01T00:00:00.000Z",
+      "title": "Apple reports second quarter results - Apple",
+      "url": "https://www.apple.com/newsroom/2026/04/apple-reports-second-quarter-results/",
+      "text": "CUPERTINO, CALIFORNIA Apple today announced financial results for its fiscal 2026 second quarter ended March 28, 2026. The Company posted quarterly revenue of $111.2 billion, up 17 percent year over year. Diluted earnings per share was $2.01, up 22 percent year over year.\n[...]\n\u201cToday Apple is proud to report our best March quarter ever, with revenue of $111.2 billion and double-digit growth across every geographic segment,\u201d said Tim Cook, Apple\u2019s CEO. \u201ciPhone achieved a March quarter revenue record, fueled by such extraordinary demand for the iPhone 17 lineup. During the quarter, Services achieved yet another all-time record, and we were excited to introduce remarkable new products to our strongest lineup ever. That included the addition of the iPhone 17e and the M4-powered iPad Air, along with the launch of MacBook Neo, which is captivating customers all around the world.\u201d\n[...]\n\u201cOur strong business performance during the March quarter generated over $28 billion in operating cash flow and drove new March quarter records for both operating cash flow and EPS,\u201d said Kevan Parekh, Apple\u2019s CFO. \u201cContinued strong customer demand for our products and services once again helped us achieve a new all-time high for our installed base of active devices across all major product categories and geographic segments.\u201d\n[...]\nApple\u2019s board of directors has declared a cash dividend of $0.27 per share of the Company\u2019s common stock, an increase of 4 percent. The dividend is payable on May 14, 20...",
+      "published_date": "2026-04-01T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "ev_web_1_evb_1779137402211",
+      "kind": "web_excerpt",
+      "source_tier": "generic_web",
+      "source": "exa",
+      "as_of": "2025-10-30T00:00:00.000Z",
+      "title": "untitled",
+      "url": "https://s2.q4cdn.com/470004039/files/doc_financials/2025/ar/_10-K-2025-As-Filed.pdf",
+      "text": "Competition The markets for the Company\u2019s products and services are highly competitive and are characterized by aggressive price competition, downward pressure on gross margins, continual improvement in product performance, and price sensitivity on the part of consumers and businesses. The markets in which the Company competes are further defined by frequent introduction of new products and services, short product life cycles, evolving industry standards, and rapid adoption of technological advancements by competitors. Many of the Company\u2019s competitors seek to compete primarily through aggressive pricing and very low cost structures, and by imitating the Company\u2019s products and infringing on its intellectual property.\n[...]\nBusiness Risks \nTo remain competitive and stimulate customer demand, the Company must successfully manage frequent introductions \nand transitions of products and services. \nDue to the highly volatile and competitive nature of the markets and industries in which the Company competes, the Company \nmust continually introduce new products, services and technologies, enhance existing products and services, effectively\n[...]\nstimulate customer demand for new and upgraded products and services, navigate global regulatory requirements and barriers\n[...]\nNew business strategies and ventures are inherently risky and may not be successful. The Company\u2019s business strategies and investments may not be successful, which could materially adversely affect the Company\u2019s bus...",
+      "published_date": "2025-10-30T00:00:00.000Z"
+    },
+    {
+      "evidence_id": "ev_web_2_evb_1779137402211",
+      "kind": "web_excerpt",
+      "source_tier": "news",
+      "source": "exa",
+      "as_of": "2026-04-30T16:00:01.000Z",
+      "title": "Apple (AAPL) Q2 2026 earnings report",
+      "url": "https://www.cnbc.com/2026/04/30/apple-aapl-q2-2026-earnings-report.html",
+      "text": "- Apple reported 17% revenue growth, topping estimates, even as iPhone sales came up short.\n- It\u2019s the first time the company is facing Wall Street since the announcement that Tim Cook will be stepping down as CEO.\n- Revenue in the company\u2019s services business topped estimates, helping drive its margin higher.\n[...]\nSales of iPhones rose 22% in the quarter from a year earlier. Like other consumer electronics companies and device makers, Apple faces supply chain constraints, largely due to the global memory shortage that\u2019s being driven by soaring artificial intelligence demand. Meta and Microsoft said Wednesday that higher memory prices contributed to their increased capital expenditures forecasts for the year.\n[...]\nOne of the first things Ternus has to figure out is where Apple is going to go with AI. Early in the quarter, Apple announced it would partner with Google to use its Gemini AI model to power its Siri product.\n[...]\nServices revenue in the quarter rose about 16% from $26.65 billion a year ago. Apple uses its massive customer base \u2014 and a total of over 2.5 billion active devices on the market \u2014 to sell subscriptions to entertainment services, as well as to services for Apple Pay, iCloud and AppleCare.\n[...]\nWith the growth in services, Apple generates higher profit margins. Long stuck in the high 30s, Apple\u2019s gross margin has been steadily moving up in recent years, reaching 49.3% in the latest quarter up from 48.2% in the previous period.\n[...]\nquarter to $11.4\n[......",
+      "published_date": "2026-04-30T16:00:01.000Z"
+    }
+  ],
+  "conviction": {
+    "direction": "genuine_uncertainty",
+    "confidence": 0.2,
+    "gap_pct": 11960.2,
+    "dispersion_pct": 102.9,
+    "unanchored_count": 12
+  }
+}

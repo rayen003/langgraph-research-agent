@@ -7,6 +7,7 @@ import type { AgentRunState, DocumentInfo, DcfReviewState, Mode, Session, Sessio
 
 const IMAGE_RE = /\.(png|jpg|jpeg|webp|gif|svg)$/i
 const ARTIFACT_MARKER_RE = /\[ARTIFACTS?\]|\[CHART\]/i
+const SENSITIVITY_CHART_MARKER = '[SENSITIVITY_CHART]'
 
 function splitOnMarker(text: string): [string, string] {
   const match = ARTIFACT_MARKER_RE.exec(text)
@@ -14,9 +15,102 @@ function splitOnMarker(text: string): [string, string] {
   return [text.slice(0, match.index).trimEnd(), text.slice(match.index + match[0].length).trimStart()]
 }
 
+function splitOnSensitivityChart(text: string): [string, string] {
+  const idx = text.indexOf(SENSITIVITY_CHART_MARKER)
+  if (idx === -1) return [text, '']
+  return [
+    text.slice(0, idx).trimEnd(),
+    text.slice(idx + SENSITIVITY_CHART_MARKER.length).trimStart(),
+  ]
+}
+
+function isDcfReport(content: string): boolean {
+  return content.startsWith('# DCF Valuation:')
+}
+
+function DcfReportDownloadMenu({ threadId }: { threadId: string }) {
+  const [format, setFormat] = useState<'pdf' | 'md'>('pdf')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleDownload = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await fetch(`/runs/${threadId}/dcf-report.${format}`)
+      if (!res.ok) {
+        let message = `Download failed (${res.status})`
+        try {
+          const body = (await res.json()) as { detail?: string }
+          if (body.detail) message = body.detail
+        } catch {
+          /* ignore */
+        }
+        setError(message)
+        return
+      }
+      const blob = await res.blob()
+      const disposition = res.headers.get('Content-Disposition') ?? ''
+      const match = disposition.match(/filename="([^"]+)"/)
+      const filename = match?.[1] ?? `dcf_report.${format}`
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      anchor.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      setError('Download failed — check that the backend is running.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1.5">
+      <div className="inline-flex items-stretch rounded-md border border-zinc-700 bg-zinc-900/80 overflow-hidden">
+        <select
+          value={format}
+          onChange={e => setFormat(e.target.value as 'pdf' | 'md')}
+          className="bg-transparent text-[11px] text-zinc-300 px-2 py-1 border-r border-zinc-700 outline-none cursor-pointer hover:text-zinc-100"
+          aria-label="Report format"
+        >
+          <option value="pdf">PDF</option>
+          <option value="md">Markdown</option>
+        </select>
+        <button
+          type="button"
+          onClick={handleDownload}
+          disabled={busy}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800/80 transition-colors disabled:opacity-50"
+        >
+          <span aria-hidden>↓</span>
+          {busy ? 'Preparing…' : 'Download'}
+        </button>
+      </div>
+      {error && (
+        <p className="max-w-xs text-right text-[10px] text-red-300/90 leading-snug">{error}</p>
+      )}
+    </div>
+  )
+}
+
 // ── Individual message renderers ─────────────────────────────────────────────
 
 function UserBubble({ content }: { content: string }) {
+  // Rerun diff messages are pre-formatted in monospace columns; render with
+  // a mono font + indigo accent so they look like a system event card rather
+  // than a typed user message.
+  const isRerunDiff = content.startsWith('🔄')
+  if (isRerunDiff) {
+    return (
+      <div className="flex justify-end animate-fade-up">
+        <div className="max-w-[80%] px-4 py-3 rounded-2xl rounded-tr-sm bg-indigo-500/10 border border-indigo-500/30">
+          <pre className="text-[12px] text-indigo-100 leading-relaxed font-mono whitespace-pre-wrap m-0">{content}</pre>
+        </div>
+      </div>
+    )
+  }
   return (
     <div className="flex justify-end animate-fade-up">
       <div className="max-w-[72%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-[#1a1a24] border border-[#252535]">
@@ -39,6 +133,23 @@ function AgentLabel() {
   )
 }
 
+function DegradedBanner({ reason }: { reason?: string }) {
+  return (
+    <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-200">
+      <div className="font-semibold flex items-center gap-1.5">
+        <span>⚠</span>
+        <span>Degraded result — model marked invalid</span>
+      </div>
+      {reason && (
+        <div className="mt-1 text-[11px] text-red-300/90 leading-snug">{reason}</div>
+      )}
+      <div className="mt-1 text-[10px] text-red-300/70">
+        Treat the figures below as illustrative. Do not act on them as a valuation.
+      </div>
+    </div>
+  )
+}
+
 function ChatBubble({
   content,
   streaming,
@@ -49,7 +160,10 @@ function ChatBubble({
   onDcfApprove,
   onDcfReject,
   threadId,
+  artifactPaths,
   hideLabel,
+  validity,
+  invalidationReason,
 }: {
   content: string
   streaming?: boolean
@@ -63,7 +177,10 @@ function ChatBubble({
   onDcfApprove?: (overrides?: Record<string, number>) => void
   onDcfReject?: () => void
   threadId?: string
+  artifactPaths?: string[]
   hideLabel?: boolean
+  validity?: 'valid' | 'invalid' | 'adjusting'
+  invalidationReason?: string
 }) {
   const useUnified = !!(activities && activities.length)
   const calls = toolCalls ?? []
@@ -83,6 +200,9 @@ function ChatBubble({
       <div className="max-w-[85%] min-w-0 w-full">
         {!hideLabel && <AgentLabel />}
         <div className="pl-1 space-y-2">
+          {validity === 'invalid' && (
+            <DegradedBanner reason={invalidationReason} />
+          )}
           {hasAnyActivity && (
             <ActivityTrace
               toolCalls={useUnified ? undefined : calls}
@@ -97,12 +217,62 @@ function ChatBubble({
           )}
 
           {hasContent ? (
-            <MarkdownRenderer content={content} streaming={streaming} />
-          ) : !hasAnyActivity && !persisted ? (
+            isDcfReport(content) && !streaming ? (
+              <DcfReportCard
+                content={content}
+                threadId={threadId}
+                artifactPaths={artifactPaths}
+              />
+            ) : (
+              <MarkdownRenderer content={content} streaming={streaming} />
+            )
+          ) : !persisted ? (
             <ThinkingDots />
           ) : null}
         </div>
       </div>
+    </div>
+  )
+}
+
+function DcfReportCard({
+  content,
+  threadId,
+  artifactPaths,
+}: {
+  content: string
+  threadId?: string
+  artifactPaths?: string[]
+}) {
+  const canDownload = !!threadId
+  const hasMarker = content.includes(SENSITIVITY_CHART_MARKER)
+  const [preChart, postChart] = hasMarker ? splitOnSensitivityChart(content) : [content, '']
+  const sensitivityImage = artifactPaths?.find(p => p.includes('sensitivity') && IMAGE_RE.test(p))
+
+  return (
+    <div className="rounded-xl border border-[#1e1e1e] bg-[#080808] px-6 py-5">
+      <MarkdownRenderer content={preChart} streaming={false} />
+
+      {hasMarker && sensitivityImage && threadId && (
+        <figure className="my-5 space-y-2">
+          <img
+            src={`/artifacts/${threadId}/${sensitivityImage.split('/').pop()}`}
+            alt="Sensitivity heatmap"
+            className="w-full max-w-xl rounded-lg border border-[#1e1e1e]"
+          />
+          <figcaption className="text-[11px] text-zinc-500">
+            WACC × terminal growth sensitivity
+          </figcaption>
+        </figure>
+      )}
+
+      {postChart && <MarkdownRenderer content={postChart} streaming={false} />}
+
+      {canDownload && (
+        <div className="mt-6 pt-4 border-t border-[#1e1e1e] flex justify-end">
+          <DcfReportDownloadMenu threadId={threadId!} />
+        </div>
+      )}
     </div>
   )
 }
@@ -259,7 +429,11 @@ function CommittedMessage({ msg }: { msg: SessionMessage }) {
         content={msg.content}
         toolCalls={msg.toolTrace}
         activities={msg.activity}
+        threadId={msg.threadId}
+        artifactPaths={msg.artifactPaths}
         persisted
+        validity={msg.validity}
+        invalidationReason={msg.invalidationReason}
       />
     )
   }
@@ -451,10 +625,30 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
               if (m.role !== 'assistant') return null
               const assistantMsgs = liveChatMessages.filter(x => x.role === 'assistant')
               const isLast = idx === liveChatMessages.length - 1 || m.id === assistantMsgs[assistantMsgs.length - 1]?.id
+              // Skip stale empty messages from prior sub-runs (e.g. HITL run that
+              // produced no text). They would show a spurious ThinkingDots above
+              // the active bubble.
+              if (!m.content && !isLast) return null
               const chatActivities = isLast ? activeRun.activity.filter(a => a.scope === 'chat') : []
               const hasDcf = isLast && !!activeRun.dcf_review
               const prevMsg = liveChatMessages[idx - 1]
               const hideLabel = !!prevMsg && prevMsg.role === 'assistant'
+              // Surface DCF validity from the live workflow activity so the
+              // degraded banner shows up before the message is committed.
+              let liveValidity: 'valid' | 'invalid' | 'adjusting' | undefined
+              let liveInvalidationReason: string | undefined
+              if (isLast) {
+                const wf = activeRun.activity.find(
+                  a => a.kind === 'workflow' && a.meta && typeof a.meta === 'object',
+                )
+                const meta = (wf?.meta ?? {}) as Record<string, unknown>
+                if (typeof meta.model_validity === 'string') {
+                  liveValidity = meta.model_validity as 'valid' | 'invalid' | 'adjusting'
+                }
+                if (typeof meta.invalidation_reason === 'string') {
+                  liveInvalidationReason = meta.invalidation_reason
+                }
+              }
               return (
                 <ChatBubble
                   key={m.id}
@@ -471,7 +665,10 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
                     // No-op fallback.
                   } : undefined}
                   threadId={activeRun.thread_id || undefined}
+                  artifactPaths={activeRun.artifact_paths.length ? activeRun.artifact_paths : undefined}
                   hideLabel={hideLabel}
+                  validity={liveValidity}
+                  invalidationReason={liveInvalidationReason}
                 />
               )
             })}

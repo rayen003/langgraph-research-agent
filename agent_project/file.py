@@ -11,7 +11,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.types import Command
 from rich.panel import Panel
 
 import agent_log
@@ -112,7 +111,7 @@ def route_after_review(state: AgentState) -> str:
 graph = StateGraph(AgentState)
 
 graph.add_node("intent", intent_node)
-graph.add_node("plan", plan_node)
+graph.add_node("planning", plan_node)
 graph.add_node("review_plan", review_plan_node)
 graph.add_node("execute_one_step", execute_one_step_node)
 graph.add_node("synthesize", synthesize_node)
@@ -120,8 +119,8 @@ graph.add_node("update_memory", update_memory_node)
 graph.add_node("chat", chat_node)
 
 graph.add_edge(START, "intent")
-graph.add_conditional_edges("intent", route_intent, {"research": "plan", "chat": "chat"})
-graph.add_edge("plan", "review_plan")
+graph.add_conditional_edges("intent", route_intent, {"research": "planning", "chat": "chat"})
+graph.add_edge("planning", "review_plan")
 graph.add_conditional_edges("review_plan", route_after_review, {"execute_one_step": "execute_one_step", END: END})
 graph.add_conditional_edges("execute_one_step", route_after_step, {"execute_one_step": "execute_one_step", "synthesize": "synthesize"})
 graph.add_edge("synthesize", "update_memory")
@@ -185,6 +184,7 @@ def run_agent(query: str, mode: str = "auto") -> None:
     else:
         resume_value = {"action": "no", "feedback": feedback}
 
+    from lg_compat import Command  # noqa: PLC0415
     result = app.invoke(
         Command(resume=resume_value),
         config=config,

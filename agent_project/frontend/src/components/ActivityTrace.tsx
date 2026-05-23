@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import type { ConfidenceBreakdown, DcfReviewState, EvidenceItem, StepState, ToolCall } from '../types'
 import type { ActivityEntry, ActivityScope } from '../lib/activity'
 import { activityStatusToToolStatus } from '../lib/activity'
@@ -6,6 +6,23 @@ import { cleanToolSummary, getToolDisplay } from '../lib/toolLabels'
 
 // Re-export for backward compat
 export { activityStatusToToolStatus }
+
+// ── Settle hook ───────────────────────────────────────────────────────────────
+// Fires a brief CSS animation when `value` transitions to `target`.
+function useSettleOn(value: string, target: string): boolean {
+  const [settling, setSettling] = useState(false)
+  const prev = useRef(value)
+  useEffect(() => {
+    if (prev.current !== target && value === target) {
+      setSettling(true)
+      const t = setTimeout(() => setSettling(false), 450)
+      prev.current = value
+      return () => clearTimeout(t)
+    }
+    prev.current = value
+  }, [value, target])
+  return settling
+}
 
 /**
  * Convert a unified ActivityEntry[] into the legacy ToolCall[] shape.
@@ -39,35 +56,50 @@ export function activitiesToToolCalls(
 // ── Grouping helpers ──────────────────────────────────────────────────────────
 
 type FlatRow = { kind: 'flat'; entry: ActivityEntry }
-type WorkflowGroup = { kind: 'group'; parent: ActivityEntry; children: ActivityEntry[] }
+// ChildEntry: a workflow_step that may itself contain nested sub-steps
+type ChildEntry = ActivityEntry & { subChildren?: ActivityEntry[] }
+type WorkflowGroup = { kind: 'group'; parent: ActivityEntry; children: ChildEntry[] }
 type RowItem = FlatRow | WorkflowGroup
 
 function groupActivities(entries: ActivityEntry[], scope?: ActivityScope): RowItem[] {
   const safe = Array.isArray(entries) ? entries : []
   const filtered = scope ? safe.filter(e => !scope || e.scope === scope || e.scope === 'workflow') : safe
 
-  // Collect workflow_step children keyed by parent_activity_id
-  const childIds = new Set<string>()
+  // Pass 1 — build childrenByParent for ALL parent_activity_ids (two levels)
   const childrenByParent = new Map<string, ActivityEntry[]>()
   for (const e of filtered) {
     if (e.kind === 'workflow_step' && e.parent_activity_id) {
-      childIds.add(e.activity_id)
       const list = childrenByParent.get(e.parent_activity_id) ?? []
       list.push(e)
       childrenByParent.set(e.parent_activity_id, list)
     }
   }
 
-  // Check if a workflow:dcf group exists — if so, suppress the flat run_dcf_workflow tool row
+  // Pass 2 — all workflow_steps are excluded from top-level (childIds).
+  // Subgroup entries (those with their own sub-children) are marked for
+  // sub-step attachment rather than removed from children lists.
+  const childIds = new Set<string>()
+  for (const e of filtered) {
+    if (e.kind === 'workflow_step' && e.parent_activity_id) {
+      childIds.add(e.activity_id)
+    }
+  }
+
+  // Check if a workflow:dcf group exists — suppress flat run_dcf_workflow row
   const hasDcfGroup = filtered.some(e => e.kind === 'workflow' && e.name === 'workflow:dcf')
 
   const result: RowItem[] = []
   for (const e of filtered) {
-    if (childIds.has(e.activity_id)) continue // rendered inside group
-    // Suppress redundant flat run_dcf_workflow row when workflow group is present
+    if (childIds.has(e.activity_id)) continue
     if (hasDcfGroup && e.kind === 'tool' && e.name === 'run_dcf_workflow') continue
     if (e.kind === 'workflow' || childrenByParent.has(e.activity_id)) {
-      result.push({ kind: 'group', parent: e, children: childrenByParent.get(e.activity_id) ?? [] })
+      // Attach subChildren to any child that is itself a subgroup container
+      const rawChildren = childrenByParent.get(e.activity_id) ?? []
+      const children: ChildEntry[] = rawChildren.map(child => {
+        const subs = childrenByParent.get(child.activity_id)
+        return subs ? { ...child, subChildren: subs } : child
+      })
+      result.push({ kind: 'group', parent: e, children })
     } else {
       result.push({ kind: 'flat', entry: e })
     }
@@ -89,6 +121,13 @@ function entryToRow(e: ActivityEntry): ToolCall {
 function EvidenceDetail({ meta }: { meta: Record<string, unknown> }) {
   const tierSummary = meta.tier_summary as Record<string, number> | undefined
   const totalItems = (meta.total_items as number) || 0
+  const items = meta.items as Array<{
+    evidence_id: string; kind: string; source_tier: string; source: string
+    title?: string; url?: string; text?: string; as_of?: string
+    filing_type?: string; section?: string
+  }> | undefined
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+
   if (!tierSummary) return null
   const TIER_ORDER = ['filing', 'structured_api', 'document', 'news', 'generic_web']
   const TIER_COLORS: Record<string, string> = {
@@ -98,9 +137,68 @@ function EvidenceDetail({ meta }: { meta: Record<string, unknown> }) {
     news: 'text-amber-400',
     generic_web: 'text-zinc-500',
   }
+  const TIER_BG: Record<string, string> = {
+    filing: 'bg-violet-500/20',
+    structured_api: 'bg-blue-500/20',
+    document: 'bg-emerald-500/20',
+    news: 'bg-amber-500/20',
+    generic_web: 'bg-zinc-500/20',
+  }
+  const kindLabel = (k: string) => {
+    const map: Record<string, string> = {
+      filing_excerpt: 'filing', web_excerpt: 'web', document_excerpt: 'doc',
+      structured_fundamental: 'api', market_data: 'mkt', profile: 'profile',
+    }
+    return map[k] ?? k.slice(0, 6)
+  }
   return (
-    <div className="space-y-1">
-      <div className="text-zinc-500">{totalItems} evidence items</div>
+    <div className="space-y-1.5 text-[11px]">
+      <div className="text-zinc-500 mb-1">{totalItems} evidence items</div>
+      {items && items.length > 0 && (
+        <details className="mb-1">
+          <summary className="text-zinc-600 hover:text-zinc-400 cursor-pointer">Inspect {items.length} sources</summary>
+          <div className="mt-1 max-h-64 overflow-y-auto space-y-1">
+            {items.map((item, i) => {
+              const isOpen = expandedId === item.evidence_id
+              const tier = item.source_tier
+              const hasContent = !!(item.text?.trim() || item.url)
+              const label = item.title || item.section || item.kind || '—'
+              return (
+                <div key={i} className="border-l-2 border-zinc-800 pl-2">
+                  <button
+                    onClick={() => hasContent && setExpandedId(isOpen ? null : item.evidence_id)}
+                    disabled={!hasContent}
+                    className="w-full text-left flex items-start gap-1.5 disabled:cursor-default"
+                  >
+                    <span className={`px-1 py-px rounded text-[9px] font-medium uppercase ${TIER_BG[tier] ?? 'bg-zinc-800'} ${TIER_COLORS[tier] ?? 'text-zinc-400'}`}>
+                      {kindLabel(item.kind)}
+                    </span>
+                    <span className="text-zinc-500 truncate flex-1">{label}</span>
+                    {item.as_of && <span className="text-zinc-700 text-[10px]">{item.as_of}</span>}
+                  </button>
+                  {isOpen && (
+                    <div className="mt-1 text-zinc-500 space-y-1 pb-1">
+                      {item.kind === 'structured_fundamental' || item.kind === 'market_data' ? (
+                        <div>
+                          <span className="text-zinc-600">{item.title}: </span>
+                          <span className="text-zinc-300">{item.text}</span>
+                        </div>
+                      ) : item.text ? (
+                        <div className="leading-relaxed">{item.text}</div>
+                      ) : null}
+                      {item.url && (
+                        <a href={item.url} target="_blank" rel="noopener" className="text-indigo-400 hover:underline break-all block">
+                          {item.url.length > 80 ? item.url.slice(0, 80) + '…' : item.url}
+                        </a>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </details>
+      )}
       {TIER_ORDER.filter(t => (tierSummary[t] ?? 0) > 0).map(t => (
         <div key={t} className="flex items-center gap-2">
           <span className={`w-16 ${TIER_COLORS[t] ?? 'text-zinc-400'}`}>{t.replace('_', ' ')}</span>
@@ -122,14 +220,58 @@ function SynthesisDetail({ meta }: { meta: Record<string, unknown> }) {
   const marginTrend = meta.margin_trend as string | undefined
   const keyRisks = meta.key_risks as string[] | undefined
   const confidence = meta.confidence as string | undefined
+  // Lifecycle signals (drive memo's choice of optional DCF mechanics)
+  const lifecycleStage = meta.lifecycle_stage as string | undefined
+  const marginTrajectory = meta.margin_trajectory as string | undefined
+  const sbcIntensity = meta.sbc_intensity as string | undefined
+  const capitalReturnPolicy = meta.capital_return_policy as string | undefined
+
   const MARGIN_COLOR: Record<string, string> = {
     improving: 'text-emerald-400',
     stable: 'text-blue-400',
     declining: 'text-red-400',
     volatile: 'text-amber-400',
   }
+  const LIFECYCLE_COLOR: Record<string, string> = {
+    hypergrowth: 'text-violet-400',
+    scaling: 'text-emerald-400',
+    mature: 'text-blue-400',
+    declining: 'text-red-400',
+    cyclical: 'text-amber-400',
+  }
+  const TRAJECTORY_COLOR: Record<string, string> = {
+    expanding: 'text-emerald-400',
+    stable: 'text-blue-400',
+    compressing: 'text-red-400',
+  }
+  const SBC_COLOR: Record<string, string> = {
+    high: 'text-red-400',
+    moderate: 'text-amber-400',
+    low: 'text-emerald-400',
+  }
+
   return (
     <div className="space-y-2">
+      {/* Lifecycle signal pills — render as compact chip row when present */}
+      {(lifecycleStage || marginTrajectory || sbcIntensity) && (
+        <div className="flex flex-wrap gap-1.5 pb-1">
+          {lifecycleStage && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border border-zinc-800 ${LIFECYCLE_COLOR[lifecycleStage] ?? 'text-zinc-400'}`}>
+              {lifecycleStage}
+            </span>
+          )}
+          {marginTrajectory && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border border-zinc-800 ${TRAJECTORY_COLOR[marginTrajectory] ?? 'text-zinc-400'}`}>
+              margins {marginTrajectory}
+            </span>
+          )}
+          {sbcIntensity && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded border border-zinc-800 ${SBC_COLOR[sbcIntensity] ?? 'text-zinc-400'}`}>
+              SBC {sbcIntensity}
+            </span>
+          )}
+        </div>
+      )}
       {confidence && (
         <div className="flex gap-2">
           <span className="text-zinc-600 w-20 flex-shrink-0">confidence</span>
@@ -140,6 +282,12 @@ function SynthesisDetail({ meta }: { meta: Record<string, unknown> }) {
         <div className="flex gap-2">
           <span className="text-zinc-600 w-20 flex-shrink-0">margin</span>
           <span className={MARGIN_COLOR[marginTrend] ?? 'text-zinc-300'}>{marginTrend}</span>
+        </div>
+      )}
+      {capitalReturnPolicy && (
+        <div>
+          <div className="text-zinc-600 mb-1">capital return</div>
+          <p className="text-zinc-400 leading-relaxed">{capitalReturnPolicy}</p>
         </div>
       )}
       {growthOutlook && (
@@ -177,14 +325,19 @@ function AssumptionsDetail({ meta }: { meta: Record<string, unknown> }) {
   const dollar = (v: number) => v > 1e9 ? `$${(v / 1e9).toFixed(1)}B` : v > 1e6 ? `$${(v / 1e6).toFixed(0)}M` : `$${v.toFixed(0)}`
 
   const FIELD_LABELS: Record<string, string> = {
-    base_revenue: 'Base revenue', revenue_growth: 'Rev. growth', fcff_margin: 'FCFF margin',
-    wacc: 'WACC', terminal_growth: 'Terminal growth', net_debt: 'Net debt',
+    base_revenue: 'Base revenue', revenue_growth: 'Rev. growth (Y1)', fcff_margin: 'FCFF margin (Y1)',
+    wacc: 'WACC', terminal_growth: 'Perpetuity growth', net_debt: 'Net debt',
     shares_outstanding: 'Shares out.', tax_rate: 'Tax rate',
+    // 4 real-world mechanics
+    revenue_growth_terminal: 'Rev. growth (Y5)',
+    fcff_margin_terminal: 'FCFF margin (Y5)',
+    buyback_yield: 'Buyback yield',
+    sbc_pct_revenue: 'SBC % rev',
   }
 
   const formatVal = (field: string, v: number) => {
     if (field === 'base_revenue' || field === 'net_debt') return dollar(v)
-    if (field === 'shares_outstanding') return `${(v / 1e6).toFixed(0)}M`
+    if (field === 'shares_outstanding') return `${v.toFixed(0)}M`  // value already in millions
     return pct(v)
   }
 
@@ -493,9 +646,16 @@ function ThesisDetail({ meta }: { meta: Record<string, unknown> }) {
   const bear = meta.bear_thesis as string | undefined
   const narrative = meta.narrative as string | undefined
   const drivers = meta.key_drivers as Array<{ driver: string; direction: string; conviction: string }> | undefined
-  if (!bull && !bear && !narrative && !drivers?.length) return null
+  const isFallback = meta.thesis_quality === 'fallback'
+  if (!bull && !bear && !narrative && !drivers?.length && !isFallback) return null
   return (
     <div className="space-y-2 text-[11px]">
+      {isFallback && (
+        <div className="px-2 py-1.5 rounded bg-amber-500/8 border border-amber-500/20 text-amber-400/90 text-[10px] leading-snug">
+          <span className="font-semibold">⚠ Thesis could not be grounded in evidence.</span>
+          {' '}Assumptions may not reflect company-specific dynamics. Review subgraph will flag this as high-severity.
+        </div>
+      )}
       {bull && (
         <div>
           <span className="text-emerald-500/80 font-medium">Bull case </span>
@@ -573,9 +733,134 @@ function AnalysisDetail({ meta }: { meta: Record<string, unknown> }) {
 }
 
 function RefineDetail({ meta }: { meta: Record<string, unknown> }) {
-  const summary = meta.summary_line as string | undefined
-  if (!summary) return null
-  return <div className="text-[11px] text-zinc-400">{summary}</div>
+  const changes = meta.changes as string[] | undefined
+  const interpretation = meta.interpretation as string | undefined
+  const adjustments = meta.adjustments_applied as Record<string, number> | undefined
+  const hadChanges = meta.had_changes as boolean | undefined
+
+  return (
+    <div className="space-y-1.5 text-[11px]">
+      {interpretation && <div className="text-zinc-400">{interpretation}</div>}
+      {adjustments && Object.keys(adjustments).length > 0 ? (
+        <div className="space-y-0.5">
+          {Object.entries(adjustments).map(([field, delta]) => (
+            <div key={field} className="flex items-center gap-1.5">
+              <span className="text-zinc-500">{field}:</span>
+              <span className={delta >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                {delta >= 0 ? '+' : ''}{delta.toFixed(4)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : hadChanges === false ? (
+        <div className="text-zinc-600">No adjustments — critique produced no suggestions</div>
+      ) : null}
+      {changes && changes.length > 0 && (
+        <div className="text-zinc-500 text-[10px]">
+          {changes.map((c, i) => <div key={i}>{c}</div>)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ScenarioRunnerDetail({ meta }: { meta: Record<string, unknown> }) {
+  const results = meta.scenario_results as Array<{
+    name: string; probability: number;
+    valuation: { implied_share_price?: number }
+  }> | undefined
+  if (!results?.length) {
+    const exp = meta.expected_value as number | undefined
+    const lo = meta.range_low as number | undefined
+    const hi = meta.range_high as number | undefined
+    if (exp == null) return null
+    return (
+      <div className="flex gap-4 text-[11px]">
+        <div><span className="text-zinc-600">expected </span><span className="text-zinc-200 font-medium">${exp.toFixed(2)}</span></div>
+        {lo != null && hi != null && <div><span className="text-zinc-600">range </span><span className="text-zinc-400">${lo.toFixed(2)}–${hi.toFixed(2)}</span></div>}
+      </div>
+    )
+  }
+  return (
+    <div className="space-y-1.5 text-[11px]">
+      <div className="grid grid-cols-3 gap-2 text-zinc-600">
+        <span>Scenario</span><span>Prob</span><span>Price</span>
+      </div>
+      {results.map((r, i) => {
+        const price = r.valuation?.implied_share_price
+        const color = r.name === 'bull' ? 'text-emerald-400' : r.name === 'bear' ? 'text-red-400' : 'text-zinc-300'
+        return (
+          <div key={i} className="grid grid-cols-3 gap-2">
+            <span className={color}>{r.name}</span>
+            <span className="text-zinc-500">{(r.probability * 100).toFixed(0)}%</span>
+            <span className="text-zinc-300">{price != null ? `$${price.toFixed(2)}` : '—'}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function ScenarioGeneratorDetail({ meta }: { meta: Record<string, unknown> }) {
+  const scenarios = meta.scenarios as Array<{
+    name: string; probability: number; assumptions: Record<string, number>; rationale: string
+  }> | undefined
+  if (!scenarios?.length) return null
+  return (
+    <div className="space-y-2 text-[11px]">
+      {scenarios.map((s, i) => {
+        const color = s.name === 'bull' ? 'text-emerald-400' : s.name === 'bear' ? 'text-red-400' : 'text-zinc-300'
+        const a = s.assumptions
+        return (
+          <div key={i}>
+            <span className={color + ' font-medium'}>{s.name}</span>
+            <span className="text-zinc-500"> ({(s.probability * 100).toFixed(0)}%)</span>
+            <div className="text-zinc-600 mt-0.5">
+              growth={((a.revenue_growth ?? 0) * 100).toFixed(1)}% margin={((a.fcff_margin ?? 0) * 100).toFixed(1)}% TGR={((a.terminal_growth ?? 0) * 100).toFixed(1)}%
+            </div>
+            {s.rationale && <div className="text-zinc-500">{s.rationale}</div>}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function MarketSignalsDetail({ meta }: { meta: Record<string, unknown> }) {
+  const ws = meta.wacc_sanity as Record<string, unknown> | undefined
+  const ig = meta.implied_growth as number | undefined | null
+  const im = meta.implied_margin as number | undefined | null
+  if (!ws && ig == null && im == null) return null
+  const pct = (v: number) => `${(v * 100).toFixed(1)}%`
+  return (
+    <div className="space-y-1 text-[10px]">
+      {ws && (
+        <div className="flex gap-3">
+          <span className="text-zinc-600">WACC</span>
+          <span className="text-zinc-300">{pct(ws.capm_wacc as number)}</span>
+          <span className="text-zinc-600">→ imp</span>
+          <span className="text-zinc-300">{pct(ws.implied_wacc as number)}</span>
+          {ws.gap_bps != null && (
+            <span className={Math.abs(ws.gap_bps as number) > 200 ? 'text-amber-400' : 'text-zinc-500'}>
+              {(ws.gap_bps as number) > 0 ? '+' : ''}{ws.gap_bps as number}bps
+            </span>
+          )}
+        </div>
+      )}
+      {ig != null && (
+        <div className="flex gap-3">
+          <span className="text-zinc-600">Growth</span>
+          <span className="text-zinc-300">{pct(ig)} imp</span>
+        </div>
+      )}
+      {im != null && (
+        <div className="flex gap-3">
+          <span className="text-zinc-600">Margin</span>
+          <span className="text-zinc-300">{pct(im)} imp</span>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function ImpliedWaccDetail({ meta }: { meta: Record<string, unknown> }) {
@@ -604,6 +889,257 @@ function ImpliedWaccDetail({ meta }: { meta: Record<string, unknown> }) {
   )
 }
 
+function ReviewDeepDiveDetail({ meta }: { meta: Record<string, unknown> }) {
+  const total = meta.total_findings as number | undefined
+  const high = meta.high_findings as number | undefined
+  const evidenceMemo = meta.evidence_memo_count as number | undefined
+  const thesisAss = meta.thesis_assumption_count as number | undefined
+  const consistency = meta.consistency_count as number | undefined
+  const distinguishability = meta.distinguishability_count as number | undefined
+  const anchoring = meta.anchoring_flags as string[] | undefined
+  const shouldStop = meta.should_stop as boolean | undefined
+  const iteration = meta.iteration as number | undefined
+
+  return (
+    <div className="space-y-1.5 text-[11px]">
+      {iteration != null && (
+        <div className="text-zinc-600">Iteration {iteration + 1}</div>
+      )}
+      <div className="flex gap-3">
+        <span className={high ? 'text-amber-400 font-medium' : 'text-zinc-500'}>{high ?? 0} high-severity</span>
+        <span className="text-zinc-600">{total ?? 0} total findings</span>
+      </div>
+      {(evidenceMemo != null || thesisAss != null || consistency != null || distinguishability != null) && (
+        <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px]">
+          {evidenceMemo != null && <div><span className="text-zinc-600">evidence↔memo </span><span className="text-zinc-400">{evidenceMemo}</span></div>}
+          {thesisAss != null && <div><span className="text-zinc-600">thesis↔assumptions </span><span className="text-zinc-400">{thesisAss}</span></div>}
+          {consistency != null && <div><span className="text-zinc-600">consistency </span><span className="text-zinc-400">{consistency}</span></div>}
+          {distinguishability != null && <div><span className="text-zinc-600">distinguishability </span><span className="text-zinc-400">{distinguishability}</span></div>}
+        </div>
+      )}
+      {anchoring && anchoring.length > 0 && (
+        <div>
+          <div className="text-zinc-600 mb-0.5">Anchoring flags</div>
+          {anchoring.map((f, i) => <div key={i} className="text-amber-400/80 text-[10px]">· {f}</div>)}
+        </div>
+      )}
+      {shouldStop && <div className="text-emerald-500/70 text-[10px]">✓ No further review needed</div>}
+    </div>
+  )
+}
+
+function SynthesizeAdjustmentsDetail({ meta }: { meta: Record<string, unknown> }) {
+  const changes = meta.changes as string[] | undefined
+  const meaningful = meta.meaningful_count as number | undefined
+  const shouldStop = meta.should_stop as boolean | undefined
+  const adjustments = meta.adjustments as Record<string, Record<string, number>> | undefined
+
+  return (
+    <div className="space-y-1.5 text-[11px]">
+      {meaningful != null && (
+        <div className={meaningful > 0 ? 'text-zinc-300' : 'text-zinc-600'}>
+          {meaningful > 0 ? `${meaningful} adjustments queued` : 'No meaningful adjustments'}
+        </div>
+      )}
+      {adjustments && Object.entries(adjustments).some(([, f]) => Object.keys(f).length > 0) && (
+        <div className="space-y-1">
+          {Object.entries(adjustments).map(([scenario, fields]) =>
+            Object.keys(fields).length > 0 ? (
+              <div key={scenario}>
+                <span className={`text-[10px] font-medium ${
+                  scenario === 'bull' ? 'text-emerald-400' :
+                  scenario === 'bear' ? 'text-red-400' : 'text-zinc-400'
+                }`}>{scenario}</span>
+                <div className="ml-2 space-y-0.5">
+                  {Object.entries(fields).map(([field, delta]) => (
+                    <div key={field} className="flex items-center gap-1.5 text-[10px]">
+                      <span className="text-zinc-500">{field}:</span>
+                      <span className={delta >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                        {delta >= 0 ? '+' : ''}{delta.toFixed(4)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null
+          )}
+        </div>
+      )}
+      {changes && changes.length > 0 && (
+        <div className="text-zinc-600 text-[10px] space-y-0.5">
+          {changes.map((c, i) => <div key={i}>{c}</div>)}
+        </div>
+      )}
+      {shouldStop && <div className="text-emerald-500/70 text-[10px]">✓ Converged</div>}
+    </div>
+  )
+}
+
+function ReviewSubgraphDetail({ meta }: { meta: Record<string, unknown> }) {
+  const changes = meta.changes as string[] | undefined
+  const reviewSummary = meta.review_summary as string | undefined
+  const shouldStop = meta.should_stop as boolean | undefined
+
+  return (
+    <div className="space-y-1.5 text-[11px]">
+      {reviewSummary && <p className="text-zinc-500 leading-relaxed">{reviewSummary}</p>}
+      {changes && changes.length > 0 && (
+        <div>
+          <div className="text-zinc-600 mb-0.5">Changes applied</div>
+          <div className="space-y-0.5 text-[10px]">
+            {changes.map((c, i) => <div key={i} className="text-zinc-400">{c}</div>)}
+          </div>
+        </div>
+      )}
+      {shouldStop && <div className="text-emerald-500/70 text-[10px]">✓ No further review needed</div>}
+    </div>
+  )
+}
+
+function AssumptionJourneyDetail({ meta }: { meta: Record<string, unknown> }) {
+  type Iter = {
+    iteration: number
+    adjustments?: Record<string, Record<string, number>>
+    findings_summary?: string
+    changes?: string[]
+  }
+  type AssumptionMap = Record<string, number>
+  type InitialShape = { base?: AssumptionMap; scenarios?: Record<string, AssumptionMap> }
+
+  const iterations = (meta.iterations as Iter[] | undefined) ?? []
+  const initial = (meta.initial as InitialShape | undefined) ?? {}
+  const final = (meta.final as InitialShape | undefined) ?? {}
+
+  const FIELD_LABELS: Record<string, string> = {
+    revenue_growth: 'Rev. growth',
+    fcff_margin: 'FCFF margin',
+    wacc: 'WACC',
+    terminal_growth: 'Terminal growth',
+    tax_rate: 'Tax rate',
+  }
+  const TRACKED_FIELDS = ['revenue_growth', 'fcff_margin', 'wacc', 'terminal_growth', 'tax_rate']
+  const SCENARIO_COLOR: Record<string, string> = {
+    base: 'text-zinc-300',
+    bull: 'text-emerald-400',
+    bear: 'text-red-400',
+  }
+
+  const pct = (v: number | undefined) => v == null ? '—' : `${(v * 100).toFixed(1)}%`
+
+  // Build per-scenario journey rows: for each (scenario, field), show
+  // initial value, per-iteration arrow + value, final value.
+  const scenarioNames = ['base', ...Object.keys(initial.scenarios ?? {})].filter(
+    (v, i, a) => a.indexOf(v) === i
+  )
+
+  const getValue = (scenario: string, field: string, source: InitialShape | undefined): number | undefined => {
+    if (!source) return undefined
+    if (scenario === 'base') return source.base?.[field]
+    return source.scenarios?.[scenario]?.[field]
+  }
+
+  // Reconstruct per-iteration intermediate values: initial + cumulative deltas
+  const valueAt = (scenario: string, field: string, upToIter: number): number | undefined => {
+    const init = getValue(scenario, field, initial)
+    if (init == null) return undefined
+    let v = init
+    for (let i = 0; i < upToIter; i++) {
+      const delta = iterations[i]?.adjustments?.[scenario]?.[field]
+      if (typeof delta === 'number') v += delta
+    }
+    return v
+  }
+
+  return (
+    <div className="space-y-3 text-[11px]">
+      <div className="text-zinc-500">
+        {iterations.length} review iteration{iterations.length !== 1 ? 's' : ''} —
+        showing how assumptions evolved
+      </div>
+
+      {scenarioNames.map(scenario => {
+        const hasAnyData =
+          getValue(scenario, 'revenue_growth', initial) != null ||
+          getValue(scenario, 'fcff_margin', initial) != null
+        if (!hasAnyData) return null
+
+        return (
+          <div key={scenario} className="border border-[#1a1a22] rounded overflow-hidden">
+            <div className={`px-2 py-1 text-[10px] font-medium uppercase tracking-wide bg-[#0d0d14] ${SCENARIO_COLOR[scenario] ?? 'text-zinc-400'}`}>
+              {scenario}
+            </div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-zinc-600">
+                  <th className="text-left font-normal px-2 py-1">Field</th>
+                  <th className="text-right font-normal px-2 py-1">Initial</th>
+                  {iterations.map(it => (
+                    <th key={it.iteration} className="text-right font-normal px-2 py-1">
+                      After Rev {it.iteration + 1}
+                    </th>
+                  ))}
+                  <th className="text-right font-normal px-2 py-1 text-zinc-300">Final</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#15151c]">
+                {TRACKED_FIELDS.map(field => {
+                  const init = getValue(scenario, field, initial)
+                  if (init == null) return null
+                  const fin = getValue(scenario, field, final)
+                  return (
+                    <tr key={field}>
+                      <td className="px-2 py-0.5 text-zinc-500">{FIELD_LABELS[field] ?? field}</td>
+                      <td className="px-2 py-0.5 text-right text-zinc-400 tabular-nums">{pct(init)}</td>
+                      {iterations.map(it => {
+                        const delta = it.adjustments?.[scenario]?.[field]
+                        const after = valueAt(scenario, field, it.iteration + 1)
+                        if (delta == null) {
+                          return (
+                            <td key={it.iteration} className="px-2 py-0.5 text-right text-zinc-700 tabular-nums">—</td>
+                          )
+                        }
+                        const arrow = delta > 0 ? '↑' : '↓'
+                        const color = delta > 0 ? 'text-emerald-400' : 'text-red-400'
+                        return (
+                          <td key={it.iteration} className={`px-2 py-0.5 text-right tabular-nums ${color}`}>
+                            {arrow} {pct(after)}
+                          </td>
+                        )
+                      })}
+                      <td className="px-2 py-0.5 text-right text-zinc-200 font-medium tabular-nums">{pct(fin)}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      })}
+
+      {iterations.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-zinc-600 text-[10px] uppercase tracking-wide">Rationale</div>
+          {iterations.map(it => (
+            <div key={it.iteration} className="border-l-2 border-[#252535] pl-2">
+              <div className="text-zinc-500 text-[10px] font-medium">
+                Rev {it.iteration + 1}
+              </div>
+              {it.findings_summary && (
+                <p className="text-zinc-500 leading-relaxed mt-0.5">{it.findings_summary}</p>
+              )}
+              {it.changes && it.changes.length > 0 && (
+                <div className="mt-1 text-[10px] text-zinc-600">
+                  {it.changes.map((c, i) => <div key={i}>· {c}</div>)}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function DcfStepDetail({ stepName, meta }: { stepName: string; meta: Record<string, unknown> }) {
   switch (stepName) {
     case 'assemble_evidence': return <EvidenceDetail meta={meta} />
@@ -619,19 +1155,338 @@ function DcfStepDetail({ stepName, meta }: { stepName: string; meta: Record<stri
     case 'formulate_thesis': return <ThesisDetail meta={meta} />
     case 'analyze_result': return <AnalysisDetail meta={meta} />
     case 'refine_assumptions': return <RefineDetail meta={meta} />
+    case 'scenario_runner': return <ScenarioRunnerDetail meta={meta} />
+    case 'scenario_generator': return <ScenarioGeneratorDetail meta={meta} />
+    case 'compute_market_signals': return <MarketSignalsDetail meta={meta} />
+    case 'review_subgraph': return <ReviewSubgraphDetail meta={meta} />
+    case 'review_deep_dive': return <ReviewDeepDiveDetail meta={meta} />
+    case 'synthesize_adjustments': return <SynthesizeAdjustmentsDetail meta={meta} />
+    case 'assumption_journey': return <AssumptionJourneyDetail meta={meta} />
+    case 'cache_check': return <KgCacheDetail meta={meta} />
+    case 'kg_backwrite': return <KgBackwriteDetail meta={meta} />
+    case 'detect_divergences': return <DivergencesDetail meta={meta} />
+    case 'analysis': return <AnalysisPositionsDetail meta={meta} />
+    case 'convergence_gate': return <ConvergenceGateDetail meta={meta} />
     default: return null
   }
 }
 
+// ── KG cache-check expander ────────────────────────────────────────────────
+
+type KgCacheResult = {
+  node_id: string
+  node_type: string
+  field: string
+  status: 'hit' | 'miss' | 'stale'
+  age_s: number | null
+  action: string
+  source?: string
+  confidence?: number
+}
+
+function formatAge(s: number | null): string {
+  if (s == null) return '—'
+  if (s < 60) return `${Math.round(s)}s`
+  if (s < 3600) return `${Math.round(s / 60)}m`
+  if (s < 86400) return `${Math.round(s / 3600)}h`
+  return `${Math.round(s / 86400)}d`
+}
+
+function KgCacheDetail({ meta }: { meta: Record<string, unknown> }) {
+  const results = (meta.kg_cache_results as KgCacheResult[] | undefined) ?? []
+  const hits = (meta.hit_count as number | undefined) ?? 0
+  const misses = (meta.miss_count as number | undefined) ?? 0
+  if (!results.length) return null
+
+  return (
+    <div className="space-y-2 text-[11px]">
+      <div className="flex items-center gap-2 text-[10px]">
+        <span className="px-1.5 py-0.5 rounded bg-teal-500/10 text-teal-400 border border-teal-500/20">
+          {hits} hits
+        </span>
+        <span className="px-1.5 py-0.5 rounded bg-zinc-700/30 text-zinc-500 border border-zinc-700/40">
+          {misses} misses
+        </span>
+        <span className="text-zinc-600">cache-first lookups before expensive nodes</span>
+      </div>
+
+      <table className="w-full text-[10px] border-separate border-spacing-0">
+        <thead>
+          <tr className="text-zinc-600">
+            <th className="px-2 py-0.5 text-left font-medium">Node</th>
+            <th className="px-2 py-0.5 text-left font-medium">Status</th>
+            <th className="px-2 py-0.5 text-right font-medium">Age</th>
+            <th className="px-2 py-0.5 text-left font-medium">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {results.map((r) => (
+            <tr key={r.node_id} className="border-t border-[#1c1c24]">
+              <td className="px-2 py-0.5 font-mono text-zinc-400">
+                {r.node_type}::{r.field}
+              </td>
+              <td className="px-2 py-0.5">
+                {r.status === 'hit' && (
+                  <span className="text-teal-400">⚡ hit</span>
+                )}
+                {r.status === 'miss' && (
+                  <span className="text-zinc-500">✗ miss</span>
+                )}
+                {r.status === 'stale' && (
+                  <span className="text-amber-400">↻ stale</span>
+                )}
+              </td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-zinc-500">
+                {formatAge(r.age_s)}
+              </td>
+              <td className="px-2 py-0.5 text-zinc-500">{r.action}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function KgBackwriteDetail({ meta }: { meta: Record<string, unknown> }) {
+  const runNodeId = meta.run_node_id as string | undefined
+  const ticker = meta.ticker as string | undefined
+  return (
+    <div className="space-y-1 text-[11px]">
+      <div className="text-zinc-500">
+        Persisted DCF run + assumptions + outputs to KG for{' '}
+        <span className="text-zinc-300 font-medium">{ticker || '?'}</span>
+      </div>
+      {runNodeId && (
+        <div className="font-mono text-[10px] text-zinc-600">
+          {runNodeId}
+        </div>
+      )}
+      <div className="text-[10px] text-zinc-600">
+        Next DCF for this ticker can use these as cached priors.
+      </div>
+    </div>
+  )
+}
+
+// ── Divergence / Analysis / Convergence-gate detail components ──────────────
+
+interface DivergenceRecord {
+  id: string
+  kind: string
+  severity: string
+  summary: string
+  details?: Record<string, unknown>
+}
+
+function severityBadge(sev: string): { cls: string; label: string } {
+  switch (sev) {
+    case 'critical': return { cls: 'bg-red-500/15 text-red-300 border-red-500/40', label: 'critical' }
+    case 'high':     return { cls: 'bg-orange-500/15 text-orange-300 border-orange-500/40', label: 'high' }
+    case 'medium':   return { cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40', label: 'medium' }
+    default:         return { cls: 'bg-zinc-700/30 text-zinc-400 border-zinc-700/40', label: sev || 'low' }
+  }
+}
+
+function DivergencesDetail({ meta }: { meta: Record<string, unknown> }) {
+  const divergences = (meta.divergences as DivergenceRecord[] | undefined) ?? []
+  const count = (meta.count as number | undefined) ?? divergences.length
+  if (!divergences.length) {
+    return (
+      <div className="text-[11px] text-zinc-500">
+        No divergences detected — model and market signals align.
+      </div>
+    )
+  }
+  return (
+    <div className="space-y-2 text-[11px]">
+      <div className="text-[10px] text-zinc-500">
+        {count} gap(s) between model output and market-implied / evidence signals.
+      </div>
+      <div className="space-y-1.5">
+        {divergences.map(d => {
+          const sb = severityBadge(d.severity)
+          return (
+            <div key={d.id} className="border border-[#1c1c24] rounded p-2 bg-[#0e0e14]">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase border ${sb.cls}`}>
+                  {sb.label}
+                </span>
+                <span className="text-[10px] font-mono text-zinc-500">{d.kind}</span>
+              </div>
+              <div className="text-zinc-300">{d.summary}</div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+interface AnalysisPosition {
+  divergence_id: string
+  divergence_summary?: string
+  divergence_severity?: string
+  position: string  // EXPLAINED | UNEXPLAINED
+  explanation: string
+  evidence_used: string[]
+  new_evidence_fetched?: string[]
+  adjustment?: { field: string; delta: number; reason: string } | null
+  uncertainty_note?: string | null
+}
+
+function AnalysisPositionsDetail({ meta }: { meta: Record<string, unknown> }) {
+  const positions = (meta.positions as AnalysisPosition[] | undefined) ?? []
+  const changes = (meta.changes as string[] | undefined) ?? []
+  const eff = meta.effective_confidence as number | undefined
+  const base = meta.base_confidence as number | undefined
+
+  if (!positions.length) {
+    return <div className="text-[11px] text-zinc-500">Nothing to analyze — model accepted as-is.</div>
+  }
+
+  return (
+    <div className="space-y-2 text-[11px]">
+      {(eff != null && base != null) && (
+        <div className="flex items-center gap-3 text-[10px]">
+          <span className="text-zinc-500">Confidence:</span>
+          <span className="text-zinc-400">base {(base * 100).toFixed(0)}%</span>
+          <span className="text-zinc-600">→</span>
+          <span className={eff < base ? 'text-amber-400 font-medium' : 'text-emerald-400 font-medium'}>
+            effective {(eff * 100).toFixed(0)}%
+          </span>
+          {eff < base && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/30">
+              penalized by unexplained gaps
+            </span>
+          )}
+        </div>
+      )}
+
+      {changes.length > 0 && (
+        <div className="text-[10px]">
+          <div className="text-zinc-500 mb-1">Adjustments applied:</div>
+          <ul className="space-y-0.5">
+            {changes.map((c, i) => (
+              <li key={i} className="font-mono text-emerald-300/80 pl-2">• {c}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="space-y-1.5">
+        {positions.map((p, i) => {
+          const explained = p.position === 'EXPLAINED'
+          return (
+            <div
+              key={i}
+              className={`border rounded p-2 ${explained ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-amber-500/30 bg-amber-500/5'}`}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase border ${
+                  explained
+                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                    : 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                }`}>
+                  {p.position}
+                </span>
+                <span className="text-[10px] font-mono text-zinc-500">{p.divergence_id}</span>
+                {p.divergence_severity && (
+                  <span className="text-[9px] text-zinc-600">[{p.divergence_severity}]</span>
+                )}
+              </div>
+              {p.divergence_summary && (
+                <div className="text-[10px] text-zinc-500 mb-1 italic">{p.divergence_summary}</div>
+              )}
+              <div className="text-zinc-300 leading-snug">{p.explanation}</div>
+              {p.adjustment && (
+                <div className="mt-1.5 text-[10px] text-emerald-300 font-mono">
+                  → {p.adjustment.field} {p.adjustment.delta >= 0 ? '+' : ''}{(p.adjustment.delta * 100).toFixed(2)}pp
+                  <div className="text-zinc-500 not-italic font-sans mt-0.5">{p.adjustment.reason}</div>
+                </div>
+              )}
+              {p.uncertainty_note && (
+                <div className="mt-1.5 text-[10px] text-amber-300/90 italic">⚠ {p.uncertainty_note}</div>
+              )}
+              {((p.evidence_used?.length ?? 0) + (p.new_evidence_fetched?.length ?? 0)) > 0 && (
+                <div className="mt-1.5 text-[9px] text-zinc-600">
+                  evidence: {p.evidence_used?.join(', ')}
+                  {p.new_evidence_fetched?.length ? (
+                    <span className="text-teal-500"> + {p.new_evidence_fetched.length} fetched</span>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ConvergenceGateDetail({ meta }: { meta: Record<string, unknown> }) {
+  const validity = (meta.validity as string) || 'valid'
+  const reason = (meta.reason as string) || ''
+  const iteration = meta.iteration as number | undefined
+  const unexplained = meta.unexplained_count as number | undefined
+  const adjustments = meta.adjustments_pending as number | undefined
+  const critical = meta.critical_unexplained as number | undefined
+
+  const palette = validity === 'invalid'
+    ? { box: 'border-red-500/40 bg-red-500/5', badge: 'bg-red-500/15 text-red-300 border-red-500/40' }
+    : validity === 'adjusting'
+    ? { box: 'border-indigo-500/40 bg-indigo-500/5', badge: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/40' }
+    : { box: 'border-emerald-500/40 bg-emerald-500/5', badge: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' }
+
+  return (
+    <div className={`text-[11px] border rounded p-2 ${palette.box}`}>
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-medium border ${palette.badge}`}>
+          {validity}
+        </span>
+        {iteration != null && (
+          <span className="text-[10px] text-zinc-500">iter {iteration}</span>
+        )}
+      </div>
+      <div className="text-zinc-300 leading-snug">{reason}</div>
+      <div className="mt-2 grid grid-cols-3 gap-2 text-[10px]">
+        <div>
+          <div className="text-zinc-600">unexplained</div>
+          <div className={`tabular-nums ${unexplained ? 'text-amber-400' : 'text-zinc-400'}`}>{unexplained ?? 0}</div>
+        </div>
+        <div>
+          <div className="text-zinc-600">adjustments queued</div>
+          <div className={`tabular-nums ${adjustments ? 'text-indigo-300' : 'text-zinc-400'}`}>{adjustments ?? 0}</div>
+        </div>
+        <div>
+          <div className="text-zinc-600">critical</div>
+          <div className={`tabular-nums ${critical ? 'text-red-400' : 'text-zinc-400'}`}>{critical ?? 0}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── DcfSubstepRow ─────────────────────────────────────────────────────────────
 
-function DcfSubstepRow({ entry }: { entry: ActivityEntry }) {
+function DcfSubstepRow({ entry }: { entry: ChildEntry }) {
   const [open, setOpen] = useState(false)
+  const settling = useSettleOn(entry.status, 'completed')
   const display = getToolDisplay(entry.name)
   const stepName = entry.name.includes(':') ? entry.name.split(':').pop()! : entry.name
   const meta = entry.meta
-  const hasDetail = entry.status === 'completed' && meta && Object.keys(meta).length > 1
+  // A row is expandable if it has detail data OR it has sub-children
+  const subChildren = entry.subChildren ?? []
+  const hasDetail = (entry.status === 'completed' && meta && Object.keys(meta).length > 1) || subChildren.length > 0
   const cleaned = cleanToolSummary(entry.summary)
+  // Iteration badge: shown when scenario_runner ran more than once
+  const runCount = (meta as Record<string, unknown> | undefined)?.run_count as number | undefined
+  const isReRerun = runCount != null && runCount > 1
+  // Fallback-thesis warning badge
+  const thesisFallback = (meta as Record<string, unknown> | undefined)?.thesis_quality === 'fallback'
+  // KG cache hit indicator — node skipped because output was cached
+  const kgHit = (meta as Record<string, unknown> | undefined)?.kg_status === 'hit'
+    || (meta as Record<string, unknown> | undefined)?.thesis_quality === 'cached'
 
   return (
     <div className="text-[11px]">
@@ -641,12 +1496,41 @@ function DcfSubstepRow({ entry }: { entry: ActivityEntry }) {
         className="w-full flex items-center gap-2 text-left text-zinc-500 hover:text-zinc-300 disabled:hover:text-zinc-500 transition-colors"
       >
         <span className={`w-1 h-1 rounded-full flex-shrink-0 ${
-          entry.status === 'completed' ? 'bg-emerald-500' :
+          kgHit ? 'bg-teal-400' :
+          thesisFallback ? 'bg-amber-400' :
+          entry.status === 'completed' ? `bg-emerald-500 ${settling ? 'animate-settle' : ''}` :
           entry.status === 'error' ? 'bg-red-500' :
           entry.status === 'skipped' ? 'bg-zinc-700' :
           'bg-indigo-400 animate-pulse'
         }`} />
-        <span className="font-medium text-zinc-300">{display.label}</span>
+        <span className={`font-medium ${
+          kgHit ? 'text-teal-300' :
+          thesisFallback ? 'text-amber-400' : 'text-zinc-300'
+        }`}>{display.label}</span>
+        {/* KG cache-hit indicator */}
+        {kgHit && (
+          <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-teal-500/10 text-teal-400 border border-teal-500/20">
+            ⚡ KG
+          </span>
+        )}
+        {/* Fallback thesis warning badge */}
+        {thesisFallback && (
+          <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-amber-500/10 text-amber-400 border border-amber-500/20">
+            ⚠ fallback
+          </span>
+        )}
+        {/* Re-run badge: ×2 when scenario_runner looped after review */}
+        {isReRerun && (
+          <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-indigo-950/60 text-indigo-400">
+            ×{runCount}
+          </span>
+        )}
+        {/* Sub-step count badge for subgroup containers (e.g. review_subgraph) */}
+        {subChildren.length > 0 && (
+          <span className="text-zinc-700 text-[10px] flex-shrink-0">
+            {subChildren.filter(s => s.status === 'completed').length}/{subChildren.length}
+          </span>
+        )}
         {cleaned && <span className="text-zinc-600 truncate min-w-0 flex-1">· {cleaned}</span>}
         {hasDetail && (
           <span className="ml-auto text-zinc-700 flex-shrink-0">
@@ -658,11 +1542,25 @@ function DcfSubstepRow({ entry }: { entry: ActivityEntry }) {
         )}
       </button>
 
-      {open && meta && (
-        <div className="ml-3 mt-1.5 pl-2 border-l border-[#222] pb-1">
-          <DcfStepDetail stepName={stepName} meta={meta as Record<string, unknown>} />
+      {/* Smooth height expand via grid-rows trick */}
+      <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
+        <div className="overflow-hidden">
+          {/* Sub-steps (e.g. review_deep_dive / synthesize_adjustments inside review_subgraph) */}
+          {subChildren.length > 0 && (
+            <div className="ml-3 mt-1 pl-2 border-l border-[#1e1e28] space-y-1 pb-1">
+              {subChildren.map((child, i) => (
+                <DcfSubstepRow key={child.activity_id || `sub-${i}`} entry={child} />
+              ))}
+            </div>
+          )}
+          {/* Step detail panel */}
+          {meta && Object.keys(meta).length > 1 && (
+            <div className="ml-3 mt-1.5 pl-2 border-l border-[#222] pb-1">
+              <DcfStepDetail stepName={stepName} meta={meta as Record<string, unknown>} />
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   )
 }
@@ -730,6 +1628,45 @@ function EvidenceItemRow({ item }: { item: EvidenceItem }) {
   )
 }
 
+/** Compact inline citation used inside per-assumption expanded rows. */
+function CitationChip({ item }: { item: EvidenceItem }) {
+  const [open, setOpen] = useState(false)
+  const badge = TIER_BADGE[item.source_tier] ?? { bg: 'bg-zinc-900', text: 'text-zinc-500', label: item.source_tier }
+  const title = item.title || item.field || item.source || item.evidence_id
+  return (
+    <div className="text-[9px]">
+      <div className="flex items-start gap-1.5">
+        <span className={`flex-shrink-0 mt-0.5 px-1 py-0.5 rounded font-medium ${badge.bg} ${badge.text}`}>
+          {badge.label}
+        </span>
+        <div className="min-w-0 flex-1">
+          {item.url ? (
+            <a href={item.url} target="_blank" rel="noopener noreferrer"
+              className="text-zinc-500 hover:text-zinc-300 underline underline-offset-2 truncate block transition-colors"
+              title={title}>
+              {title}
+            </a>
+          ) : (
+            <span className="text-zinc-600 truncate block" title={title}>{title}</span>
+          )}
+        </div>
+        {item.text && (
+          <button onClick={() => setOpen(o => !o)} className="flex-shrink-0 text-zinc-700 hover:text-zinc-400 mt-0.5">
+            <svg width="6" height="6" viewBox="0 0 8 8" fill="none" className={`transition-transform duration-100 ${open ? 'rotate-180' : ''}`}>
+              <path d="M1 2.5L4 5.5L7 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
+      </div>
+      {open && item.text && (
+        <p className="mt-0.5 ml-8 text-zinc-700 leading-relaxed border-l border-zinc-800 pl-2 line-clamp-3">
+          {item.text.slice(0, 300)}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function EvidencePanel({ items }: { items: EvidenceItem[] }) {
   const [open, setOpen] = useState(false)
   if (!items.length) return null
@@ -780,12 +1717,25 @@ function EvidencePanel({ items }: { items: EvidenceItem[] }) {
 
 // ── Main ActivityTrace ────────────────────────────────────────────────────────
 
-const DCF_HITL_FIELDS: Array<{ key: string; label: string }> = [
-  { key: 'revenue_growth', label: 'Revenue Growth' },
-  { key: 'fcff_margin', label: 'FCFF Margin' },
-  { key: 'terminal_growth', label: 'Terminal Growth' },
+type DcfHitlField = {
+  key: string
+  label: string
+  optional?: boolean
+  group?: string
+}
+
+const DCF_HITL_FIELDS: DcfHitlField[] = [
+  // Core (required)
+  { key: 'revenue_growth', label: 'Revenue Growth (Y1-Y2)' },
+  { key: 'revenue_growth_terminal', label: 'Revenue Growth (Y5 fade)', optional: true, group: 'glide' },
+  { key: 'fcff_margin', label: 'FCFF Margin (Y1)' },
+  { key: 'fcff_margin_terminal', label: 'FCFF Margin (Y5 terminal)', optional: true, group: 'glide' },
+  { key: 'terminal_growth', label: 'Perpetuity Growth' },
   { key: 'tax_rate', label: 'Tax Rate' },
   { key: 'wacc', label: 'WACC' },
+  // Capital structure & dilution (optional, real-world mechanics)
+  { key: 'buyback_yield', label: 'Buyback Yield', optional: true, group: 'capital' },
+  { key: 'sbc_pct_revenue', label: 'SBC % of Revenue', optional: true, group: 'capital' },
 ]
 
 export function DcfHitlSection({
@@ -802,6 +1752,15 @@ export function DcfHitlSection({
   const [edits, setEdits] = useState<Record<string, string>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [confirmed, setConfirmed] = useState(false)
+
+  // Build evidence lookup by ID so per-field citations can resolve items.
+  const evidenceById = useMemo(() => {
+    const map: Record<string, EvidenceItem> = {}
+    for (const item of review.evidence_items ?? []) {
+      map[item.evidence_id] = item
+    }
+    return map
+  }, [review.evidence_items])
 
   const fmtPct = (v: number | undefined) => v == null ? '—' : `${(v * 100).toFixed(1)}%`
   const hasEdits = Object.values(edits).some(v => v !== '')
@@ -874,10 +1833,18 @@ export function DcfHitlSection({
           const prov = review.provenance[f.key] ?? {}
           const proposal = review.memo_proposals?.[f.key]
           const isOpen = !!expanded[f.key]
-          const hasDetail = !!(proposal?.rationale || prov.source)
+          // Resolve per-field citation items from evidence_refs list in provenance.
+          const fieldRefs = (prov.evidence_refs ?? [])
+            .map(id => evidenceById[id])
+            .filter((item): item is EvidenceItem => item != null)
+          const hasDetail = !!(proposal?.rationale || prov.source || fieldRefs.length > 0)
           const conf = proposal?.confidence ?? (prov.confidence as number | undefined)
           const confPct = conf != null ? Math.round(conf * 100) : null
           const confColor = confPct == null ? '' : confPct >= 80 ? 'text-emerald-400' : confPct >= 60 ? 'text-amber-400' : 'text-red-400'
+          // Hide optional fields when LLM didn't propose them (no value, no proposal)
+          if (f.optional && val == null && !proposal) {
+            return null
+          }
           return (
             <div key={f.key}>
               <div className="grid grid-cols-[1fr_60px_70px_55px] gap-2 items-center px-3 py-1.5 text-[11px]">
@@ -893,6 +1860,12 @@ export function DcfHitlSection({
                     </svg>
                   )}
                   <span className="text-zinc-500">{f.label}</span>
+                  {f.optional && (
+                    <span className="text-[8px] uppercase tracking-wider text-zinc-700 ml-1">opt</span>
+                  )}
+                  {fieldRefs.length > 0 && !isOpen && (
+                    <span className="text-[8px] text-zinc-700 ml-1">[{fieldRefs.length}]</span>
+                  )}
                 </button>
                 <span className="text-zinc-200 font-medium tabular-nums">{fmtPct(val)}</span>
                 <span className="text-zinc-700 truncate text-[10px]">{prov.source ?? '—'}</span>
@@ -906,6 +1879,14 @@ export function DcfHitlSection({
                     <p className="text-[10px] text-zinc-600 leading-relaxed border-l border-zinc-800 pl-2">
                       {proposal.rationale}
                     </p>
+                  )}
+                  {fieldRefs.length > 0 && (
+                    <div className="space-y-1 border-l border-zinc-800 pl-2">
+                      <span className="text-[9px] text-zinc-700 uppercase tracking-wider">Sources</span>
+                      {fieldRefs.map(item => (
+                        <CitationChip key={item.evidence_id} item={item} />
+                      ))}
+                    </div>
                   )}
                   <div className="flex items-center gap-1.5">
                     <span className="text-[10px] text-zinc-700 w-16 flex-shrink-0">Override %</span>
@@ -1054,21 +2035,23 @@ export function ActivityTrace({
         </span>
       </button>
 
-      {open && (
-        <div className="border-t border-[#161616] px-3 py-2 space-y-1.5">
-          {grouped !== null
-            ? grouped.map((item, i) =>
-                item.kind === 'group'
-                  ? <WorkflowGroupRow key={item.parent.activity_id || `g-${i}`} group={item} />
-                  : <ActivityRow key={item.entry.activity_id || `f-${i}`} tc={entryToRow(item.entry)} />
-              )
-            : flatRows.map((tc, i) => (
-                <ActivityRow key={`${tc.tool_name}-${i}`} tc={tc} />
-              ))
-          }
-          {/* DcfHitlSection now rendered exclusively in ExecutionSidebar */}
+      <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
+        <div className="overflow-hidden">
+          <div className="border-t border-[#161616] px-3 py-2 space-y-1.5">
+            {grouped !== null
+              ? grouped.map((item, i) =>
+                  item.kind === 'group'
+                    ? <WorkflowGroupRow key={item.parent.activity_id || `g-${i}`} group={item} />
+                    : <ActivityRow key={item.entry.activity_id || `f-${i}`} tc={entryToRow(item.entry)} />
+                )
+              : flatRows.map((tc, i) => (
+                  <ActivityRow key={`${tc.tool_name}-${i}`} tc={tc} />
+                ))
+            }
+            {/* DcfHitlSection now rendered exclusively in ExecutionSidebar */}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   )
 }
@@ -1082,6 +2065,7 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
   const display = getToolDisplay(parent.name)
   const doneCount = children.filter(c => c.status === 'completed' || c.status === 'skipped').length
   const [open, setOpen] = useState(isRunning || parent.status === 'started')
+  const settling = useSettleOn(parent.status, 'completed')
 
   const isDcf = parent.name === 'workflow:dcf'
 
@@ -1097,7 +2081,9 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-[11px] hover:bg-[#0d0d18] transition-colors"
       >
         <span className={`w-1 h-1 rounded-full flex-shrink-0 ${
-          isRunning ? 'bg-indigo-400 animate-pulse' : isError ? 'bg-red-500' : 'bg-violet-500'
+          isRunning ? 'bg-indigo-400 animate-pulse' :
+          isError ? 'bg-red-500' :
+          `bg-violet-500 ${settling ? 'animate-settle' : ''}`
         }`} />
         <span className="font-medium text-violet-300">{display.label}</span>
         {children.length > 0 && (
@@ -1124,15 +2110,17 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
         </span>
       </button>
 
-      {open && children.length > 0 && (
-        <div className="border-t border-[#18181f] px-3 py-1.5 space-y-1 ml-1">
-          {children.map((child, i) =>
-            isDcf
-              ? <DcfSubstepRow key={child.activity_id || `c-${i}`} entry={child} />
-              : <ActivityRow key={child.activity_id || `c-${i}`} tc={entryToRow(child)} />
-          )}
+      <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open && children.length > 0 ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
+        <div className="overflow-hidden">
+          <div className="border-t border-[#18181f] px-3 py-1.5 space-y-1 ml-1">
+            {children.map((child, i) =>
+              isDcf
+                ? <DcfSubstepRow key={child.activity_id || `c-${i}`} entry={child} />
+                : <ActivityRow key={child.activity_id || `c-${i}`} tc={entryToRow(child)} />
+            )}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   )
 }
@@ -1141,6 +2129,7 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
 
 function ActivityRow({ tc }: { tc: ToolCall }) {
   const [open, setOpen] = useState(false)
+  const settling = useSettleOn(tc.status, 'done')
   const display = getToolDisplay(tc.tool_name)
   const cleaned = cleanToolSummary(tc.summary)
   const expandable = tc.status !== 'running' && cleaned.length > 0
@@ -1153,7 +2142,9 @@ function ActivityRow({ tc }: { tc: ToolCall }) {
         className="w-full flex items-center gap-2 text-left text-zinc-500 hover:text-zinc-300 disabled:hover:text-zinc-500 transition-colors"
       >
         <span className={`w-1 h-1 rounded-full flex-shrink-0 ${
-          tc.status === 'done' ? 'bg-emerald-500' : tc.status === 'error' ? 'bg-red-500' : 'bg-indigo-400 animate-pulse'
+          tc.status === 'done' ? `bg-emerald-500 ${settling ? 'animate-settle' : ''}` :
+          tc.status === 'error' ? 'bg-red-500' :
+          'bg-indigo-400 animate-pulse'
         }`} />
         <span className={`font-medium ${display.group === 'workflow' ? 'text-violet-300' : 'text-zinc-300'}`}>
           {display.label}
@@ -1171,9 +2162,14 @@ function ActivityRow({ tc }: { tc: ToolCall }) {
         )}
       </button>
 
-      {open && cleaned && (
-        <p className="ml-3 mt-1 pl-2 border-l border-[#222] text-zinc-600 leading-relaxed">{cleaned}</p>
-      )}
+      {/* Smooth height expand */}
+      <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
+        <div className="overflow-hidden">
+          {cleaned && (
+            <p className="ml-3 mt-1 pl-2 border-l border-[#222] text-zinc-600 leading-relaxed">{cleaned}</p>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

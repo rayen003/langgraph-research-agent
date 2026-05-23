@@ -255,6 +255,7 @@ export function useAgentRun() {
 
         case 'chat_complete': {
           const content = (data.content as string) ?? ''
+          const artifactPaths = (data.artifact_paths as string[]) ?? []
           const msgs = prev.chat_messages.map(m => {
             if (!m.streaming) return m
             // Use event content if it was never streamed token-by-token (tool-using runs)
@@ -270,7 +271,12 @@ export function useAgentRun() {
           // the 150ms reset in App.tsx doesn't wipe dcf_review before the user
           // sees the card. The next startRun call resets everything cleanly.
           const nextStatus = prev.dcf_review ? 'awaiting_assumptions' : 'complete'
-          return { ...prev, status: nextStatus, chat_messages: finalMsgs }
+          return {
+            ...prev,
+            status: nextStatus,
+            chat_messages: finalMsgs,
+            artifact_paths: artifactPaths.length ? artifactPaths : prev.artifact_paths,
+          }
         }
         // ── Shared terminal states ─────────────────────────────────────────
         case 'run_complete':
@@ -294,7 +300,7 @@ export function useAgentRun() {
   }, [])
 
   const startRun = useCallback(
-    async (query: string, mode: Mode, chatThreadId?: string, sessionId?: string) => {
+    async (query: string, mode: Mode, chatThreadId?: string, sessionId?: string): Promise<string | null> => {
       esRef.current?.close()
 
       const userMsg: ChatMessage = { id: nextId(), role: 'user', content: query }
@@ -317,9 +323,10 @@ export function useAgentRun() {
         }
       })
 
-      // Reuse thread only for explicit chat mode; auto mode may route to research
-      // and should start a fresh run context.
-      const threadIdToUse = mode === 'chat' && chatThreadId ? chatThreadId : undefined
+      // Reuse thread when chatThreadId is provided — caller (App.tsx) already
+      // gates this to chat-resolved turns only, so auto-→-research still gets
+      // a fresh thread (chatThreadId is undefined in that case).
+      const threadIdToUse = chatThreadId ?? undefined
 
       const res = await fetch('/runs', {
         method: 'POST',
@@ -329,12 +336,19 @@ export function useAgentRun() {
       if (!res.ok) {
         const err = await res.text()
         setState(prev => ({ ...prev, status: 'error', error: err }))
-        return
+        return null
       }
-      const { thread_id } = (await res.json()) as { thread_id: string }
+      const { thread_id, start_event_id } = (await res.json()) as {
+        thread_id: string
+        start_event_id?: number
+      }
       setState(prev => ({ ...prev, thread_id }))
 
-      const es = new EventSource(`/runs/${thread_id}/events`)
+      // Pass start_event_id so the server doesn't replay prior turns (events
+      // persisted from earlier messages in the same chat thread). Without
+      // this, second+ turns see META's substeps in the NVDA run, etc.
+      const afterId = typeof start_event_id === 'number' ? start_event_id : 0
+      const es = new EventSource(`/runs/${thread_id}/events?after_id=${afterId}`)
 
       es.onmessage = (e: MessageEvent) => {
         let data: Record<string, unknown>
@@ -358,6 +372,7 @@ export function useAgentRun() {
       }
 
       esRef.current = es
+      return thread_id
     },
     [handleEvent],
   )

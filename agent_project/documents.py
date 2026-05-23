@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 import chromadb
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction, DefaultEmbeddingFunction
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from storage import (
     delete_document_metadata,
@@ -53,12 +53,19 @@ _COLLECTION_NAME = "rag_documents"
 
 
 def _get_collection() -> chromadb.Collection:
-    return _chroma_client.get_or_create_collection(
-        name=_COLLECTION_NAME,
-        embedding_function=OpenAIEmbeddingFunction(
+    # Use local sentence-transformers embeddings (free, no API required).
+    # Falls back to OpenAI if OPENAI_API_KEY is set and USE_OPENAI_EMBEDDINGS=1.
+    use_openai = os.getenv("USE_OPENAI_EMBEDDINGS", "0") == "1" and os.getenv("OPENAI_API_KEY")
+    if use_openai:
+        embedding_fn = OpenAIEmbeddingFunction(
             api_key=os.getenv("OPENAI_API_KEY", ""),
             model_name="text-embedding-3-small",
-        ),
+        )
+    else:
+        embedding_fn = DefaultEmbeddingFunction()
+    return _chroma_client.get_or_create_collection(
+        name=_COLLECTION_NAME,
+        embedding_function=embedding_fn,
         metadata={"hnsw:space": "cosine"},
     )
 

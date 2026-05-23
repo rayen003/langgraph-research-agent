@@ -1,0 +1,104 @@
+{
+  "ticker": "WMT",
+  "as_of": "2026-05-19",
+  "fiscal_year": "FY2025",
+  "horizon_years": 5,
+  "model_variant": "low_margin_retail",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 680985.0,
+      "tier": "factual",
+      "source": "10-K FY2025 Income Statement (ended Jan 31, 2025)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "Total revenues FY2025 ($M)"
+    },
+    "revenue_growth": {
+      "value": 0.045,
+      "tier": "consensus",
+      "source": "Y1-Y2 near-term consensus",
+      "url": "https://simplywall.st/stocks/us/consumer-retailing/nyse-wmt/walmart",
+      "note": "4.5% near-term — e-commerce growing 20%+ within total. Walmart Connect ads ~$4B and rising fast"
+    },
+    "revenue_growth_terminal": {
+      "value": 0.035,
+      "tier": "consensus",
+      "source": "Y5 fade",
+      "url": "",
+      "note": "Y5 fade to 3.5%. E-commerce penetration matures by FY30; back toward GDP+ growth as ad business stabilizes"
+    },
+    "fcff_margin": {
+      "value": 0.0187,
+      "tier": "derived",
+      "source": "10-K FY2025 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "FCF $12,700M / Revenue $680,985M = 1.87%. Classic retail: thin margin × huge volume. CapEx ~$23.7B (stores + automation)"
+    },
+    "fcff_margin_terminal": {
+      "value": 0.035,
+      "tier": "consensus",
+      "source": "Ad business (Walmart Connect) + membership scale thesis",
+      "url": "",
+      "note": "1.87% → 3.5% over 5yr — EXPANSION case. Walmart Connect ads (~80% margin) + Walmart+ subscriptions add high-margin layer on top of low-margin retail. Management guidance + analyst models support 3-4% blended FCF margin by FY30."
+    },
+    "wacc": {
+      "value": 0.0727,
+      "tier": "industry",
+      "source": "Damodaran NYU - Retail (General) sector (Jan 2026)",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: Cost of equity 7.54% (Rf 4.18% + β 0.81 × ERP 4.23%) × 92.64% E-weight + after-tax cost of debt 3.97% × 7.36% D-weight. Low beta = consumer staple"
+    },
+    "terminal_growth": {
+      "value": 0.025,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "GDP-matching; mature global retailer"
+    },
+    "net_debt": {
+      "value": 36763.0,
+      "tier": "factual",
+      "source": "10-K FY2025 Balance Sheet (Jan 31, 2025)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "Total debt $45,800M - Cash $9,037M = $36,763M. WMT doesn't hoard cash; capital-intensive ops"
+    },
+    "shares_outstanding": {
+      "value": 8024.0,
+      "tier": "factual",
+      "source": "10-K FY2025 Income Statement (Jan 31, 2025)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "Diluted weighted-average shares FY2025 ($M shares) — post 3:1 split Feb 2024"
+    },
+    "tax_rate": {
+      "value": 0.234,
+      "tier": "factual",
+      "source": "10-K FY2025 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "Effective tax rate FY2025 = 23.4%"
+    },
+    "buyback_yield": {
+      "value": 0.01,
+      "tier": "derived",
+      "source": "10-K capital allocation",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "Steady $5-10B/yr buyback program / ~$700B market cap = ~1% annual. WMT balances dividend + capex + buyback."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.001,
+      "tier": "derived",
+      "source": "10-K FY2025 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000104169/000010416925000021/wmt-20250131.htm",
+      "note": "SBC ~$0.9B / Revenue $681B = 0.1%. Lowest in dataset — retail workforce is hourly cash comp."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 20.0,
+      "high": 90.0
+    },
+    "analyst_consensus_target": 138.72,
+    "target_source": "48-analyst consensus (TipRanks May 2026)",
+    "tolerance_rationale": "Hand DCF (g=4%, margin=1.87%, WACC=7.27%) → ~$31. Market trades ~$135 (huge premium for e-commerce growth optionality, Walmart Connect ad business, OneAtWMT, scale moat). Pure FCFF margin doesn't capture these. Range [$20, $90] captures conservative-textbook through optimistic bull DCF; market $138 well above any 5yr FCFF model."
+  }
+}

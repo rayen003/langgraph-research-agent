@@ -1,0 +1,90 @@
+{
+  "ticker": "KO",
+  "as_of": "2026-05-19",
+  "fiscal_year": "FY2024",
+  "horizon_years": 5,
+  "model_variant": "mature_consumer",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 47061.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement (ended Dec 31, 2024)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "Total revenue FY2024 ($M)"
+    },
+    "revenue_growth": {
+      "value": 0.04,
+      "tier": "consensus",
+      "source": "Analyst consensus (Simply Wall St)",
+      "url": "https://simplywall.st/stocks/us/beverage/nyse-ko",
+      "note": "Consensus growth 3.77% — biased slightly to 4% for pricing power upside. Mature global beverage, limited unit volume growth"
+    },
+    "fcff_margin": {
+      "value": 0.20,
+      "tier": "derived",
+      "source": "10-K FY2024 + 3-year normalized average",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "NORMALIZED 20% — 2024 reported OCF was depressed by one-time IRS settlement (~$6B). 3-year normalized FCF margin ~20-22%. Capital-light branded beverage"
+    },
+    "wacc": {
+      "value": 0.0633,
+      "tier": "industry",
+      "source": "Damodaran NYU - Beverage (Soft) sector (Jan 2026)",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: Cost of equity 6.81% (Rf 4.18% + β 0.64 × ERP 4.23%) × 82.93% E-weight + after-tax cost of debt 3.97% × 17.07% D-weight. Very low beta = defensive name"
+    },
+    "terminal_growth": {
+      "value": 0.025,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "GDP-matching long-run growth; mature global consumer staple"
+    },
+    "net_debt": {
+      "value": 29922.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Balance Sheet (Dec 31, 2024)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "Total debt $44,522M - Cash & ST investments $14,600M = $29,922M (positive net debt — KO uses leverage for capital return)"
+    },
+    "shares_outstanding": {
+      "value": 4320.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "Diluted weighted-average shares FY2024 ($M shares)"
+    },
+    "tax_rate": {
+      "value": 0.186,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "Effective tax rate FY2024 = 18.6%"
+    },
+    "buyback_yield": {
+      "value": 0.005,
+      "tier": "derived",
+      "source": "10-K capital allocation",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "KO prioritizes dividend (~3% yield, dividend aristocrat). Modest ~$1-2B/yr buybacks / ~$300B market cap = 0.5% annual."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.009,
+      "tier": "derived",
+      "source": "10-K FY2024 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000021344/000002134425000011/ko-20241231.htm",
+      "note": "SBC ~$0.4B / Revenue $47B = 0.9%. Mature consumer — equity comp is minor."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 35.0,
+      "high": 85.0
+    },
+    "analyst_consensus_target": 85.67,
+    "target_source": "27-analyst consensus (TipRanks May 2026)",
+    "tolerance_rationale": "Hand DCF (normalized inputs, g=4%, margin=20%, WACC=6.33%) → ~$55. Market trades ~$70 (premium for defensive characteristics + 3% dividend yield). Analyst target $85 captures bullish forward growth + multiple expansion. Range [$35, $85]."
+  }
+}

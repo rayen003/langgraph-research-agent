@@ -60,7 +60,7 @@ dotenv.load_dotenv()
 MAX_TOOL_ROUNDS = 6
 MAX_SEARCHES_PER_STEP = 3
 
-llm = ChatOpenAI(model="gpt-5-nano", api_key=os.getenv("OPENAI_API_KEY"), timeout=60)
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"), timeout=60)
 
 # ---------------------------------------------------------------------------
 # Models
@@ -366,6 +366,14 @@ def execute_step(
                     result = json.dumps({"error": str(e)})
                     format_tool_error(tc["name"], str(e))
             messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+    from graphs.workflows.dcf.payload import extract_dcf_report_from_tool_pointer  # noqa: PLC0415
+
+    for message in reversed(messages):
+        if isinstance(message, ToolMessage):
+            dcf_report = extract_dcf_report_from_tool_pointer(str(message.content))
+            if dcf_report:
+                return dcf_report, list(tool_result_ids)
 
     last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
     result_text = last_ai.content if last_ai and isinstance(last_ai.content, str) else "Step completed."

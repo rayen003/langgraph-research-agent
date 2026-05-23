@@ -193,23 +193,47 @@ def _fetch_fundamentals_fmp(ticker: str) -> dict[str, dict[str, Any]]:
         isinstance(market_cap, (int, float)) and market_cap > 0
         and isinstance(spot_price, (int, float)) and spot_price > 0
     ):
-        derived_shares = float(market_cap) / float(spot_price)
+        derived_shares = float(market_cap) / float(spot_price)  # always raw share count
     shares_final = (
         weighted_shares
         if isinstance(weighted_shares, (int, float)) and weighted_shares > 0
         else derived_shares
     )
     if isinstance(shares_final, (int, float)) and shares_final > 0:
-        out["shares_outstanding"] = {
-            "value": float(shares_final) / 1_000_000.0,
-            "source": "fmp",
-            "field": "weightedAverageShsOutDil",
-            "raw_value": float(shares_final),
-            "raw_unit": "shares",
-            "as_of": as_of,
-            "confidence": 0.97,
-            "evidence": "FMP annual statement share count.",
-        }
+        shares_in_millions = float(shares_final) / 1_000_000.0
+        shares_field = "weightedAverageShsOutDil"
+        # Sanity check: any listed company has >1M shares. If < 1M after dividing,
+        # FMP likely returned shares already in millions (unit mismatch). Cross-check
+        # against market-cap-derived count.
+        if shares_in_millions < 1.0:
+            if derived_shares and derived_shares / 1_000_000.0 >= 1.0:
+                # Use market-cap-implied shares (reliable for large caps)
+                shares_final = derived_shares
+                shares_in_millions = derived_shares / 1_000_000.0
+                shares_field = "marketCap/price"
+                logger.warning(
+                    "DCF fundamentals: FMP share count looks wrong (<1M after /1e6), "
+                    "using marketCap/price fallback ticker=%s raw=%s derived_M=%.1f",
+                    ticker, weighted_shares, shares_in_millions,
+                )
+            else:
+                logger.warning(
+                    "DCF fundamentals: share count unusable ticker=%s shares_M=%.4f",
+                    ticker, shares_in_millions,
+                )
+                shares_final = None
+        if isinstance(shares_final, (int, float)) and shares_final > 0:
+            out["shares_outstanding"] = {
+                "value": shares_in_millions,
+                "source": "fmp",
+                "field": shares_field,
+                "raw_value": float(shares_final),
+                "raw_unit": "shares",
+                "as_of": as_of,
+                "confidence": 0.97 if shares_field == "weightedAverageShsOutDil" else 0.90,
+                "evidence": "FMP annual statement share count." if shares_field == "weightedAverageShsOutDil"
+                            else "Shares derived from FMP marketCap / price.",
+            }
 
     # --- base revenue ---
     revenue_raw = income.get("revenue")
@@ -226,21 +250,50 @@ def _fetch_fundamentals_fmp(ticker: str) -> dict[str, dict[str, Any]]:
         }
 
     # --- net debt ---
-    debt_raw = balance.get("totalDebt")
-    cash_raw = balance.get("cashAndCashEquivalents")
+    # Debt: prefer longTermDebt + shortTermDebt (financial debt only — excludes
+    # operating lease liabilities that FMP bundles into totalDebt for many companies).
+    # Cash: prefer cashAndShortTermInvestments (broadest liquid measure) to avoid
+    # overstating net debt for cash-rich companies (META, AAPL, MSFT hold large ST
+    # investment portfolios not captured by narrow cashAndCashEquivalents).
+    ltd = balance.get("longTermDebt")
+    std = balance.get("shortTermDebt")
+    if isinstance(ltd, (int, float)) or isinstance(std, (int, float)):
+        debt_raw = (float(ltd) if isinstance(ltd, (int, float)) else 0.0
+                    + float(std) if isinstance(std, (int, float)) else 0.0)
+        debt_field = "longTermDebt + shortTermDebt"
+    else:
+        debt_raw = balance.get("totalDebt")
+        debt_field = "totalDebt"
+    cash_raw = (
+        balance.get("cashAndShortTermInvestments")  # cash + ST investments (preferred)
+        or balance.get("cashAndCashEquivalents")    # narrow cash (fallback)
+    )
+    cash_field = (
+        "cashAndShortTermInvestments"
+        if isinstance(balance.get("cashAndShortTermInvestments"), (int, float))
+        else "cashAndCashEquivalents"
+    )
     if isinstance(debt_raw, (int, float)) or isinstance(cash_raw, (int, float)):
         debt = float(debt_raw) if isinstance(debt_raw, (int, float)) else 0.0
         cash = float(cash_raw) if isinstance(cash_raw, (int, float)) else 0.0
         net_debt_usd = debt - cash
+        # Sanity log: net_debt > 2× revenue is unusual — may indicate bad data
+        revenue_usd = float(income.get("revenue") or 0)
+        if revenue_usd > 0 and net_debt_usd > revenue_usd * 2:
+            logger.warning(
+                "DCF fundamentals: net_debt may be overstated ticker=%s "
+                "net_debt=%.0fM revenue=%.0fM (debt_field=%s cash_field=%s)",
+                ticker, net_debt_usd / 1e6, revenue_usd / 1e6, debt_field, cash_field,
+            )
         out["net_debt"] = {
             "value": net_debt_usd / 1_000_000.0,
             "source": "fmp",
-            "field": "totalDebt - cashAndCashEquivalents",
+            "field": f"{debt_field} - {cash_field}",
             "raw_value": net_debt_usd,
             "raw_unit": "USD",
             "as_of": as_of,
             "confidence": 0.9,
-            "evidence": "FMP annual balance sheet net debt.",
+            "evidence": f"FMP balance sheet: {debt_field} minus {cash_field}.",
         }
 
     # --- FCFF margin (Tier B but high-quality from statement components) ---

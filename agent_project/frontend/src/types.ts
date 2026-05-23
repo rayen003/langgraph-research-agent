@@ -100,7 +100,7 @@ export interface DcfReviewState {
   ticker: string
   horizon_years: number
   assumptions: Record<string, number>
-  provenance: Record<string, { source?: string; confidence?: number }>
+  provenance: Record<string, { source?: string; confidence?: number; evidence_refs?: string[] }>
   memo_proposals?: Record<string, { rationale: string; confidence: number }>
   evidence_items?: EvidenceItem[]
 }
@@ -125,6 +125,13 @@ export interface SessionMessage {
    * Renders the same auditable view used for live runs.
    */
   activity?: ActivityEntry[]
+  /**
+   * DCF validity captured at commit time. When 'invalid', the message
+   * renders with a red degraded banner so the user can't miss it.
+   */
+  validity?: 'valid' | 'invalid' | 'adjusting'
+  /** Reason text emitted by convergence_gate when validity != 'valid'. */
+  invalidationReason?: string
 }
 
 export interface Session {

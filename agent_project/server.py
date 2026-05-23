@@ -8,6 +8,8 @@ GET    /runs/{thread_id}/events          SSE stream of execution events
 POST   /runs/{thread_id}/decision        HITL approve / reject the plan
 GET    /runs/{thread_id}/plan            latest plan JSON for the thread
 GET    /runs/{thread_id}/report          final markdown report (if complete)
+GET    /runs/{thread_id}/dcf-report.md   DCF valuation report (markdown)
+GET    /runs/{thread_id}/dcf-report.pdf  DCF valuation report (PDF)
 GET    /artifacts/{thread_id}/{filename} serve generated artifact files
 GET    /jobs                             list all runs as job summaries
 POST   /workflows/dcf/runs               create & start deterministic DCF workflow
@@ -34,12 +36,15 @@ import agent_log
 import dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from typing import Any
 from pydantic import BaseModel
 
 dotenv.load_dotenv(Path(__file__).parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+import lg_compat  # noqa: F401 — validates langgraph version at startup, not mid-request
 
 from plan_store import save_plan as save_plan_to_store  # noqa: E402
 from storage import (  # noqa: E402
@@ -282,15 +287,23 @@ def _make_event_bridge(rs: RunState):
             rs.status = "planning" if rs.intent == "research" else "chat_responding"
             update_job(rs.thread_id, status=rs.status, intent=rs.intent)
         elif event.get("type") == "dcf_assumptions_review":
-            # Store HITL payload directly on RunState — safe from any thread
-            # since we're only writing and _run_agent_task reads it after ainvoke.
+            # Store full HITL snapshot on RunState — restored on fast-path re-run.
             rs.dcf_hitl_payload = {
                 "ticker": event.get("ticker", "?"),
                 "horizon_years": event.get("horizon_years", 5),
                 "assumptions": event.get("assumptions", {}),
                 "assumption_provenance": event.get("assumption_provenance", {}),
+                "assumption_memo": event.get("assumption_memo"),
                 "memo_proposals": event.get("memo_proposals", {}),
                 "evidence_items": event.get("evidence_items", []),
+                "scenarios": event.get("scenarios", []),
+                "company_state": event.get("company_state"),
+                "thesis": event.get("thesis"),
+                "features": event.get("features", {}),
+                "fundamentals": event.get("fundamentals", {}),
+                "profile": event.get("profile", "default"),
+                "profile_meta": event.get("profile_meta", {}),
+                "wacc_components": event.get("wacc_components", {}),
             }
             rs.status = "awaiting_assumptions"
             update_job(rs.thread_id, status=rs.status)
@@ -318,7 +331,7 @@ def _make_event_bridge(rs: RunState):
 async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str = "") -> None:
     from file import app as agent_graph  # noqa: PLC0415
     from langchain_core.messages import HumanMessage  # noqa: PLC0415
-    from langgraph.types import Command  # noqa: PLC0415
+    from lg_compat import Command  # noqa: PLC0415
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     rs = _run_registry[thread_id]
@@ -353,13 +366,24 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
                 rs.event_queue.put_nowait(None)
                 return
 
-            # User approved — re-invoke chat with approval message to trigger DCF completion
+            # User approved — restore HITL context, then re-invoke for fast-path valuation.
+            from graphs.workflows.dcf.hitl_snapshot import build_hitl_snapshot  # noqa: PLC0415
+            from utils import set_dcf_hitl_payload  # noqa: PLC0415
+
+            merged_assumptions = overrides or dcf_data.get("assumptions", {})
+            hitl_snapshot = build_hitl_snapshot({
+                **dcf_data,
+                "assumptions": merged_assumptions,
+            })
+            set_dcf_hitl_payload(hitl_snapshot)
+
             rs.status = "chat_responding"
             update_job(thread_id, status=rs.status)
             approval_payload = {
                 "ticker": dcf_data.get("ticker", "?"),
                 "horizon_years": dcf_data.get("horizon_years", 5),
-                "all_assumptions": overrides or dcf_data.get("assumptions", {}),
+                "all_assumptions": merged_assumptions,
+                "hitl_snapshot": hitl_snapshot,
             }
             approval_message = f"[DCF_APPROVED]:{json.dumps(approval_payload)}"
 
@@ -453,7 +477,7 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
 
 async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> None:
     from graphs.workflows.dcf import dcf_workflow_app  # noqa: PLC0415
-    from langgraph.types import Command  # noqa: PLC0415
+    from lg_compat import Command  # noqa: PLC0415
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     rs = _run_registry[thread_id]
@@ -491,10 +515,14 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
         "assumption_memo": None,
         "confidence_breakdown": None,
         "wacc_sanity": None,
+        "implied_growth": None,
+        "implied_margin": None,
         "thesis": None,
         "analysis_iteration": 0,
         "critique": None,
         "previous_valuation": None,
+        "scenarios": [],
+        "scenario_results": [],
     }
 
     try:
@@ -623,6 +651,10 @@ class RunRequest(BaseModel):
 
 class RunCreatedResponse(BaseModel):
     thread_id: str
+    # Highest event_id at the moment this run was created. Clients should pass
+    # this back as ?after_id= when opening the SSE stream so prior turns in
+    # the same chat thread don't get replayed as live events.
+    start_event_id: int = 0
 
 
 class DecisionRequest(BaseModel):
@@ -720,6 +752,17 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+def _latest_event_id_for(thread_id: str) -> int:
+    """Highest persisted event_id for this thread (0 if none).
+
+    Used as the per-turn boundary marker: clients that reuse a thread_id
+    across multiple turns (chat continuity) pass this back as ?after_id=
+    when opening SSE so prior turns aren't replayed as live events.
+    """
+    prior = list_job_events(thread_id, after_id=0, limit=1_000_000)
+    return max((int(e.get("event_id") or 0) for e in prior), default=0)
+
+
 @app.post("/runs", response_model=RunCreatedResponse)
 async def create_run(body: RunRequest) -> RunCreatedResponse:
     thread_id = body.thread_id or f"thread_{uuid4().hex[:8]}"
@@ -733,6 +776,8 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
             detail=f"Thread '{thread_id}' is already running (status={existing.status}).",
         )
 
+    start_event_id = _latest_event_id_for(thread_id)
+
     loop = asyncio.get_running_loop()
     rs = RunState(thread_id, loop, body.query, body.mode, session_id)
     _run_registry[thread_id] = rs
@@ -744,7 +789,7 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
         session_id=session_id,
     )
     asyncio.create_task(_run_agent_task(thread_id, body.query, body.mode, session_id))
-    return RunCreatedResponse(thread_id=thread_id)
+    return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
 
 
 @app.post("/workflows/dcf/runs", response_model=RunCreatedResponse)
@@ -775,8 +820,9 @@ async def create_dcf_run(body: DCFRunRequest) -> RunCreatedResponse:
         session_id=session_id,
         intent=rs.intent,
     )
+    start_event_id = _latest_event_id_for(thread_id)
     asyncio.create_task(_run_dcf_workflow_task(thread_id, body))
-    return RunCreatedResponse(thread_id=thread_id)
+    return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
 
 
 @app.get("/runs/{thread_id}/events")
@@ -982,7 +1028,7 @@ async def submit_dcf_decision(
 async def continue_dcf_after_review(thread_id: str, body: DcfContinueRequest) -> dict:
     """Resume DCF graph from assumption review interrupt."""
     from graphs.workflows.dcf import dcf_workflow_app  # noqa: PLC0415
-    from langgraph.types import Command  # noqa: PLC0415
+    from lg_compat import Command  # noqa: PLC0415
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     # Create or reuse a run state for SSE streaming of valuation events
@@ -1043,6 +1089,51 @@ def get_report(thread_id: str) -> dict:
             return {"thread_id": thread_id, "content": stored["content"]}
         raise HTTPException(status_code=404, detail=f"No report found for thread '{thread_id}'")
     return {"thread_id": thread_id, "content": path.read_text(encoding="utf-8")}
+
+
+@app.get("/runs/{thread_id}/dcf-report.md")
+def get_dcf_report_markdown(thread_id: str) -> Response:
+    """Download the DCF valuation report as markdown."""
+    from report_export import load_dcf_report_markdown  # noqa: PLC0415
+
+    run_dir = _runs_dir_for(thread_id)
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"No run found for thread '{thread_id}'")
+    try:
+        markdown, base_name, _ = load_dcf_report_markdown(run_dir)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(
+        content=markdown,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base_name}-report.md"',
+        },
+    )
+
+
+@app.get("/runs/{thread_id}/dcf-report.pdf")
+def get_dcf_report_pdf(thread_id: str) -> Response:
+    """Download the DCF valuation report as a formatted PDF."""
+    from report_export import load_dcf_report_markdown, render_report_pdf  # noqa: PLC0415
+
+    run_dir = _runs_dir_for(thread_id)
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"No run found for thread '{thread_id}'")
+    try:
+        markdown, base_name, png_path = load_dcf_report_markdown(run_dir)
+        pdf_bytes = render_report_pdf(markdown, sensitivity_png=png_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}") from exc
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base_name}-report.pdf"',
+        },
+    )
 
 
 @app.get("/workflows/dcf/runs/{thread_id}/result")
@@ -1167,6 +1258,155 @@ def remove_document(doc_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     delete_document(doc_id)
     return {"deleted": doc_id}
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Graph endpoints
+# ---------------------------------------------------------------------------
+
+class KGNodeUpsert(BaseModel):
+    ticker: str
+    node_type: str
+    field: str
+    value: Any
+    confidence: float = 1.0
+    source: str = "user_stated"
+    run_id: str | None = None
+
+
+class KGNodePatch(BaseModel):
+    value: Any | None = None
+    confidence: float | None = None
+
+
+class KGEdgeCreate(BaseModel):
+    src_id: str
+    tgt_id: str
+    relation: str
+    confidence: float = 1.0
+    source: str = "user_stated"
+
+
+class KGQueryRequest(BaseModel):
+    question: str
+    ticker: str | None = None
+
+
+@app.get("/kg/{session_id}")
+async def kg_full(session_id: str) -> dict[str, Any]:
+    """Return all KG nodes + edges for a session."""
+    from storage import list_kg_nodes, list_kg_edges  # noqa: PLC0415
+    nodes = list_kg_nodes(session_id=session_id)
+    edges = list_kg_edges(session_id=session_id)
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/kg/{session_id}/subgraph/{ticker}")
+async def kg_subgraph(session_id: str, ticker: str) -> dict[str, Any]:
+    """Ticker-scoped subgraph for a session."""
+    from storage import list_kg_nodes, list_kg_edges  # noqa: PLC0415
+    nodes = list_kg_nodes(session_id=session_id, ticker=ticker.upper())
+    node_ids = {n["id"] for n in nodes}
+    all_edges = list_kg_edges(session_id=session_id)
+    edges = [e for e in all_edges if e["src_id"] in node_ids or e["tgt_id"] in node_ids]
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.post("/kg/{session_id}/nodes")
+async def kg_create_node(session_id: str, body: KGNodeUpsert) -> dict[str, Any]:
+    """User-driven node creation. Default source='user_stated', confidence=1.0."""
+    from kg import get_cache  # noqa: PLC0415
+    cache = get_cache()
+    node = cache.put(
+        ticker=body.ticker.upper(),
+        node_type=body.node_type,
+        field=body.field,
+        value=body.value,
+        source=body.source,
+        confidence=body.confidence,
+        run_id=body.run_id,
+        session_id=session_id,
+        respect_user_lock=False,  # user explicitly creating, allow overwrite
+    )
+    return {"node": node}
+
+
+@app.patch("/kg/{session_id}/nodes/{node_id}")
+async def kg_patch_node(session_id: str, node_id: str, body: KGNodePatch) -> dict[str, Any]:
+    """Edit value/confidence on an existing node. Always becomes 'user_stated'."""
+    from kg import get_cache  # noqa: PLC0415
+    from storage import get_kg_node  # noqa: PLC0415
+    existing = get_kg_node(node_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+    cache = get_cache()
+    new_value = body.value if body.value is not None else existing["value"]
+    new_conf = body.confidence if body.confidence is not None else 1.0
+    node = cache.put(
+        ticker=existing["ticker"],
+        node_type=existing["node_type"],
+        field=existing["field"],
+        value=new_value,
+        source="user_stated",  # any user edit → user_stated
+        confidence=new_conf,
+        run_id=existing.get("run_id"),
+        session_id=session_id,
+        respect_user_lock=False,
+    )
+    return {"node": node}
+
+
+@app.delete("/kg/{session_id}/nodes/{node_id}")
+async def kg_delete_node(session_id: str, node_id: str) -> dict[str, str]:
+    """Delete a node and any edges touching it."""
+    from kg import get_cache  # noqa: PLC0415
+    from storage import delete_kg_node  # noqa: PLC0415
+    delete_kg_node(node_id)
+    cache = get_cache()
+    cache.invalidate(node_id)
+    return {"deleted": node_id}
+
+
+@app.post("/kg/{session_id}/edges")
+async def kg_create_edge(session_id: str, body: KGEdgeCreate) -> dict[str, Any]:
+    from kg import get_cache  # noqa: PLC0415
+    cache = get_cache()
+    edge = cache.add_edge(
+        src_id=body.src_id,
+        tgt_id=body.tgt_id,
+        relation=body.relation,
+        session_id=session_id,
+        confidence=body.confidence,
+        source=body.source,
+    )
+    return {"edge": edge}
+
+
+@app.delete("/kg/{session_id}/edges/{edge_id:path}")
+async def kg_delete_edge(session_id: str, edge_id: str) -> dict[str, str]:
+    from kg import get_cache  # noqa: PLC0415
+    cache = get_cache()
+    cache.remove_edge(edge_id)
+    return {"deleted": edge_id}
+
+
+@app.get("/kg/{session_id}/traversal/{run_id}")
+async def kg_traversal(session_id: str, run_id: str) -> dict[str, Any]:
+    """Replay the KG access path for a past DCF run."""
+    from storage import list_kg_traversals  # noqa: PLC0415
+    return {"run_id": run_id, "traversal": list_kg_traversals(run_id)}
+
+
+@app.post("/kg/{session_id}/query")
+async def kg_query(session_id: str, body: KGQueryRequest) -> dict[str, Any]:
+    """Natural-language query against the KG. Returns answer + traversal subgraph."""
+    from kg.query import run_nl_query  # noqa: PLC0415
+    result = await run_nl_query(
+        question=body.question,
+        ticker=(body.ticker.upper() if body.ticker else None),
+        session_id=session_id,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

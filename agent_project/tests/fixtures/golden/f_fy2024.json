@@ -1,0 +1,90 @@
+{
+  "ticker": "F",
+  "as_of": "2026-05-19",
+  "fiscal_year": "FY2024",
+  "horizon_years": 5,
+  "model_variant": "cyclical_industrial",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 184992.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement (ended Dec 31, 2024)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "Total revenue FY2024 ($M) — record year for Ford"
+    },
+    "revenue_growth": {
+      "value": 0.0,
+      "tier": "consensus",
+      "source": "Analyst consensus (Simply Wall St / WallStreetZen)",
+      "url": "https://simplywall.st/stocks/us/automobiles/nyse-f/ford-motor/future",
+      "note": "Flat — consensus revenue forecast -0.7% to +0.8% p.a.; auto cyclical with EV transition headwinds"
+    },
+    "fcff_margin": {
+      "value": 0.036,
+      "tier": "derived",
+      "source": "Ford 10-K FY2024 + Q4 2024 earnings release",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "Adjusted FCF $6,700M / Revenue $184,992M = 3.62%. Auto industry — low margin, high capex. Industrial segment only (excludes Ford Credit)"
+    },
+    "wacc": {
+      "value": 0.0938,
+      "tier": "industry",
+      "source": "Damodaran NYU - Auto & Truck sector (Jan 2026)",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: Cost of equity 10.45% (Rf 4.18% + β 1.46 × ERP 4.23%) × 83.55% E-weight + after-tax cost of debt 3.97% × 16.45% D-weight"
+    },
+    "terminal_growth": {
+      "value": 0.02,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "Below US GDP — auto is mature/cyclical, no real long-run growth"
+    },
+    "net_debt": {
+      "value": -8500.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Industrial segment (excludes Ford Credit financing debt)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "Industrial cash ~$28,500M - Industrial debt ~$20,000M = -$8,500M (net cash). Excludes Ford Credit's $137B financing debt which is offset by receivables. Pure industrial DCF only"
+    },
+    "shares_outstanding": {
+      "value": 4022.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "Diluted weighted-average shares FY2024 ($M shares)"
+    },
+    "tax_rate": {
+      "value": 0.15,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement (estimated)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "Estimated effective tax rate — auto industry typical 12-18%"
+    },
+    "buyback_yield": {
+      "value": 0.0,
+      "tier": "derived",
+      "source": "10-K capital allocation",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "Ford preserves cash for EV transition + dividend (~5% yield). Modest buybacks ~$1B/yr offset by SBC — net ~0% share change."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.002,
+      "tier": "derived",
+      "source": "10-K FY2024 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000037996/000003799625000013/f-20241231.htm",
+      "note": "SBC ~$0.3B / Revenue $185B = 0.2%. Auto/industrial — primarily cash comp, minimal equity."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 8.0,
+      "high": 35.0
+    },
+    "analyst_consensus_target": 13.41,
+    "target_source": "13-analyst consensus (Benzinga/MarketBeat May 2026)",
+    "tolerance_rationale": "Hand DCF (industrial only, g=0%) → ~$23. Market trades ~$11 — prices EV transition risk, China competition, Ford Credit drag. Wide range covers both. Below $8 or above $35 = math bug. Note: Ford is hard to DCF cleanly due to dual-segment structure (industrial + Ford Credit)."
+  }
+}

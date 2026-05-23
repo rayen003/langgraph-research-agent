@@ -15,35 +15,54 @@ Three layers:
         Form a conviction, derive assumptions, get approval.
     Valuation + analysis layer (project → analyze → refine | finalize):
         Deterministic FCFF math + self-critique loop.
+
+Node implementations live in sibling modules; this file owns wiring + the
+public sync entrypoint:
+  - lifecycle.py   — normalize_input, cache_check, route_after_cache_check
+  - scenarios.py   — scenario_generator + monotonicity validation
+  - execution.py   — formulate_thesis + scenario_runner
+  - review_loop.py — run_review_subgraph + routers
+  - refinement.py  — analyze_result + refine_assumptions + route_after_analysis
+  - payload.py     — summarize_dcf_payload + consistency checks
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_openai import ChatOpenAI
 
-from utils import get_run_dir
+from utils import get_dcf_hitl_payload, get_run_dir
 
-from .activity import emit_step, emit_workflow_terminal
-from .evidence import assemble_evidence_node
-from .memo import propose_assumptions_node
-from .review import review_assumptions_node, route_after_assumptions
-from .synthesis import semantic_synthesis_node
-from .state import (
-    _TIER_A_FIELDS,
-    DCFState,
+from .hitl_snapshot import apply_hitl_snapshot, build_hitl_snapshot
+from .sources import merge_hitl_provenance, reconstruct_memo_from_provenance
+
+from .analysis import (
+    analysis_node,
+    convergence_gate_node,
+    detect_divergences_node,
+    route_after_convergence_gate,
+    route_after_convergence_gate_val,
 )
+from .evidence import assemble_evidence_node
+from .execution import formulate_thesis_node, scenario_runner_node
+from .lifecycle import cache_check_node, normalize_input_node, route_after_cache_check
+from .memo import propose_assumptions_node
+from .payload import summarize_dcf_payload  # re-exported for public API
+from .refinement import analyze_result_node, refine_assumptions_node, route_after_analysis
+from .review import review_assumptions_node, route_after_assumptions
+from .review_loop import route_after_review, route_after_review_val, run_review_subgraph
+from .scenarios import scenario_generator_node
+from .state import DCFState
+from .synthesis import semantic_synthesis_node
 from .valuation import (
     collect_market_data_node,
-    compute_implied_wacc_node,
+    compute_market_signals_node,
     compute_valuation_node,
     finalize_node,
     project_cashflows_node,
@@ -52,744 +71,18 @@ from .valuation import (
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# normalize_input — validates and normalizes the incoming request
-# ---------------------------------------------------------------------------
-
-
-def normalize_input_node(state: DCFState) -> dict:
-    """Validate ticker and horizon, emit workflow-started span."""
-    parent_step_id = state.get("parent_step_id") or "workflow_dcf"
-    emit_workflow_terminal(
-        parent_step_id=parent_step_id,
-        status="started",
-        payload={"ticker": str(state.get("ticker") or "").upper()},
-    )
-    emit_step("normalize_input", "start", parent_step_id)
-    ticker = str(state.get("ticker") or "").strip().upper()
-    if not ticker:
-        raise ValueError("ticker is required for DCF workflow.")
-    horizon = int(state.get("horizon_years") or 5)
-    horizon = min(max(horizon, 3), 10)
-    logger.info(
-        "DCF normalize_input ticker=%s horizon_years=%d", ticker, horizon,
-    )
-    emit_step(
-        "normalize_input", "complete", parent_step_id,
-        {"ticker": ticker, "horizon_years": horizon, "summary_line": f"{ticker} {horizon}yr horizon"},
-    )
-    return {"ticker": ticker, "horizon_years": horizon}
+__all__ = [
+    "dcf_workflow_app",
+    "dcf_valuation_app",
+    "dcf_scenario_val_app",
+    "run_dcf_workflow_sync",
+    "summarize_dcf_payload",
+]
 
 
 # ---------------------------------------------------------------------------
-# formulate_thesis — forms an investment thesis before assumptions
+# Initial-state builder + memo helper
 # ---------------------------------------------------------------------------
-
-_THESIS_LLM = ChatOpenAI(
-    model=os.getenv("DCF_THESIS_MODEL", "gpt-4o"),
-    api_key=os.getenv("OPENAI_API_KEY"),
-    timeout=60,
-)
-
-
-def formulate_thesis_node(state: DCFState) -> dict:
-    """Produce a structured investment thesis from evidence and company synthesis.
-
-    The thesis anchors assumptions — every assumption must be explainable
-    in terms of the thesis.  The critique loop later checks for consistency.
-    """
-    parent_step_id = state.get("parent_step_id") or "workflow_dcf"
-    emit_step("formulate_thesis", "start", parent_step_id)
-
-    ticker = state["ticker"]
-    evidence = state.get("evidence_pack") or {}
-    company_state = state.get("company_state") or {}
-
-    try:
-        # Build a summary of evidence for the LLM
-        evidence_summary = json.dumps({
-            "items_count": len(evidence.get("items", [])),
-            "tier_counts": evidence.get("tier_counts", {}),
-        }, ensure_ascii=False)
-
-        prompt = (
-            f"You are a senior equity analyst forming an investment thesis for {ticker}.\n\n"
-            f"## Company context\n{json.dumps(company_state, ensure_ascii=False)}\n\n"
-            f"## Evidence summary\n{evidence_summary}\n\n"
-            "## Instructions\n"
-            "Form a concise investment thesis.  Output valid JSON ONLY — no markdown, no preamble:\n\n"
-            "{\n"
-            '  "bull_thesis": "Why the stock could outperform. 1-2 sentences naming specific drivers.",\n'
-            '  "bear_thesis": "Why the stock could underperform. 1-2 sentences naming specific risks.",\n'
-            '  "key_drivers": [\n'
-            '    {"driver": "name", "direction": "positive|negative|neutral", "conviction": "high|medium|low"}\n'
-            "  ],\n"
-            '  "narrative": "2-3 sentences tying the thesis together — what the investment case hinges on."\n'
-            "}\n\n"
-            f"Base the thesis on the evidence and company context above. Be specific to {ticker}."
-        )
-
-        response = _THESIS_LLM.invoke(prompt)
-        raw = (response.content or "").strip()
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        thesis = json.loads(raw or "{}")
-        logger.info("DCF thesis produced ticker=%s bull=%s", ticker, thesis.get("bull_thesis", "")[:60])
-    except Exception:
-        logger.warning("Thesis LLM failed for %s — using fallback", ticker, exc_info=True)
-        thesis = {
-            "bull_thesis": f"{ticker} is undervalued relative to its growth potential.",
-            "bear_thesis": f"{ticker} faces headwinds from competition and margin pressure.",
-            "key_drivers": [],
-            "narrative": f"Unable to formulate thesis for {ticker} due to insufficient evidence.",
-        }
-
-    emit_step(
-        "formulate_thesis", "complete", parent_step_id,
-        {
-            "summary_line": f"Thesis: {thesis.get('narrative', '')[:80]}...",
-            "bull_thesis": thesis.get("bull_thesis", ""),
-            "bear_thesis": thesis.get("bear_thesis", ""),
-            "key_drivers": thesis.get("key_drivers", []),
-            "narrative": thesis.get("narrative", ""),
-        },
-    )
-    return {"thesis": thesis}
-
-
-# ---------------------------------------------------------------------------
-# Analysis loop nodes — self-critique after valuation
-# ---------------------------------------------------------------------------
-
-_ANALYSIS_LLM = ChatOpenAI(
-    model=os.getenv("DCF_ANALYSIS_MODEL", "gpt-4o"),
-    api_key=os.getenv("OPENAI_API_KEY"),
-    timeout=60,
-)
-
-# Field-specific adjustment bounds — the LLM can suggest, but we clamp here.
-_CRITIQUE_ADJUSTMENT_BOUNDS: dict[str, tuple[float, float]] = {
-    "revenue_growth": (-0.03, 0.03),
-    "fcff_margin": (-0.03, 0.03),
-    "terminal_growth": (-0.005, 0.005),
-    "wacc": (-0.01, 0.01),
-    "tax_rate": (-0.02, 0.02),
-}
-
-_MAX_ANALYSIS_ITERATIONS = 2
-
-
-def _build_deterministic_flags(state: DCFState) -> list[dict[str, Any]]:
-    """Extract structured signals from valuation output for the critique node."""
-    valuation = state.get("valuation") or {}
-    wacc_sanity = state.get("wacc_sanity") or {}
-    assumptions = state.get("assumptions") or {}
-    confidence = state.get("confidence_breakdown") or {}
-    sensitivity = state.get("sensitivity_table") or []
-
-    flags: list[dict[str, Any]] = []
-
-    # Terminal value as % of EV
-    tv = valuation.get("terminal_pv", 0) or 0
-    ev = valuation.get("enterprise_value", 1) or 1
-    tv_pct = tv / ev if ev else 0
-    flags.append({
-        "signal": "terminal_weight",
-        "value": round(tv_pct * 100, 1),
-        "threshold": "> 70% is concerning",
-        "severity": "severe" if tv_pct > 0.75 else ("warning" if tv_pct > 0.70 else "ok"),
-    })
-
-    # Implied vs spot price gap
-    implied = valuation.get("implied_share_price", 0) or 0
-    spot = valuation.get("current_price", 1) or 1
-    gap_pct = round(((implied / spot) - 1) * 100, 1) if spot else 0
-    flags.append({
-        "signal": "implied_vs_spot",
-        "value": gap_pct,
-        "threshold": "> ±50% is extreme",
-        "severity": "severe" if abs(gap_pct) > 50 else ("warning" if abs(gap_pct) > 30 else "ok"),
-    })
-
-    # WACC sanity gap
-    wacc_gap_bps = wacc_sanity.get("gap_bps", 0) or 0
-    flags.append({
-        "signal": "wacc_sanity_gap",
-        "value_bps": wacc_gap_bps,
-        "threshold": "> 200 bps is concerning",
-        "severity": "severe" if abs(wacc_gap_bps) > 200 else ("warning" if abs(wacc_gap_bps) > 100 else "ok"),
-    })
-
-    # WACC sensitivity — price swing per 1% WACC change
-    if sensitivity:
-        prices = [r.get("implied_share_price", 0) for r in sensitivity if r.get("implied_share_price")]
-        if len(prices) >= 3:
-            price_range_pct = round(((max(prices) - min(prices)) / (prices[len(prices)//2] or 1)) * 100, 1)
-            flags.append({
-                "signal": "wacc_sensitivity",
-                "value_pct": price_range_pct,
-                "threshold": "> 30% swing is high sensitivity",
-                "severity": "warning" if price_range_pct > 30 else "ok",
-            })
-
-    # Confidence label
-    flags.append({
-        "signal": "confidence",
-        "value": confidence.get("label", state.get("confidence_label", "medium")),
-        "severity": "severe" if state.get("confidence_label") == "low" else ("warning" if state.get("confidence_label") == "medium" else "ok"),
-    })
-
-    # Terminal growth vs risk-free rate
-    tg = assumptions.get("terminal_growth")
-    if tg is not None:
-        flags.append({
-            "signal": "tgr_vs_rf",
-            "value": round(tg * 100, 2),
-            "threshold": "TGR should not exceed Rf by more than 50 bps",
-            "severity": "warning",
-        })
-
-    return flags
-
-
-def analyze_result_node(state: DCFState) -> dict:
-    """Self-critique node — the analyst reads the DCF output and challenges it.
-
-    Uses deterministic flags as structured input; the LLM interprets why
-    they matter and suggests bounded adjustments.  Never free-form critique.
-    """
-    parent_step_id = state.get("parent_step_id") or "workflow_dcf"
-    iteration = state.get("analysis_iteration", 0)
-    ticker = state["ticker"]
-    emit_step("analyze_result", "start", parent_step_id)
-    logger.info("DCF analyze_result node RUNNING ticker=%s iteration=%d", ticker, iteration)
-    thesis = state.get("thesis") or {}
-    valuation = state.get("valuation") or {}
-    assumptions = state.get("assumptions") or {}
-    assumption_flags = state.get("assumption_flags") or []
-    valuation_flags = state.get("valuation_flags") or []
-
-    # Build deterministic flags
-    flags = _build_deterministic_flags(state)
-    severe_count = sum(1 for f in flags if f.get("severity") == "severe")
-    warning_count = sum(1 for f in flags if f.get("severity") == "warning")
-
-    # Convergence check — short-circuit if prior valuation exists
-    prev_val = state.get("previous_valuation") or {}
-    prev_implied = prev_val.get("implied_share_price", 0)
-    curr_implied = valuation.get("implied_share_price", 0)
-    delta_pct = abs((curr_implied - prev_implied) / max(prev_implied, 1)) * 100 if prev_implied and curr_implied else float("inf")
-    converged = delta_pct < 5 and prev_implied > 0
-
-    # Determine if we should refine
-    should_refine = (
-        severe_count > 0
-        and iteration < _MAX_ANALYSIS_ITERATIONS
-        and not converged
-    )
-
-    critique: dict[str, Any] = {
-        "iteration": iteration,
-        "flags": flags,
-        "severe_count": severe_count,
-        "warning_count": warning_count,
-        "converged": converged,
-        "delta_pct": round(delta_pct, 1),
-        "should_refine": should_refine,
-    }
-
-    if not should_refine:
-        reason = (
-            "converged (< 5% delta)" if converged
-            else f"no severe flags ({severe_count} severe, {warning_count} warnings)"
-            if severe_count == 0
-            else f"max iterations reached ({iteration}/{_MAX_ANALYSIS_ITERATIONS})"
-        )
-        critique["stop_reason"] = reason
-        emit_step(
-            "analyze_result", "complete", parent_step_id,
-            {
-                "summary_line": f"Analysis: {reason}",
-                "severe_count": severe_count,
-                "warning_count": warning_count,
-                "should_refine": False,
-                "stop_reason": reason,
-                "flags": [{"signal": f["signal"], "severity": f["severity"], "value": f.get("value", f.get("value_bps", f.get("value_pct")))} for f in flags],
-            },
-        )
-        return {"critique": critique, "analysis_iteration": iteration + 1}
-
-    # LLM interprets the flags and suggests adjustments
-    severe_desc = "\n".join(
-        f"- {f['signal']}: {f.get('value', f.get('value_bps', f.get('value_pct', '?')))} (threshold: {f.get('threshold', 'N/A')})"
-        for f in flags if f.get("severity") == "severe"
-    )
-
-    prompt = (
-        f"You are a senior analyst reviewing a junior's DCF valuation for {ticker}.\n\n"
-        f"## Thesis\n{json.dumps(thesis, ensure_ascii=False)}\n\n"
-        f"## Current assumptions\n{json.dumps(assumptions, ensure_ascii=False)}\n\n"
-        f"## Valuation output\n{json.dumps({k: v for k, v in valuation.items() if k in ('implied_share_price', 'enterprise_value', 'terminal_pv', 'pv_cash_flows')}, ensure_ascii=False)}\n\n"
-        f"## Severe flags (these MUST be addressed)\n{severe_desc}\n\n"
-        "## Instructions\n"
-        "You identified these severe issues.  Suggest BOUNDED adjustments to fix them.\n"
-        f"Growth can shift ±2-3%, margin ±2-3%, terminal growth ±0.5%, WACC ±1%.\n\n"
-        "Output valid JSON ONLY:\n"
-        "{\n"
-        '  "interpretation": "Why these flags matter — 1-2 sentences.",\n'
-        '  "suggested_adjustments": {\n'
-        '    "revenue_growth": 0.02,   // absolute adjustment, NOT new value\n'
-        '    "fcff_margin": -0.01,\n'
-        '    "terminal_growth": -0.003,\n'
-        '    "wacc": 0.005\n'
-        "  }\n"
-        "}\n\n"
-        "Only include fields you actually want to adjust. Leave others out.\n"
-        "If the thesis contradicts the assumptions, flag that in interpretation."
-    )
-
-    try:
-        response = _ANALYSIS_LLM.invoke(prompt)
-        raw = (response.content or "").strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        analysis = json.loads(raw or "{}")
-    except Exception:
-        logger.warning("Analysis LLM failed for %s — using flag-only critique", ticker)
-        analysis = {
-            "interpretation": f"{severe_count} severe flags detected in {ticker} valuation.",
-            "suggested_adjustments": {},
-        }
-
-    critique.update(analysis)
-
-    # Clamp adjustments to bounds
-    suggested = critique.get("suggested_adjustments") or {}
-    clamped: dict[str, float] = {}
-    for field, delta in suggested.items():
-        bounds = _CRITIQUE_ADJUSTMENT_BOUNDS.get(field)
-        if bounds is None:
-            continue
-        low, high = bounds
-        clamped[field] = max(low, min(high, float(delta)))
-    critique["suggested_adjustments"] = clamped
-    critique["adjustments_clamped"] = clamped != suggested
-
-    emit_step(
-        "analyze_result", "complete", parent_step_id,
-        {
-            "summary_line": f"{severe_count} severe, {warning_count} warnings → {'refine' if should_refine else 'done'}",
-            "severe_count": severe_count,
-            "warning_count": warning_count,
-            "should_refine": should_refine,
-            "stop_reason": critique.get("stop_reason", ""),
-            "interpretation": critique.get("interpretation", ""),
-            "flags": [{"signal": f["signal"], "severity": f["severity"], "value": f.get("value", f.get("value_bps", f.get("value_pct")))} for f in flags],
-        },
-    )
-    return {
-        "critique": critique,
-        "analysis_iteration": iteration + 1,
-        "previous_valuation": {
-            "implied_share_price": valuation.get("implied_share_price"),
-            "enterprise_value": valuation.get("enterprise_value"),
-        },
-    }
-
-
-def refine_assumptions_node(state: DCFState) -> dict:
-    """Apply bounded adjustments from the critique and re-enter valuation."""
-    parent_step_id = state.get("parent_step_id") or "workflow_dcf"
-    emit_step("refine_assumptions", "start", parent_step_id)
-
-    critique = state.get("critique") or {}
-    adjustments = critique.get("suggested_adjustments") or {}
-    assumptions = dict(state.get("assumptions") or {})
-
-    # Apply adjustments
-    changes: list[str] = []
-    for field, delta in adjustments.items():
-        if field in assumptions:
-            old = assumptions[field]
-            assumptions[field] = round(old + delta, 4)
-            changes.append(f"{field}: {old:.4f} → {assumptions[field]:.4f}")
-
-    interpretation = critique.get("interpretation", "No interpretation provided.")
-
-    emit_step(
-        "refine_assumptions", "complete", parent_step_id,
-        {
-            "summary_line": f"Refined: {', '.join(changes) if changes else 'no changes'}",
-        },
-    )
-    return {"assumptions": assumptions}
-
-
-def route_after_analysis(state: DCFState) -> str:
-    """Route to refinement or finalization based on critique."""
-    critique = state.get("critique") or {}
-    should = critique.get("should_refine")
-    dest = "refine_assumptions" if should else "finalize"
-    logger.info("DCF route_after_analysis should_refine=%s → %s", should, dest)
-    return dest
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def summarize_dcf_payload(payload: dict[str, Any]) -> str:
-    """Rich summary for LLM tool-result feedback.
-
-    Surfaces: per-assumption provenance, synthesis insights, evidence refs,
-    confidence, flags, and WACC decomposition. Gives the LLM structured
-    context to write a high-quality report.
-    """
-    if not isinstance(payload, dict):
-        return "DCF workflow finished without payload."
-
-    lines: list[str] = []
-
-    # ── Header ──────────────────────────────────────────────────────────
-    ticker = str(payload.get("ticker") or "?").upper()
-    valuation = payload.get("valuation") or {}
-    implied = valuation.get("implied_share_price")
-    spot = valuation.get("current_price") or 0.0
-    confidence = str(payload.get("confidence_label") or "medium")
-    horizon = payload.get("horizon_years", 5)
-
-    lines.append(f"# DCF Valuation: {ticker}")
-    lines.append(f"Horizon: {horizon} years")
-    if isinstance(implied, (int, float)) and implied:
-        gap = ""
-        if isinstance(spot, (int, float)) and spot > 0:
-            pct = ((implied / spot) - 1) * 100
-            gap = f" (vs spot ${spot:.2f}, {pct:+.1f}%)"
-        lines.append(f"Implied share price: ${implied:.2f}{gap}")
-    lines.append(f"Confidence: **{confidence.upper()}**")
-    lines.append("")
-
-    # ── Thesis ────────────────────────────────────────────────────────
-    thesis = payload.get("thesis") or {}
-    if thesis:
-        lines.append("## Investment Thesis")
-        bull = thesis.get("bull_thesis", "")
-        bear = thesis.get("bear_thesis", "")
-        narrative = thesis.get("narrative", "")
-        drivers = thesis.get("key_drivers") or []
-        if bull:
-            lines.append(f"**Bull case:** {bull}")
-        if bear:
-            lines.append(f"**Bear case:** {bear}")
-        if drivers:
-            lines.append("**Key drivers:**")
-            for d in drivers:
-                direction = d.get("direction", "?")
-                conviction = d.get("conviction", "medium")
-                lines.append(f"  - {d.get('driver', '?')} ({direction}, {conviction} conviction)")
-        if narrative:
-            lines.append(f"**Narrative:** {narrative}")
-        lines.append("")
-
-    # ── Analysis journey (if the critique loop ran) ────────────────────
-    critique = payload.get("critique") or {}
-    if critique:
-        flags = critique.get("flags") or []
-        iteration = critique.get("iteration", 0)
-        stop_reason = critique.get("stop_reason", "")
-
-        lines.append("## Analysis Journey")
-        if flags:
-            lines.append(f"Self-critique after valuation (iteration {iteration}):")
-            for f in flags:
-                sev = f.get("severity", "?").upper()
-                signal = f.get("signal", "?").replace("_", " ")
-                val = f.get("value", f.get("value_bps", f.get("value_pct", "?")))
-                unit = "bps" if "value_bps" in f else ("%" if "value_pct" in f else "")
-                lines.append(f"  [{sev}] {signal}: {val}{unit}")
-            interpretation = critique.get("interpretation", "")
-            if interpretation:
-                lines.append(f"**Interpretation:** {interpretation}")
-            adjustments = critique.get("suggested_adjustments") or {}
-            if adjustments:
-                lines.append("**Adjustments applied:**")
-                for field, delta in adjustments.items():
-                    lines.append(f"  - {field}: {'+' if delta >= 0 else ''}{delta:.4f}")
-        if stop_reason:
-            lines.append(f"**Final:** {stop_reason}")
-        if not flags or not stop_reason:
-            lines.append("No issues found — valuation accepted as-is.")
-        lines.append("")
-
-    # ── Assumptions with provenance ─────────────────────────────────────
-    assumptions = payload.get("assumptions") or {}
-    provenance = payload.get("assumption_provenance") or {}
-    memo = payload.get("assumption_memo") or {}
-
-    if assumptions:
-        lines.append("## Assumptions")
-        lines.append("| Field | Value | Source | Confidence |")
-        lines.append("|-------|-------|--------|------------|")
-        for field in [
-            "base_revenue", "revenue_growth", "fcff_margin",
-            "terminal_growth", "tax_rate", "wacc",
-            "shares_outstanding", "net_debt",
-        ]:
-            val = assumptions.get(field)
-            if val is None:
-                continue
-            prov = provenance.get(field, {}) if isinstance(provenance, dict) else {}
-            source = prov.get("source", "unknown")
-            conf = prov.get("confidence", "?")
-            if isinstance(conf, (int, float)):
-                conf = f"{conf:.0%}"
-            # Format: millions for scale fields, % for rates
-            if field in _TIER_A_FIELDS:
-                val_str = f"${val:,.0f}M"
-            elif field == "shares_outstanding":
-                val_str = f"{val:,.0f}M"
-            else:
-                val_str = f"{val:.2%}"
-            lines.append(f"| {field} | {val_str} | {source} | {conf} |")
-        lines.append("")
-
-    # ── WACC decomposition ──────────────────────────────────────────────
-    wacc_comp = payload.get("wacc_components") or {}
-    if wacc_comp:
-        lines.append("## WACC Decomposition")
-        lines.append(f"Method: {wacc_comp.get('method', 'unknown')}")
-        for key in (
-            "risk_free_rate", "equity_risk_premium", "beta",
-            "cost_of_equity", "pre_tax_cost_of_debt",
-            "after_tax_cost_of_debt", "equity_weight", "debt_weight",
-            "marginal_tax_rate",
-        ):
-            v = wacc_comp.get(key)
-            if v is not None:
-                if isinstance(v, float) and key not in ("beta",):
-                    lines.append(f"  {key}: {v:.2%}")
-                else:
-                    lines.append(f"  {key}: {v}")
-        lines.append("")
-
-    # ── Memo rationale (if available) ───────────────────────────────────
-    proposals = memo.get("proposals") if isinstance(memo, dict) else None
-    evidence_items = payload.get("_evidence_items") or []
-    if proposals:
-        lines.append("## Assumption Rationale")
-        for prop in proposals:
-            field = prop.get("field", "?")
-            rationale = prop.get("rationale", "")
-            conf = prop.get("confidence", 0.5)
-            refs = prop.get("evidence_refs", [])
-            human_refs = _humanize_evidence_refs(refs, evidence_items) if evidence_items else refs
-            ref_str = "; ".join(human_refs[:3]) if human_refs else "none cited"
-            lines.append(f"**{field}** (confidence: {conf:.0%})")
-            lines.append(f"  {rationale}")
-            lines.append(f"  Sources: {ref_str}")
-            lines.append("")
-        overall = memo.get("overall_narrative", "")
-        if overall:
-            lines.append(f"**Narrative:** {overall}")
-            lines.append("")
-        uncertainties = memo.get("key_uncertainties", [])
-        if uncertainties:
-            lines.append("**Key uncertainties:**")
-            for u in uncertainties:
-                lines.append(f"  - {u}")
-            lines.append("")
-
-    # ── Synthesis summary ───────────────────────────────────────────────
-    company_state = payload.get("company_state") or {}
-    if company_state:
-        lines.append("## Company Context")
-        for key, label in [
-            ("growth_outlook", "Growth outlook"),
-            ("margin_trend", "Margin trend"),
-            ("margin_narrative", "Margin narrative"),
-            ("competitive_position", "Competitive position"),
-        ]:
-            val = company_state.get(key)
-            if val:
-                lines.append(f"**{label}:** {val}")
-        risks = company_state.get("key_risks", [])
-        if risks:
-            lines.append("**Key risks:**")
-            for r in risks[:5]:
-                lines.append(f"  - {r}")
-        conflicts = company_state.get("conflicts", [])
-        if conflicts:
-            lines.append("**Source conflicts:**")
-            for c in conflicts:
-                lines.append(f"  - {c}")
-        lines.append("")
-
-    # ── Flags ───────────────────────────────────────────────────────────
-    flags = (
-        list(payload.get("assumption_flags") or [])
-        + list(payload.get("valuation_flags") or [])
-    )
-    if flags:
-        lines.append("## Quality Flags")
-        for flag in flags:
-            sev = flag.get("severity", "?").upper()
-            msg = flag.get("message", "")
-            lines.append(f"  [{sev}] {msg}")
-        lines.append("")
-
-    # ── Valuation detail ────────────────────────────────────────────────
-    if valuation:
-        lines.append("## Valuation Detail")
-        for key, label in [
-            ("pv_cash_flows", "PV of explicit cash flows"),
-            ("terminal_value", "Terminal value (undiscounted)"),
-            ("terminal_pv", "Terminal value (discounted to present)"),
-            ("enterprise_value", "Enterprise value (= PV + discounted TV)"),
-            ("equity_value", "Equity value (= EV − net debt)"),
-        ]:
-            v = valuation.get(key)
-            if isinstance(v, (int, float)):
-                lines.append(f"  {label}: ${v:,.0f}M")
-        # Reconciliation check
-        pv = valuation.get("pv_cash_flows", 0)
-        tv_pv = valuation.get("terminal_pv", 0)
-        ev = valuation.get("enterprise_value", 0)
-        implied_ev = pv + tv_pv
-        if abs(ev - implied_ev) > 1:
-            lines.append(f"  ⚠ EV reconciliation: PV (${pv:,.0f}M) + discounted TV (${tv_pv:,.0f}M) = ${implied_ev:,.0f}M ≠ stated EV (${ev:,.0f}M)")
-        else:
-            lines.append(f"  ✓ EV = ${pv:,.0f}M + ${tv_pv:,.0f}M = ${ev:,.0f}M")
-        lines.append("")
-
-    # ── Sensitivity highlights ──────────────────────────────────────────
-    sensitivity = payload.get("sensitivity_table") or []
-    if sensitivity:
-        prices = [r.get("implied_share_price", 0) for r in sensitivity if r.get("implied_share_price")]
-        if prices:
-            lines.append(f"## Sensitivity Range")
-            lines.append(f"  Implied price range: ${min(prices):.2f} – ${max(prices):.2f}")
-            lines.append(f"  Across WACC ±1% and terminal growth ±0.5%")
-            lines.append("")
-
-    # ── Consistency checks ─────────────────────────────────────────────
-    checks = _run_consistency_checks(payload)
-    if checks:
-        lines.append("## Consistency Checks")
-        for check in checks:
-            status = "✓" if check["ok"] else "⚠"
-            lines.append(f"  {status} {check['label']}: {check['detail']}")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def _run_consistency_checks(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Cross-validate the DCF output for internal consistency."""
-    checks: list[dict[str, Any]] = []
-    val = payload.get("valuation") or {}
-    features = payload.get("features") or {}
-    wacc_comp = payload.get("wacc_components") or {}
-    memo = payload.get("assumption_memo") or {}
-
-    # 1. EV reconciliation
-    pv = val.get("pv_cash_flows", 0) or 0
-    tv_pv = val.get("terminal_pv", 0) or 0
-    ev = val.get("enterprise_value", 0) or 0
-    if abs((pv + tv_pv) - ev) > 0.01 * max(ev, 1):
-        checks.append({"ok": False, "label": "EV reconciliation",
-                        "detail": f"PV (${pv:,.0f}M) + TV_discounted (${tv_pv:,.0f}M) ≠ EV (${ev:,.0f}M)"})
-    else:
-        checks.append({"ok": True, "label": "EV reconciliation",
-                        "detail": f"${pv:,.0f}M + ${tv_pv:,.0f}M = ${ev:,.0f}M"})
-
-    # 2. Memo vs features WACC consistency
-    memo_wacc = (payload.get("assumptions") or {}).get("wacc")
-    capm_beta = features.get("beta")
-    capm_erp = wacc_comp.get("equity_risk_premium", 0.055)
-    capm_rf = wacc_comp.get("risk_free_rate", 0.045)
-    if memo_wacc and capm_beta:
-        implied_capm_wacc = capm_rf + float(capm_beta) * capm_erp
-        wacc_method = wacc_comp.get("method", "?")
-        if wacc_method == "capm" and abs(memo_wacc - implied_capm_wacc) > 0.02:
-            checks.append({"ok": False, "label": "WACC vs CAPM",
-                           "detail": f"WACC={memo_wacc:.2%} vs CAPM-implied Rf+β·ERP={implied_capm_wacc:.2%} (gap > 2%)"})
-        else:
-            checks.append({"ok": True, "label": "WACC vs CAPM",
-                           "detail": f"WACC={memo_wacc:.2%} via {wacc_method}, β={capm_beta}"})
-
-    # 3. Terminal growth vs risk-free rate
-    tg = (payload.get("assumptions") or {}).get("terminal_growth")
-    rf = wacc_comp.get("risk_free_rate", 0.045)
-    if tg is not None and rf:
-        if tg > rf + 0.005:
-            checks.append({"ok": False, "label": "Terminal growth vs Rf",
-                           "detail": f"TGR={tg:.2%} exceeds Rf={rf:.2%} by >50bps — implies company outgrows economy forever"})
-        else:
-            checks.append({"ok": True, "label": "Terminal growth vs Rf",
-                           "detail": f"TGR={tg:.2%} ≤ Rf={rf:.2%}+buffer ✓"})
-
-    # 4. Evidence coverage
-    proposals = memo.get("proposals") if isinstance(memo, dict) else None
-    if proposals:
-        total_refs = sum(len(p.get("evidence_refs", [])) for p in proposals)
-        filing_refs = 0
-        evidence_items = payload.get("_evidence_items") or []
-        by_id = {item.get("evidence_id", ""): item for item in evidence_items}
-        for p in proposals:
-            for ref in p.get("evidence_refs", []):
-                if by_id.get(ref, {}).get("source_tier") == "filing":
-                    filing_refs += 1
-        if total_refs == 0:
-            checks.append({"ok": False, "label": "Evidence coverage",
-                           "detail": "No evidence refs cited in memo proposals"})
-        elif filing_refs == 0:
-            checks.append({"ok": False, "label": "Evidence coverage",
-                           "detail": f"{total_refs} refs but 0 from SEC filings — assumptions may lack grounding"})
-        else:
-            checks.append({"ok": True, "label": "Evidence coverage",
-                           "detail": f"{total_refs} refs, {filing_refs} from SEC filings ✓"})
-
-    return checks
-
-
-def _humanize_evidence_refs(
-    refs: list[str],
-    evidence_items: list[dict[str, Any]],
-) -> list[str]:
-    """Map opaque evidence_ids to human-readable labels."""
-    by_id: dict[str, dict[str, Any]] = {
-        item.get("evidence_id", ""): item for item in evidence_items
-    }
-    result: list[str] = []
-    for ref in refs:
-        item = by_id.get(ref)
-        if not item:
-            result.append(ref)
-            continue
-        kind = item.get("kind", "?")
-        if kind == "filing_excerpt":
-            result.append(f"{item.get('filing_type','')} {item.get('section','')} ({item.get('as_of','')})")
-        elif kind == "structured_fundamental":
-            result.append(f"{item.get('source','')}: {item.get('field','')}={item.get('value','?')}")
-        elif kind == "web_excerpt":
-            result.append(f"web: {item.get('title','?')[:60]}")
-        elif kind == "document_excerpt":
-            result.append(f"doc: {item.get('filename','?')} p.{item.get('page','?')}")
-        elif kind == "market_data":
-            result.append(f"market: {item.get('field','?')}={item.get('value','?')}")
-        else:
-            result.append(f"{kind}: {ref[:40]}")
-    return result
-
 
 def _build_initial_state(
     ticker: str,
@@ -831,10 +124,28 @@ def _build_initial_state(
         "assumption_memo": None,
         "confidence_breakdown": None,
         "wacc_sanity": None,
+        "implied_growth": None,
+        "implied_margin": None,
         "thesis": None,
         "analysis_iteration": 0,
         "critique": None,
         "previous_valuation": None,
+        "scenarios": [],
+        "scenario_results": [],
+        "assumption_history": [],
+        "initial_assumptions": {},
+        "kg_cache_flags": {},
+        "kg_fundamentals_hint": {},
+        "kg_lifecycle_hint": {},
+        "kg_anchored_corpus_meta": {},
+        "kg_cache_results": [],
+        "divergences": [],
+        "analysis_positions": [],
+        "model_validity": "valid",
+        "invalidation_reason": "",
+        "reconciliation_status": "aligned",
+        "reconciliation_note": "",
+        "effective_confidence": None,
     }
 
 
@@ -851,6 +162,124 @@ def _build_memo_proposals(state_or_payload: dict) -> dict:
     return result
 
 
+_ALL_ASSUMPTION_FIELDS = frozenset({
+    "base_revenue", "revenue_growth", "fcff_margin", "wacc",
+    "terminal_growth", "net_debt", "shares_outstanding", "tax_rate",
+})
+
+
+# ---------------------------------------------------------------------------
+# Graph definition — main workflow
+# ---------------------------------------------------------------------------
+
+graph = StateGraph(DCFState)
+
+graph.add_node("normalize_input", normalize_input_node)
+graph.add_node("cache_check", cache_check_node)
+graph.add_node("assemble_evidence", assemble_evidence_node)
+graph.add_node("semantic_synthesis", semantic_synthesis_node)
+graph.add_node("formulate_thesis", formulate_thesis_node)
+graph.add_node("propose_assumptions", propose_assumptions_node)
+graph.add_node("scenario_generator", scenario_generator_node)
+graph.add_node("review_assumptions", review_assumptions_node)
+graph.add_node("scenario_runner", scenario_runner_node)
+graph.add_node("project_cashflows", project_cashflows_node)
+graph.add_node("compute_valuation", compute_valuation_node)
+graph.add_node("compute_market_signals", compute_market_signals_node)
+graph.add_node("sensitivity", sensitivity_node)
+graph.add_node("review_subgraph", run_review_subgraph)
+graph.add_node("detect_divergences", detect_divergences_node)
+graph.add_node("analysis", analysis_node)
+graph.add_node("convergence_gate", convergence_gate_node)
+graph.add_node("finalize", finalize_node)
+
+graph.add_edge(START, "normalize_input")
+graph.add_edge("normalize_input", "cache_check")
+graph.add_conditional_edges(
+    "cache_check",
+    route_after_cache_check,
+    {"assemble_evidence": "assemble_evidence", "formulate_thesis": "formulate_thesis"},
+)
+graph.add_edge("assemble_evidence", "semantic_synthesis")
+graph.add_edge("semantic_synthesis", "formulate_thesis")
+graph.add_edge("formulate_thesis", "propose_assumptions")
+graph.add_edge("propose_assumptions", "scenario_generator")
+graph.add_edge("scenario_generator", "review_assumptions")
+graph.add_conditional_edges(
+    "review_assumptions",
+    route_after_assumptions,
+    {"scenario_runner": "scenario_runner", END: END},
+)
+graph.add_edge("scenario_runner", "project_cashflows")
+graph.add_edge("project_cashflows", "compute_valuation")
+graph.add_edge("compute_valuation", "compute_market_signals")
+graph.add_edge("compute_market_signals", "sensitivity")
+graph.add_edge("sensitivity", "review_subgraph")
+graph.add_edge("review_subgraph", "detect_divergences")
+graph.add_edge("detect_divergences", "analysis")
+graph.add_edge("analysis", "convergence_gate")
+graph.add_conditional_edges(
+    "convergence_gate",
+    route_after_convergence_gate,
+    {"scenario_runner": "scenario_runner", "finalize": "finalize"},
+)
+graph.add_edge("finalize", END)
+
+dcf_workflow_app = graph.compile(checkpointer=MemorySaver())
+
+# Valuation-only graph — skips evidence/synthesis/memo (fast path after HITL approval).
+_val_graph = StateGraph(DCFState)
+_val_graph.add_node("normalize_input", normalize_input_node)
+_val_graph.add_node("collect_market_data", collect_market_data_node)
+_val_graph.add_node("project_cashflows", project_cashflows_node)
+_val_graph.add_node("compute_valuation", compute_valuation_node)
+_val_graph.add_node("compute_market_signals", compute_market_signals_node)
+_val_graph.add_node("sensitivity", sensitivity_node)
+_val_graph.add_node("review_subgraph", run_review_subgraph)
+_val_graph.add_node("detect_divergences", detect_divergences_node)
+_val_graph.add_node("analysis", analysis_node)
+_val_graph.add_node("convergence_gate", convergence_gate_node)
+_val_graph.add_node("finalize", finalize_node)
+_val_graph.add_edge(START, "normalize_input")
+_val_graph.add_edge("normalize_input", "collect_market_data")
+_val_graph.add_edge("collect_market_data", "project_cashflows")
+_val_graph.add_edge("project_cashflows", "compute_valuation")
+_val_graph.add_edge("compute_valuation", "compute_market_signals")
+_val_graph.add_edge("compute_market_signals", "sensitivity")
+_val_graph.add_edge("sensitivity", "review_subgraph")
+_val_graph.add_edge("review_subgraph", "detect_divergences")
+_val_graph.add_edge("detect_divergences", "analysis")
+_val_graph.add_edge("analysis", "convergence_gate")
+_val_graph.add_conditional_edges(
+    "convergence_gate",
+    route_after_convergence_gate_val,
+    {"project_cashflows": "project_cashflows", "finalize": "finalize"},
+)
+_val_graph.add_edge("finalize", END)
+dcf_valuation_app = _val_graph.compile()
+
+# Scenario valuation graph — runs per scenario, no analysis loop.
+_scenario_graph = StateGraph(DCFState)
+_scenario_graph.add_node("normalize_input", normalize_input_node)
+_scenario_graph.add_node("collect_market_data", collect_market_data_node)
+_scenario_graph.add_node("project_cashflows", project_cashflows_node)
+_scenario_graph.add_node("compute_valuation", compute_valuation_node)
+_scenario_graph.add_node("compute_market_signals", compute_market_signals_node)
+_scenario_graph.add_node("sensitivity", sensitivity_node)
+_scenario_graph.add_edge(START, "normalize_input")
+_scenario_graph.add_edge("normalize_input", "collect_market_data")
+_scenario_graph.add_edge("collect_market_data", "project_cashflows")
+_scenario_graph.add_edge("project_cashflows", "compute_valuation")
+_scenario_graph.add_edge("compute_valuation", "compute_market_signals")
+_scenario_graph.add_edge("compute_market_signals", "sensitivity")
+_scenario_graph.add_edge("sensitivity", END)
+dcf_scenario_val_app = _scenario_graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# Public sync entrypoint
+# ---------------------------------------------------------------------------
+
 def run_dcf_workflow_sync(
     *,
     ticker: str,
@@ -865,16 +294,12 @@ def run_dcf_workflow_sync(
 
     When ``assumption_review_mode=True``, the workflow runs up to the
     assumption review gate, then returns a structured HITL payload
-    containing the proposed assumptions and their provenance. The caller
-    (agent tool) can surface this to the user for review. After the user
-    approves/edits, re-call with ``assumption_overrides`` and
-    ``assumption_review_mode=False`` to complete the valuation.
+    containing the proposed assumptions and their provenance.
 
     When ``assumption_review_mode=False``, auto-approves and runs to
     completion, returning the full dcf_output.json payload.
     """
     overrides = assumption_overrides or {}
-    # Fast path: all assumptions already approved — skip evidence/synthesis/memo.
     use_fast_path = (
         not assumption_review_mode
         and _ALL_ASSUMPTION_FIELDS.issubset(overrides.keys())
@@ -893,14 +318,33 @@ def run_dcf_workflow_sync(
 
     try:
         if use_fast_path:
-            # Pre-populate state with approved assumptions so valuation nodes
-            # can run without evidence assembly or LLM memo.
             initial_state["assumptions"] = {k: float(v) for k, v in overrides.items()}
             initial_state["assumptions_approved"] = True
-            initial_state["assumption_provenance"] = {
-                k: {"source": "user_approved", "confidence": 1.0}
-                for k in overrides
-            }
+            hitl = get_dcf_hitl_payload()
+            if hitl:
+                original_assumptions = hitl.get("assumptions") or {}
+                provenance = merge_hitl_provenance(
+                    hitl.get("assumption_provenance") or {},
+                    overrides,
+                    original_assumptions,
+                )
+                initial_state["assumption_provenance"] = provenance
+                apply_hitl_snapshot(initial_state, hitl)
+                if not initial_state.get("assumption_memo"):
+                    reconstructed = reconstruct_memo_from_provenance(
+                        provenance, initial_state["assumptions"],
+                    )
+                    if reconstructed:
+                        initial_state["assumption_memo"] = reconstructed
+            else:
+                initial_state["assumption_provenance"] = {
+                    k: {
+                        "source": "user_provided",
+                        "evidence": "User-provided assumption value.",
+                        "confidence": 1.0,
+                    }
+                    for k in overrides
+                }
             logger.info(
                 "DCF fast path ticker=%s assumptions=%s",
                 ticker, json.dumps(initial_state["assumptions"], ensure_ascii=False),
@@ -924,14 +368,11 @@ def run_dcf_workflow_sync(
             json.dumps(assumptions, ensure_ascii=False),
         )
         memo_proposals = _build_memo_proposals(interrupt_payload)
+        snapshot = build_hitl_snapshot(interrupt_payload)
         return {
             "__dcf_hitl__": True,
-            "ticker": ticker,
-            "horizon_years": horizon_years,
-            "assumptions": assumptions,
-            "assumption_provenance": provenance,
+            **snapshot,
             "memo_proposals": memo_proposals,
-            "evidence_items": interrupt_payload.get("evidence_items", []),
             "message": (
                 "DCF assumptions are ready for review. "
                 "Present these to the user for approval or edits. "
@@ -943,27 +384,20 @@ def run_dcf_workflow_sync(
     except Exception:
         raise
 
-    # Completed run — read the output file
     result_path = result.get("result_path")
     if not result_path:
         # Graph was interrupted (checkpointer swallowed GraphInterrupt).
-        # The review node called interrupt() but invoke() returned partial state.
         if result.get("assumptions"):
             assumptions = result.get("assumptions") or {}
             provenance = result.get("assumption_provenance") or {}
             if assumption_review_mode:
-                logger.info(
-                    "DCF interrupted for review ticker=%s", ticker,
-                )
+                logger.info("DCF interrupted for review ticker=%s", ticker)
                 memo_proposals = _build_memo_proposals(result)
+                snapshot = build_hitl_snapshot(result)
                 return {
                     "__dcf_hitl__": True,
-                    "ticker": ticker,
-                    "horizon_years": horizon_years,
-                    "assumptions": assumptions,
-                    "assumption_provenance": provenance,
+                    **snapshot,
                     "memo_proposals": memo_proposals,
-                    "evidence_items": [],
                     "message": "DCF assumptions ready for review.",
                 }
             # review_mode off but no valuation — shouldn't happen; try to continue
@@ -976,84 +410,3 @@ def run_dcf_workflow_sync(
     if not out_path.exists():
         raise FileNotFoundError(f"DCF workflow result not found: {result_path}")
     return json.loads(out_path.read_text(encoding="utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# Graph definition
-# ---------------------------------------------------------------------------
-
-graph = StateGraph(DCFState)
-
-graph.add_node("normalize_input", normalize_input_node)
-graph.add_node("assemble_evidence", assemble_evidence_node)
-graph.add_node("semantic_synthesis", semantic_synthesis_node)
-graph.add_node("formulate_thesis", formulate_thesis_node)
-graph.add_node("propose_assumptions", propose_assumptions_node)
-graph.add_node("review_assumptions", review_assumptions_node)
-graph.add_node("collect_market_data", collect_market_data_node)
-graph.add_node("project_cashflows", project_cashflows_node)
-graph.add_node("compute_valuation", compute_valuation_node)
-graph.add_node("compute_implied_wacc", compute_implied_wacc_node)
-graph.add_node("sensitivity", sensitivity_node)
-graph.add_node("analyze_result", analyze_result_node)
-graph.add_node("refine_assumptions", refine_assumptions_node)
-graph.add_node("finalize", finalize_node)
-
-graph.add_edge(START, "normalize_input")
-graph.add_edge("normalize_input", "assemble_evidence")
-graph.add_edge("assemble_evidence", "semantic_synthesis")
-graph.add_edge("semantic_synthesis", "formulate_thesis")
-graph.add_edge("formulate_thesis", "propose_assumptions")
-graph.add_edge("propose_assumptions", "review_assumptions")
-graph.add_conditional_edges(
-    "review_assumptions",
-    route_after_assumptions,
-    {"collect_market_data": "collect_market_data", END: END},
-)
-graph.add_edge("collect_market_data", "project_cashflows")
-graph.add_edge("project_cashflows", "compute_valuation")
-graph.add_edge("compute_valuation", "compute_implied_wacc")
-graph.add_edge("compute_implied_wacc", "sensitivity")
-graph.add_edge("sensitivity", "analyze_result")
-graph.add_conditional_edges(
-    "analyze_result",
-    route_after_analysis,
-    {"refine_assumptions": "refine_assumptions", "finalize": "finalize"},
-)
-graph.add_edge("refine_assumptions", "project_cashflows")  # re-enter valuation
-graph.add_edge("finalize", END)
-
-dcf_workflow_app = graph.compile(checkpointer=MemorySaver())
-
-# Valuation-only graph — skips evidence/synthesis/memo.
-# Used when all assumptions are provided directly (fast path after HITL approval).
-_val_graph = StateGraph(DCFState)
-_val_graph.add_node("normalize_input", normalize_input_node)
-_val_graph.add_node("collect_market_data", collect_market_data_node)
-_val_graph.add_node("project_cashflows", project_cashflows_node)
-_val_graph.add_node("compute_valuation", compute_valuation_node)
-_val_graph.add_node("compute_implied_wacc", compute_implied_wacc_node)
-_val_graph.add_node("sensitivity", sensitivity_node)
-_val_graph.add_node("analyze_result", analyze_result_node)
-_val_graph.add_node("refine_assumptions", refine_assumptions_node)
-_val_graph.add_node("finalize", finalize_node)
-_val_graph.add_edge(START, "normalize_input")
-_val_graph.add_edge("normalize_input", "collect_market_data")
-_val_graph.add_edge("collect_market_data", "project_cashflows")
-_val_graph.add_edge("project_cashflows", "compute_valuation")
-_val_graph.add_edge("compute_valuation", "compute_implied_wacc")
-_val_graph.add_edge("compute_implied_wacc", "sensitivity")
-_val_graph.add_edge("sensitivity", "analyze_result")
-_val_graph.add_conditional_edges(
-    "analyze_result",
-    route_after_analysis,
-    {"refine_assumptions": "refine_assumptions", "finalize": "finalize"},
-)
-_val_graph.add_edge("refine_assumptions", "project_cashflows")  # re-enter valuation
-_val_graph.add_edge("finalize", END)
-dcf_valuation_app = _val_graph.compile()
-
-_ALL_ASSUMPTION_FIELDS = frozenset({
-    "base_revenue", "revenue_growth", "fcff_margin", "wacc",
-    "terminal_growth", "net_debt", "shares_outstanding", "tax_rate",
-})

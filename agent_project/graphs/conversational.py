@@ -1,6 +1,7 @@
 """Conversational subgraph — ReAct agent with tool access, no HITL."""
 
 import json
+import logging
 import os
 
 import dotenv
@@ -17,12 +18,13 @@ from tools import (
     search_web,
 )
 import agent_log
-from utils import console, emit_ui_event, get_run_dir, track_tool
+from utils import console, emit_ui_event, get_run_dir, list_artifact_paths, set_dcf_hitl_payload, track_tool
+
+logger = logging.getLogger(__name__)
 
 dotenv.load_dotenv()
 
-# Use the same model as research; chat is lighter (fewer rounds) so cost stays low
-llm = ChatOpenAI(model="gpt-5-nano", api_key=os.getenv("OPENAI_API_KEY"), timeout=60)
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"), timeout=60)
 
 MAX_CHAT_ROUNDS = 4
 
@@ -63,8 +65,8 @@ _CHAT_SYSTEM = (
     "This presents an interactive assumption review card to the user before computing valuation. "
     "After the user reviews and approves (or edits) the assumptions, call again with assumption_review_mode=False "
     "and any assumption_overrides the user specified. "
-    "The result includes full assumption provenance, WACC decomposition, confidence label, and quality flags. "
-    "When confidence is medium or low, mention flagged assumptions and any implied-vs-spot gap.\n\n"
+    "The tool returns a full markdown report — present it **verbatim** to the user (do NOT rewrite as a summary). "
+    "Use only [n] citations from the report's ## References section; never cite 'tool results'.\n\n"
     "## Behaviour\n"
     "- Use tools when the question requires current data or computation — don't guess.\n"
     "- For pure conceptual questions (e.g. 'what is DCF?'), answer directly without tools.\n"
@@ -91,6 +93,36 @@ _CHAT_SYSTEM = (
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
+
+
+def _restore_hitl_from_approval(messages: list) -> None:
+    """Restore DCF HITL snapshot when user approves assumptions via [DCF_APPROVED]."""
+    for message in reversed(messages):
+        if not isinstance(message, HumanMessage):
+            continue
+        content = str(message.content or "")
+        if not content.startswith("[DCF_APPROVED]:"):
+            break
+        try:
+            payload = json.loads(content.split(":", 1)[1])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            break
+        snapshot = payload.get("hitl_snapshot")
+        if isinstance(snapshot, dict) and snapshot.get("assumptions"):
+            set_dcf_hitl_payload(snapshot)
+        break
+
+
+def _extract_dcf_report(history: list) -> str | None:
+    """If the last completed run_dcf_workflow produced a report, return it verbatim."""
+    from graphs.workflows.dcf.payload import extract_dcf_report_from_tool_pointer  # noqa: PLC0415
+
+    for message in reversed(history):
+        if isinstance(message, ToolMessage):
+            report = extract_dcf_report_from_tool_pointer(str(message.content))
+            if report:
+                return report
+    return None
 
 
 def _normalize_args(args: dict) -> dict:
@@ -149,11 +181,42 @@ def _fallback_answer_from_tool_results(history: list) -> str:
     return ""
 
 
+def _is_quota_error(exc: Exception) -> bool:
+    """Detect rate-limit / quota exhaustion via error message."""
+    msg = str(exc).lower()
+    return "insufficient_quota" in msg or "rate limit" in msg or "429" in msg or "quota" in msg
+
+
+_QUOTA_FALLBACK_MSG = (
+    "⚠️ API quota exhausted (HTTP 429 insufficient_quota). "
+    "The DCF workflow completed any deterministic steps and persisted what it could, "
+    "but I can't synthesize a final answer until the API key has credits again. "
+    "Refill your DeepSeek credits at https://platform.deepseek.com or set a different DEEPSEEK_API_KEY."
+)
+
+
 def chat_node(state: dict) -> dict:
-    """ReAct loop: reason → optional tool calls → final answer."""
+    """ReAct loop: reason → optional tool calls → final answer.
+
+    Wrapped end-to-end in a quota guard so OpenAI 429 / insufficient_quota
+    failures degrade to a user-visible message instead of crashing the graph.
+    Deterministic work already done (DCF outputs, KG writes) is preserved.
+    """
+    try:
+        return _chat_node_inner(state)
+    except Exception as exc:  # noqa: BLE001
+        if _is_quota_error(exc):
+            logger.warning("chat_node: OpenAI quota exhausted, emitting fallback message")
+            emit_ui_event({"type": "chat_complete", "content": _QUOTA_FALLBACK_MSG})
+            return {"messages": [AIMessage(content=_QUOTA_FALLBACK_MSG)]}
+        raise
+
+
+def _chat_node_inner(state: dict) -> dict:
     messages = state.get("messages", [])
     session_memory = state.get("session_memory") or ""
     _session_ctx.set(state.get("session_id") or "")
+    _restore_hitl_from_approval(messages)
 
     system_content = _CHAT_SYSTEM
     if session_memory:
@@ -237,6 +300,9 @@ def chat_node(state: dict) -> dict:
         # so the user's /dcf-decision response can stream valuation events back.
         agent_log.chat_hitl(_hitl_ticker)
         return {"messages": [AIMessage(content="DCF assumptions ready for review.")]}
+    dcf_report = _extract_dcf_report(history)
+    if dcf_report:
+        final_text = dcf_report
     elif used_tools:
         history.append(HumanMessage(content=(
             "Now write the final answer from the tool results above. "
@@ -256,6 +322,11 @@ def chat_node(state: dict) -> dict:
         final_text = "I could not generate a final answer from the tool results. Check the backend log at agent_project/runs/server.log."
 
     agent_log.chat_done(final_text, _chat_t)
-    emit_ui_event({"type": "chat_complete", "content": final_text})
+    complete_event: dict = {"type": "chat_complete", "content": final_text}
+    if dcf_report or final_text.startswith("# DCF Valuation:"):
+        artifact_paths = list_artifact_paths()
+        if artifact_paths:
+            complete_event["artifact_paths"] = artifact_paths
+    emit_ui_event(complete_event)
 
     return {"messages": [AIMessage(content=final_text)]}

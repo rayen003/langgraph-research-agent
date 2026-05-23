@@ -10,6 +10,7 @@ export default defineConfig({
       '/artifacts': 'http://localhost:8080',
       '/documents': 'http://localhost:8080',
       '/health': 'http://localhost:8080',
+      '/kg': 'http://localhost:8080',
     },
   },
 })

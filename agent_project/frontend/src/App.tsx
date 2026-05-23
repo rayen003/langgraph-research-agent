@@ -8,6 +8,8 @@ import { MessageThread } from './components/MessageThread'
 import { ExecutionSidebar } from './components/ExecutionSidebar'
 import { DocumentPreview } from './components/DocumentPreview'
 import { JobsPanel } from './components/JobsPanel'
+import { KnowledgePanel } from './components/KnowledgePanel'
+import { RerunToast, type RerunToastState } from './components/RerunToast'
 import type { JobSummary, Mode } from './types'
 
 let _msgCounter = 0
@@ -15,11 +17,13 @@ const nextMsgId = () => `m_${Date.now()}_${++_msgCounter}`
 
 export default function App() {
   const { state, startRun, approve, reject, reset } = useAgentRun()
-  const { sessions, activeSession, newSession, selectSession, deleteSession, addMessage } = useSessionManager()
+  const { sessions, activeSession, newSession, selectSession, deleteSession, addMessage, updateChatThreadId } = useSessionManager()
   const { researchJobs, runningCount } = useJobs(true)
   const { docs, upload, remove: removeDoc } = useDocuments(activeSession?.id ?? '')
   const [mode, setMode] = useState<Mode>('auto')
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null)
+  const [kgPanelOpen, setKgPanelOpen] = useState(false)
+  const [rerunToast, setRerunToast] = useState<RerunToastState | null>(null)
 
   // Auto-clear selection when doc disappears or session changes
   useEffect(() => {
@@ -29,17 +33,36 @@ export default function App() {
 
   // Track which thread_ids have already been committed to a session
   const committedRef = useRef<Set<string>>(new Set())
+  // Per-run target session override. Set when a rerun fires against a session
+  // that isn't currently active (e.g. "new chat" target from KG modal). The
+  // commit hook below reads this to route the assistant message to the
+  // intended session rather than the (potentially-stale) activeSession.
+  const runTargetSessionIdRef = useRef<string | null>(null)
 
-  // When a run completes, commit its output to the active session and reset the run
+  // When a run completes, commit its output to the target session and reset the run
   useEffect(() => {
     if (state.status !== 'complete' || !state.thread_id) return
     if (committedRef.current.has(state.thread_id)) return
     committedRef.current.add(state.thread_id)
 
-    if (!activeSession) return
+    const targetSessionId = runTargetSessionIdRef.current ?? activeSession?.id
+    if (!targetSessionId) return
+    const targetSession = sessions.find(s => s.id === targetSessionId) ?? activeSession
+    if (!targetSession) return
+
+    // Scan workflow activity for DCF validity. The convergence_gate writes
+    // model_validity into the terminal workflow activity's meta; we capture
+    // it here so the persisted message can render a degraded banner.
+    const workflowEntry = state.activity.find(
+      a => a.kind === 'workflow' && a.meta && typeof a.meta === 'object',
+    )
+    const wfMeta = (workflowEntry?.meta ?? {}) as Record<string, unknown>
+    const validity = (wfMeta.model_validity as 'valid' | 'invalid' | 'adjusting' | undefined)
+    const invalidationReason = typeof wfMeta.invalidation_reason === 'string'
+      ? wfMeta.invalidation_reason : undefined
 
     if (state.report) {
-      addMessage(activeSession.id, {
+      addMessage(targetSession.id, {
         id: nextMsgId(),
         type: 'research_report',
         content: state.report,
@@ -47,27 +70,59 @@ export default function App() {
         artifactPaths: state.artifact_paths,
         researchSteps: state.steps.length ? state.steps : undefined,
         activity: state.activity.length ? state.activity : undefined,
+        validity,
+        invalidationReason,
       })
     } else {
       const lastAssistant = [...state.chat_messages].reverse().find(m => m.role === 'assistant')
       if (lastAssistant?.content) {
-        addMessage(activeSession.id, {
+        addMessage(targetSession.id, {
           id: nextMsgId(),
           type: 'chat_response',
           content: lastAssistant.content,
+          threadId: state.thread_id,
+          artifactPaths: state.artifact_paths.length ? state.artifact_paths : undefined,
           activity: state.activity.length ? state.activity : undefined,
+          validity,
+          invalidationReason,
         })
       }
+      // Sync session's chatThreadId to the actual LangGraph thread used so
+      // subsequent turns (including auto-mode) continue the same checkpoint.
+      if (state.thread_id && state.thread_id !== targetSession.chatThreadId) {
+        updateChatThreadId(targetSession.id, state.thread_id)
+      }
     }
+
+    // Mark the toast complete (if any) before clearing the target ref so the
+    // toast knows which thread completed.
+    setRerunToast(prev => prev && prev.threadId === state.thread_id
+      ? { ...prev, status: 'complete' } : prev)
+    runTargetSessionIdRef.current = null
 
     // Small delay so the final token renders before we flip back to idle
     const tid = setTimeout(reset, 150)
     return () => clearTimeout(tid)
   }, [state.status, state.thread_id]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Surface backend errors on the rerun toast too
+  useEffect(() => {
+    if (state.status !== 'error' || !state.thread_id) return
+    setRerunToast(prev => prev && prev.threadId === state.thread_id
+      ? { ...prev, status: 'error', error: state.error ?? 'error' } : prev)
+  }, [state.status, state.thread_id, state.error])
+
   const handleSubmit = useCallback(
     (query: string, selectedMode: Mode) => {
       if (!activeSession) return
+
+      // New turn → allow a fresh commit even on a reused thread_id. Without
+      // this, the second+ message in a chat thread (same thread_id, memory
+      // continuity) hits the committedRef guard from the first run and never
+      // gets its assistant response added to the session.
+      if (!query.startsWith('[DCF_APPROVED]')) {
+        committedRef.current.clear()
+      }
 
       // Add user message to the active session (skip internal approval triggers)
       if (!query.startsWith('[DCF_APPROVED]')) {
@@ -112,11 +167,13 @@ export default function App() {
   const showExecutionPanel = isRunActive
 
   const selectedDoc = docs.find(d => d.doc_id === selectedDocId) ?? null
-  // Document preview takes priority over execution sidebar when both could show
+  // Priority: doc preview > execution sidebar.  KG now opens as a full-screen
+  // modal (rendered below at z-50) so it doesn't compete for sidebar space.
   const rightPanel: 'doc' | 'execution' | null =
     selectedDoc ? 'doc' : showExecutionPanel ? 'execution' : null
   const rightPanelOpen = rightPanel !== null
-  const rightPanelWidth = rightPanel === 'doc' ? 520 : 360
+  const rightPanelWidth =
+    rightPanel === 'doc' ? 520 : 360
 
   return (
     <div className="h-screen bg-[#0a0a0a] text-zinc-100 flex overflow-hidden">
@@ -177,6 +234,77 @@ export default function App() {
         runningCount={runningCount}
         onSelectJob={handleSelectJob}
       />
+
+      {/* ── KB toggle (floating, bottom-right) ─────────────────── */}
+      <button
+        onClick={() => setKgPanelOpen(o => !o)}
+        className={`fixed bottom-4 right-4 z-40 px-3 py-2 rounded-full text-[12px] border shadow-lg transition ${
+          kgPanelOpen
+            ? 'bg-teal-500/20 text-teal-300 border-teal-500/40 hover:bg-teal-500/30'
+            : 'bg-zinc-900 text-zinc-400 border-zinc-700 hover:bg-zinc-800 hover:text-zinc-200'
+        }`}
+        title="Toggle Knowledge Graph"
+      >
+        🧠 {kgPanelOpen ? 'Close KB' : 'Knowledge Base'}
+      </button>
+
+      {/* ── KB full-screen modal ──────────────────────────────── */}
+      {kgPanelOpen && (
+        <KnowledgePanel
+          sessionId={activeSession?.id ?? null}
+          onClose={() => setKgPanelOpen(false)}
+          activeSessionTitle={activeSession?.title ?? '(unnamed)'}
+          activeChatThreadId={activeSession?.chatThreadId}
+          onCreateNewSession={() => {
+            // Do NOT auto-activate. KG stays attached to the session you're
+            // viewing so it doesn't flash empty mid-rerun. Toast's
+            // "View chat →" performs the switch after the rerun completes.
+            const s = newSession({ activate: false })
+            return { id: s.id, chatThreadId: s.chatThreadId }
+          }}
+          isRunActive={isRunActive}
+          onStartRerun={async ({ ticker, sessionId, chatThreadId, target, query, diffText }) => {
+            // Record where the assistant response should land — the commit
+            // hook reads this ref so reruns targeting a non-active session
+            // don't leak their reply into the wrong chat.
+            runTargetSessionIdRef.current = sessionId || activeSession?.id || null
+
+            // Append the diff message to the target session immediately so
+            // the chat history shows what was changed even before the run
+            // produces tokens. addMessage resolves session inside setState,
+            // so brand-new sessions work even pre-render.
+            if (sessionId) {
+              addMessage(sessionId, { id: nextMsgId(), type: 'user', content: diffText })
+            }
+
+            // Optimistic toast — threadId filled in once /runs returns.
+            setRerunToast({
+              id: `pending_${Date.now()}`,
+              ticker, threadId: null, sessionId, target,
+              status: 'running',
+              createdAt: Date.now(),
+            })
+
+            const threadId = await startRun(query, 'chat', chatThreadId, sessionId)
+            setRerunToast(prev => prev ? { ...prev, threadId } : prev)
+            return threadId
+          }}
+        />
+      )}
+
+      {/* ── Rerun toast (bottom-right, above the 🧠 button) ───── */}
+      {rerunToast && (
+        <RerunToast
+          toast={rerunToast}
+          onView={() => {
+            selectSession(rerunToast.sessionId)
+            setKgPanelOpen(false)
+            setRerunToast(null)
+          }}
+          onInspect={() => setKgPanelOpen(false)}
+          onDismiss={() => setRerunToast(null)}
+        />
+      )}
     </div>
   )
 }

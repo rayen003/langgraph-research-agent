@@ -112,6 +112,61 @@ def init_db() -> None:
                 PRIMARY KEY(thread_id, step_id),
                 FOREIGN KEY(thread_id) REFERENCES jobs(thread_id) ON DELETE CASCADE
             );
+
+            -- ── Knowledge Graph tables ─────────────────────────────────────
+            -- Node ID schemes:
+            --   Shared:     "{ticker}::{node_type}::{field}"
+            --   Run-scoped: "{ticker}::{node_type}::{run_id}::{field}"
+            CREATE TABLE IF NOT EXISTS kg_nodes (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                ticker TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.8,
+                source TEXT NOT NULL,
+                input_hash TEXT,
+                run_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kg_nodes_session_ticker
+            ON kg_nodes(session_id, ticker);
+
+            CREATE INDEX IF NOT EXISTS idx_kg_nodes_ticker_type
+            ON kg_nodes(ticker, node_type);
+
+            CREATE TABLE IF NOT EXISTS kg_edges (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                src_id TEXT NOT NULL,
+                tgt_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.8,
+                source TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kg_edges_src
+            ON kg_edges(src_id);
+
+            CREATE INDEX IF NOT EXISTS idx_kg_edges_session
+            ON kg_edges(session_id);
+
+            CREATE TABLE IF NOT EXISTS kg_traversals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                action TEXT,
+                age_s REAL,
+                ts REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_kg_traversals_run
+            ON kg_traversals(run_id);
             """
         )
 
@@ -527,6 +582,177 @@ def get_document(doc_id: str) -> dict[str, Any] | None:
 def delete_document_metadata(doc_id: str) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Knowledge Graph CRUD
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _row_to_kg_node(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    try:
+        d["value"] = json.loads(d["value"])
+    except (TypeError, json.JSONDecodeError):
+        pass
+    return d
+
+
+def upsert_kg_node(
+    *,
+    id: str,
+    session_id: str | None,
+    ticker: str,
+    node_type: str,
+    field: str,
+    value: Any,
+    confidence: float,
+    source: str,
+    input_hash: str | None = None,
+    run_id: str | None = None,
+    respect_user_lock: bool = True,
+) -> None:
+    """Insert or update a KG node.
+
+    If ``respect_user_lock`` and an existing row has source='user_stated',
+    a non-user-stated update is silently dropped (user beliefs are sticky).
+    """
+    import time as _time  # noqa: PLC0415
+    now = _time.time()
+    value_json = json.dumps(value, ensure_ascii=False, default=str)
+    with _connect() as conn:
+        if respect_user_lock:
+            existing = conn.execute(
+                "SELECT source FROM kg_nodes WHERE id = ?", (id,),
+            ).fetchone()
+            if existing and existing["source"] == "user_stated" and source != "user_stated":
+                return
+        conn.execute(
+            """
+            INSERT INTO kg_nodes(id, session_id, ticker, node_type, field, value,
+                                 confidence, source, input_hash, run_id,
+                                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                session_id = excluded.session_id,
+                value = excluded.value,
+                confidence = excluded.confidence,
+                source = excluded.source,
+                input_hash = excluded.input_hash,
+                updated_at = excluded.updated_at
+            """,
+            (id, session_id, ticker, node_type, field, value_json,
+             confidence, source, input_hash, run_id, now, now),
+        )
+
+
+def get_kg_node(node_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM kg_nodes WHERE id = ?", (node_id,)).fetchone()
+    return _row_to_kg_node(row) if row else None
+
+
+def delete_kg_node(node_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM kg_nodes WHERE id = ?", (node_id,))
+        conn.execute("DELETE FROM kg_edges WHERE src_id = ? OR tgt_id = ?", (node_id, node_id))
+
+
+def list_kg_nodes(
+    *,
+    session_id: str | None = None,
+    ticker: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if ticker is not None:
+        clauses.append("ticker = ?")
+        params.append(ticker)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM kg_nodes {where} ORDER BY updated_at DESC", params,
+        ).fetchall()
+    return [_row_to_kg_node(r) for r in rows]
+
+
+def insert_kg_edge(
+    *,
+    id: str,
+    session_id: str | None,
+    src_id: str,
+    tgt_id: str,
+    relation: str,
+    confidence: float = 0.8,
+    source: str = "agent_inferred",
+) -> None:
+    import time as _time  # noqa: PLC0415
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO kg_edges
+            (id, session_id, src_id, tgt_id, relation, confidence, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (id, session_id, src_id, tgt_id, relation, confidence, source, _time.time()),
+        )
+
+
+def delete_kg_edge(edge_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM kg_edges WHERE id = ?", (edge_id,))
+
+
+def list_kg_edges(
+    *,
+    session_id: str | None = None,
+    src_id: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if src_id is not None:
+        clauses.append("src_id = ?")
+        params.append(src_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM kg_edges {where}", params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_kg_traversal(
+    *,
+    run_id: str,
+    node_id: str,
+    status: str,
+    action: str | None = None,
+    age_s: float | None = None,
+) -> None:
+    import time as _time  # noqa: PLC0415
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO kg_traversals(run_id, node_id, status, action, age_s, ts)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, node_id, status, action, age_s, _time.time()),
+        )
+
+
+def list_kg_traversals(run_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM kg_traversals WHERE run_id = ? ORDER BY ts ASC",
+            (run_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 init_db()

@@ -69,6 +69,45 @@ def emit_step(
     )
 
 
+def emit_review_substep(
+    step: str,
+    status: str,
+    workflow_parent_step_id: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Emit a sub-step nested inside the review_subgraph activity.
+
+    Produces ``parent_activity_id = dcf_{workflow_parent_step_id}_review_subgraph``
+    so the frontend groups review_deep_dive / synthesize_adjustments *inside*
+    the review_subgraph row rather than at the top-level DCF group.
+    """
+    activity_status = _ACTIVITY_STATUS_MAP.get(status, "completed")
+    summary = ""
+    meta: dict[str, Any] | None = None
+    if payload:
+        if "summary_line" in payload:
+            summary = str(payload.pop("summary_line"))
+        meta = dict(payload)
+
+    if status == "start":
+        agent_log.dcf_step_start(step, workflow_parent_step_id, summary)
+    else:
+        agent_log.dcf_step_done(step, workflow_parent_step_id, summary, activity_status)
+
+    emit_activity(
+        activity_id=f"dcf_{workflow_parent_step_id}_{step}",
+        kind="workflow_step",
+        name=f"workflow:dcf:{step}",
+        scope="workflow",
+        status=activity_status,
+        step_id=workflow_parent_step_id,
+        # Key difference: parent is the review_subgraph activity, not the workflow
+        parent_activity_id=f"dcf_{workflow_parent_step_id}_review_subgraph",
+        summary=summary or None,
+        meta=meta,
+    )
+
+
 def emit_progress(message: str) -> None:
     """Emit a chat-visible progress token during DCF execution.
 

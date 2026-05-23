@@ -1,0 +1,104 @@
+{
+  "ticker": "AAPL",
+  "as_of": "2026-05-19",
+  "fiscal_year": "FY2024",
+  "horizon_years": 5,
+  "model_variant": "mature_megacap",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 391035.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+      "note": "Total net sales FY2024 ($M)"
+    },
+    "revenue_growth": {
+      "value": 0.08,
+      "tier": "consensus",
+      "source": "Y1-Y2 near-term consensus",
+      "url": "https://stockanalysis.com/stocks/aapl/forecast/",
+      "note": "8% near-term — analyst forward 10%, historical 8% blend. Services tailwind + iPhone replacement cycle"
+    },
+    "revenue_growth_terminal": {
+      "value": 0.05,
+      "tier": "consensus",
+      "source": "Y5 fade",
+      "url": "",
+      "note": "Y5 fade to 5%. iPhone unit growth flat; services growth decays from ~15% today toward GDP+. Mature global brand"
+    },
+    "fcff_margin": {
+      "value": 0.2783,
+      "tier": "derived",
+      "source": "10-K FY2024 Cash Flow Statement",
+      "url": "https://www.apple.com/newsroom/pdfs/fy2024-q4/FY24_Q4_Consolidated_Financial_Statements.pdf",
+      "note": "(OCF $118,254M - CapEx $9,447M) / Revenue $391,035M"
+    },
+    "fcff_margin_terminal": {
+      "value": 0.30,
+      "tier": "consensus",
+      "source": "Services mix expansion thesis",
+      "url": "",
+      "note": "27.83% → 30% over 5yr. Services revenue grows faster + higher margin (~70% vs ~35% products). Mix shift drives modest expansion."
+    },
+    "wacc": {
+      "value": 0.0971,
+      "tier": "industry",
+      "source": "Damodaran NYU - Computers/Peripherals sector (Jan 2026)",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: cost of equity 9.97% (Rf 4.18% + β 1.35 × ERP 4.23%) × 95.58% E-weight + after-tax cost of debt 3.97% × 4.42% D-weight"
+    },
+    "terminal_growth": {
+      "value": 0.025,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "Below long-run US GDP ~2.5%; below Rf 4.18%"
+    },
+    "net_debt": {
+      "value": -50021.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Balance Sheet (Sept 28, 2024)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+      "note": "Total debt $106,629M (CP $9,967 + current term $10,912 + non-current term $85,750) - Cash & investments $156,650M (cash $29,943 + ST mkt sec $35,228 + LT mkt sec $91,479). Negative = net cash."
+    },
+    "shares_outstanding": {
+      "value": 15408.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+      "note": "Diluted weighted-average shares FY2024 ($M shares)"
+    },
+    "tax_rate": {
+      "value": 0.2409,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+      "note": "Provision $29,749M / Income before tax $123,485M"
+    },
+    "buyback_yield": {
+      "value": 0.035,
+      "tier": "derived",
+      "source": "10-K + capital return program",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+      "note": "~$110B/yr buyback authorization / ~$3T market cap = 3.5% annual share reduction. AAPL most aggressive buyback in history."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.030,
+      "tier": "derived",
+      "source": "10-K FY2024 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000320193/000032019324000123/aapl-20240928.htm",
+      "note": "SBC ~$11.7B / Revenue $391B = 3.0%. Disciplined for tech — AAPL relies less on equity comp than peers."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 80.0,
+      "high": 280.0
+    },
+    "analyst_consensus_target": 308.07,
+    "target_source": "TipRanks (43 analyst mean, May 2026)",
+    "tolerance_rationale": "Range covers conservative-textbook DCF (~$120, this record's assumptions) through optimistic bull DCF (~$250, g=10%/margin=30%/WACC=8.5%). Below $80 or above $280 = math bug. Analyst consensus $308 above upper bound — reflects market growth premium (services, AI, buybacks) not captured in pure DCF."
+  }
+}

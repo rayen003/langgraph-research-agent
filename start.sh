@@ -44,6 +44,9 @@ if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
   cd "$FRONTEND_DIR" && npm install
 fi
 
+echo -e "${DIM}Syncing Python deps…${RESET}"
+cd "$ROOT" && "$UV" sync --quiet
+
 echo -e "${CYAN}${BOLD}▶ Backend${RESET}  ${DIM}http://localhost:8080${RESET}"
 PYTHONUNBUFFERED=1 "$UV" run uvicorn server:app \
   --app-dir "$ROOT/agent_project" \

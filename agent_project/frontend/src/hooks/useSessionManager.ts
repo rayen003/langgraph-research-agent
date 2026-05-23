@@ -50,11 +50,12 @@ export function useSessionManager() {
 
   const activeSession = state.sessions.find(s => s.id === state.activeId) ?? state.sessions[0]
 
-  const newSession = useCallback(() => {
+  const newSession = useCallback((opts?: { activate?: boolean }) => {
+    const activate = opts?.activate !== false
     const s = makeSession()
     setState(prev => ({
       sessions: [s, ...prev.sessions].slice(0, MAX_SESSIONS),
-      activeId: s.id,
+      activeId: activate ? s.id : prev.activeId,
     }))
     return s
   }, [])
@@ -75,6 +76,16 @@ export function useSessionManager() {
     })
   }, [])
 
+  /** Sync the stable LangGraph thread for a session's chat history. */
+  const updateChatThreadId = useCallback((sessionId: string, chatThreadId: string) => {
+    setState(prev => ({
+      ...prev,
+      sessions: prev.sessions.map(s =>
+        s.id === sessionId ? { ...s, chatThreadId } : s,
+      ),
+    }))
+  }, [])
+
   /** Append a message to the given session, updating title from first user msg. */
   const addMessage = useCallback((sessionId: string, msg: SessionMessage) => {
     setState(prev => ({
@@ -91,5 +102,5 @@ export function useSessionManager() {
     }))
   }, [])
 
-  return { sessions: state.sessions, activeSession, newSession, selectSession, deleteSession, addMessage }
+  return { sessions: state.sessions, activeSession, newSession, selectSession, deleteSession, addMessage, updateChatThreadId }
 }

@@ -1,0 +1,104 @@
+{
+  "ticker": "NVDA",
+  "as_of": "2026-05-19",
+  "fiscal_year": "FY2025",
+  "horizon_years": 5,
+  "model_variant": "high_growth_megacap",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 130497.0,
+      "tier": "factual",
+      "source": "10-K FY2025 Income Statement (ended Jan 26, 2025)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "Total revenue FY2025 ($M) — grew 114% YoY from $60.9B FY2024"
+    },
+    "revenue_growth": {
+      "value": 0.30,
+      "tier": "consensus",
+      "source": "Y1-Y2 near-term consensus",
+      "url": "https://simplywall.st/stocks/us/semiconductors/nasdaq-nvda/nvidia/future",
+      "note": "30% near-term — captures FY26/FY27 hyperscaler capex cycle. Was 114% FY25 actual; deceleration begins."
+    },
+    "revenue_growth_terminal": {
+      "value": 0.12,
+      "tier": "consensus",
+      "source": "Y5 fade — mandatory mean reversion",
+      "url": "",
+      "note": "Y5 fade to 12%. By FY30 revenue ~$300B+ — law of large numbers + AMD/Google/custom-silicon competition forces deceleration. Damodaran: \"all hypergrowth fades\""
+    },
+    "fcff_margin": {
+      "value": 0.466,
+      "tier": "derived",
+      "source": "10-K FY2025 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "(OCF $64,089M - CapEx $3,236M) / Revenue $130,497M = 46.6%. Software-like margins on hardware due to CUDA moat + AI demand"
+    },
+    "fcff_margin_terminal": {
+      "value": 0.38,
+      "tier": "consensus",
+      "source": "Competitive intensification thesis",
+      "url": "",
+      "note": "46.6% → 38% over 5yr — COMPRESSION case. AMD MI300, Google TPU, custom silicon (Meta MTIA, AWS Trainium) will pressure pricing. CUDA moat slows decay but doesn't eliminate it."
+    },
+    "wacc": {
+      "value": 0.1055,
+      "tier": "industry",
+      "source": "Damodaran NYU - Semiconductor sector (Jan 2026)",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: Cost of equity 10.72% (Rf 4.18% + β 1.52 × ERP 4.23%) × 97.47% E-weight + after-tax cost of debt 3.97% × 2.53% D-weight"
+    },
+    "terminal_growth": {
+      "value": 0.025,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "Below long-run US GDP ~2.5%; below Rf 4.18%. NVDA terminal must mean-revert despite current hypergrowth"
+    },
+    "net_debt": {
+      "value": -32940.0,
+      "tier": "factual",
+      "source": "10-K FY2025 Balance Sheet (Jan 26, 2025)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "Total debt $10,270M - Cash & marketable securities $43,210M = -$32,940M (net cash)"
+    },
+    "shares_outstanding": {
+      "value": 24804.0,
+      "tier": "factual",
+      "source": "10-K FY2025 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "Diluted weighted-average shares FY2025 ($M shares) — post 10-for-1 split June 2024"
+    },
+    "tax_rate": {
+      "value": 0.133,
+      "tier": "factual",
+      "source": "10-K FY2025 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "GAAP effective tax rate FY2025"
+    },
+    "buyback_yield": {
+      "value": 0.01,
+      "tier": "derived",
+      "source": "10-K + capital return program",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "$50B authorization June 2024 / ~$3T market cap = ~1% annual. NVDA prioritizes reinvestment over buybacks vs MSFT/META."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.036,
+      "tier": "derived",
+      "source": "10-K FY2025 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0001045810/000104581025000023/nvda-20250126.htm",
+      "note": "SBC ~$4.7B / Revenue $130B = 3.6%. Looks reasonable in % terms but absolute SBC grew sharply alongside revenue."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 50.0,
+      "high": 300.0
+    },
+    "analyst_consensus_target": 280.0,
+    "target_source": "61-analyst S&P Global consensus (May 2026)",
+    "tolerance_rationale": "Extra-wide range — NVDA fundamentally hard to DCF given growth uncertainty. Conservative (g=25%) → ~$75. Aggressive bull (g=35%/margin=50%/WACC=9%) → ~$200. Analyst consensus $280 prices sustained 30%+ growth for a decade + AI dominance moat. Pure 5yr DCF can't capture terminal optionality."
+  }
+}

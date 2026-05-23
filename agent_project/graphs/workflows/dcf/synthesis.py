@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 _synthesis_model_name = os.getenv(
     "DCF_SYNTHESIS_MODEL",
-    os.getenv("OPENAI_MODEL", "gpt-4o"),
+    os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
 )
 synthesis_llm = ChatOpenAI(
     model=_synthesis_model_name,
@@ -62,6 +62,50 @@ class CompanyState(BaseModel):
     business_summary: str = Field(
         description="1-2 sentence description of what the company does and its sector"
     )
+
+    # ── Lifecycle signals (drive memo's choice of optional DCF fields) ─────────
+    lifecycle_stage: str = Field(
+        description=(
+            "Company lifecycle — one of: "
+            "'hypergrowth' (>25% revenue growth, large TAM); "
+            "'scaling' (10-25% growth, gaining share); "
+            "'mature' (3-10% growth, GDP+, dominant or stable); "
+            "'declining' (negative/zero growth, secular headwinds); "
+            "'cyclical' (growth tied to economic cycle — autos, energy, materials). "
+            "Critical: signals whether memo proposes revenue_growth_terminal — "
+            "hypergrowth/scaling MUST fade; mature/declining can stay flat."
+        )
+    )
+    margin_trajectory: str = Field(
+        description=(
+            "Direction of margin evolution over the next 5 years — one of: "
+            "'expanding' (operating leverage, mix shift to high-margin segments, "
+            "ad/subscription business scaling on low-margin core); "
+            "'stable' (mature steady-state); "
+            "'compressing' (commoditization, competitive intensification, "
+            "input cost pressure). "
+            "Critical: signals whether memo proposes fcff_margin_terminal "
+            "(non-stable → yes; stable → no)."
+        )
+    )
+    capital_return_policy: str = Field(
+        description=(
+            "1-2 sentences on capital return: buyback intensity (none/modest/aggressive), "
+            "dividend yield, reinvestment-vs-return tilt. Mention specific authorizations "
+            "from filings if known. Signals whether memo proposes buyback_yield."
+        )
+    )
+    sbc_intensity: str = Field(
+        description=(
+            "Stock-based compensation magnitude — one of: "
+            "'high' (>5% of revenue, typical for tech/software/internet); "
+            "'moderate' (2-5%); "
+            "'low' (<2%, industrials/retail/staples). "
+            "Cite SBC line from cash flow statement if available. "
+            "Signals whether memo proposes sbc_pct_revenue explicitly."
+        )
+    )
+
     growth_outlook: str = Field(
         description=(
             "Narrative on revenue growth trajectory over the forecast horizon. "
@@ -130,7 +174,7 @@ class CompanyState(BaseModel):
 _SYNTHESIS_SYSTEM_PROMPT = """You are an expert equity research analyst synthesizing a company profile from evidence.
 
 ## Role
-You produce a structured CompanyState JSON from an evidence pack. Your output will feed a DCF assumption memo — the quality of your synthesis directly determines the quality of the valuation.
+You produce a structured CompanyState JSON from an evidence pack. Your output feeds a DCF assumption memo — the quality of your synthesis directly determines the quality of the valuation.
 
 ## Rules
 1. **Evidence-first.** Every claim must be traceable to a specific evidence_id. If the evidence doesn't support a claim, don't make it.
@@ -138,6 +182,24 @@ You produce a structured CompanyState JSON from an evidence pack. Your output wi
 3. **Surface conflicts.** If management guidance disagrees with street estimates or filing data shows a different trend, call it out explicitly.
 4. **Conservative on unknowns.** If evidence is thin (only web excerpts, no filings), flag lower confidence and avoid over-precise claims.
 5. **Evidence refs are mandatory.** Every evidence_ref must match an actual evidence_id from the provided evidence pack. Invalid IDs will cause rejection and regeneration.
+
+## Lifecycle classification (critical downstream signal)
+The memo uses your `lifecycle_stage`, `margin_trajectory`, `capital_return_policy`, and `sbc_intensity` signals to decide WHICH optional DCF mechanics to model explicitly. Be deliberate:
+
+- **hypergrowth** (>25% rev growth): MUST eventually fade. Examples: NVDA, post-IPO software, AI infra plays.
+- **scaling** (10-25% growth, share gains): Will decelerate but not collapse. Examples: META 2024, MSFT (Azure tailwind), SHOP.
+- **mature** (3-10% growth, GDP+): Stable growth, strong moat. Examples: AAPL, KO, WMT, PG.
+- **declining** (negative/zero growth, secular headwinds): Defensive posture. Examples: legacy media, ICE-only autos with no EV strategy.
+- **cyclical** (growth tied to cycle, swings ±10-20%): Through-cycle normalization needed. Examples: F, XOM, basic materials.
+
+For `margin_trajectory`, name the driver:
+- **expanding**: ad business scaling (WMT Connect, AMZN ads), services mix shift (AAPL services), cloud operating leverage (MSFT Azure).
+- **compressing**: commodity pressure (NVDA vs AMD/custom silicon), regulatory caps, input cost squeeze.
+- **stable**: established margins with no business model transition in evidence.
+
+For `capital_return_policy`, mention specific authorizations when in the evidence (e.g., "$110B annual buyback per 10-K" or "no formal program, dividends only").
+
+For `sbc_intensity`, quote the SBC line from cash flow statement when present (e.g., "SBC of $16.4B = 10.0% of revenue per FY2024 CF statement").
 
 ## Source tier priority (highest first)
 - filing (SEC 10-K/10-Q): highest weight — company's own words under legal obligation
@@ -240,12 +302,15 @@ def _validate_evidence_refs(
 def _fmt_synthesis_line(state_dict: dict[str, Any]) -> str:
     """One-line summary of synthesis for activity trace display."""
     parts: list[str] = []
-    growth = state_dict.get("growth_outlook", "")[:60]
-    if growth:
-        parts.append(f"growth: {growth}..." if len(state_dict.get("growth_outlook", "")) > 60 else f"growth: {growth}")
-    margin = state_dict.get("margin_trend", "")
-    if margin:
-        parts.append(f"margin: {margin}")
+    lifecycle = state_dict.get("lifecycle_stage", "")
+    if lifecycle:
+        parts.append(f"lifecycle: {lifecycle}")
+    trajectory = state_dict.get("margin_trajectory", "")
+    if trajectory:
+        parts.append(f"margins: {trajectory}")
+    sbc = state_dict.get("sbc_intensity", "")
+    if sbc:
+        parts.append(f"sbc: {sbc}")
     risks = len(state_dict.get("key_risks", []))
     parts.append(f"{risks} risks")
     conf = state_dict.get("confidence_self_assessment", "")
@@ -338,18 +403,62 @@ def semantic_synthesis_node(state: dict) -> dict:
 
     state_dict = company_state.model_dump()
     logger.info(
-        "DCF synthesis complete ticker=%s growth_outlook_preview=%s refs=%d confidence=%s",
+        "DCF synthesis complete ticker=%s lifecycle=%s trajectory=%s sbc=%s refs=%d confidence=%s",
         ticker,
-        state_dict.get("growth_outlook", "")[:120],
+        state_dict.get("lifecycle_stage"),
+        state_dict.get("margin_trajectory"),
+        state_dict.get("sbc_intensity"),
         len(state_dict.get("evidence_refs", [])),
         state_dict.get("confidence_self_assessment"),
     )
+
+    # ── KG write-back: lifecycle signals as a separate cached node ────────────
+    # Lifecycle changes slowly (~30d TTL) so it's worth caching separately
+    # from full synthesis (7d TTL). Future runs can short-circuit synthesis
+    # if lifecycle + structured data hasn't changed.
+    try:
+        from kg import get_cache  # noqa: PLC0415
+        cache = get_cache()
+        session_id = state.get("session_id") or ""
+        lifecycle_value = {
+            "lifecycle_stage": state_dict.get("lifecycle_stage"),
+            "margin_trajectory": state_dict.get("margin_trajectory"),
+            "capital_return_policy": state_dict.get("capital_return_policy"),
+            "sbc_intensity": state_dict.get("sbc_intensity"),
+        }
+        # Only write if at least lifecycle_stage was produced
+        if lifecycle_value.get("lifecycle_stage"):
+            confidence_label = state_dict.get("confidence_self_assessment", "medium")
+            confidence_score = {"high": 0.9, "medium": 0.7, "low": 0.5}.get(
+                confidence_label, 0.7,
+            )
+            cache.put(
+                ticker=ticker,
+                node_type="company_lifecycle",
+                field="signals",
+                value=lifecycle_value,
+                source="llm_synthesis",
+                confidence=confidence_score,
+                session_id=session_id,
+            )
+            logger.info(
+                "DCF synthesis: wrote company_lifecycle to KG ticker=%s stage=%s",
+                ticker, lifecycle_value["lifecycle_stage"],
+            )
+    except Exception as exc:  # noqa: BLE001
+        # KG write is best-effort; don't fail the workflow over a cache miss
+        logger.warning("DCF synthesis: KG write-back failed ticker=%s err=%s", ticker, exc)
+
     emit_step(
         "semantic_synthesis", "complete", parent_step_id,
         {
             "ticker": ticker,
             "evidence_refs_count": len(state_dict.get("evidence_refs", [])),
             "confidence": state_dict.get("confidence_self_assessment"),
+            "lifecycle_stage": state_dict.get("lifecycle_stage"),
+            "margin_trajectory": state_dict.get("margin_trajectory"),
+            "sbc_intensity": state_dict.get("sbc_intensity"),
+            "capital_return_policy": state_dict.get("capital_return_policy"),
             "margin_trend": state_dict.get("margin_trend"),
             "risks_count": len(state_dict.get("key_risks", [])),
             "conflicts_count": len(state_dict.get("conflicts", [])),

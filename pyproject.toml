@@ -11,7 +11,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "numpy>=1.24.0",
     "openai>=2.14.0",
-    "langgraph>=0.2.0",
+    "langgraph>=0.3.0",
     "langchain>=0.3.0",
     "langchain-core>=0.3.0",
     "langchain-openai>=0.2.0",
@@ -21,6 +21,8 @@ dependencies = [
     "pyppeteer>=2.0.0",
     "daytona>=0.26.0",
     "matplotlib>=3.10.8",
+    "markdown>=3.7",
+    "reportlab>=4.2.0",
     "fastapi>=0.135.1",
     "uvicorn[standard]>=0.42.0",
     "chainlit>=2.10.0",
@@ -38,4 +40,19 @@ dependencies = [
 [project.optional-dependencies]
 studio = [
     "langgraph-cli[inmem]>=0.2",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "hypothesis>=6.100.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["agent_project/tests/unit", "agent_project/tests/golden"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "llm: tests that call LLM APIs (slow, cost money)",
+    "integration: end-to-end workflow tests",
+    "golden: hand-curated regression tests against real filings",
 ]

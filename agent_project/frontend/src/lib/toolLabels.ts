@@ -68,6 +68,8 @@ const WORKFLOW_LABEL: Record<string, string> = {
 const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
   dcf: {
     normalize_input: 'Resolving ticker & horizon',
+    cache_check: 'Checking knowledge graph',
+    kg_backwrite: 'Persisting to knowledge graph',
     assemble_evidence: 'Assembling evidence',
     semantic_synthesis: 'Synthesizing company profile',
     formulate_thesis: 'Formulating investment thesis',
@@ -77,9 +79,19 @@ const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
     project_cashflows: 'Projecting cash flows',
     compute_valuation: 'Computing valuation',
     compute_implied_wacc: 'Market-implied WACC check',
+    compute_market_signals: 'Market-implied expectations',
     sensitivity: 'Running sensitivity table',
     analyze_result: 'Analyzing valuation quality',
     refine_assumptions: 'Refining assumptions',
+    scenario_generator: 'Generating scenarios',
+    scenario_runner: 'Running scenario valuations',
+    review_subgraph: 'Adversarial review',
+    review_deep_dive: 'Deep-dive findings',
+    synthesize_adjustments: 'Synthesizing adjustments',
+    detect_divergences: 'Detecting model–market divergences',
+    analysis: 'Analyzing divergences with evidence',
+    convergence_gate: 'Convergence gate',
+    assumption_journey: 'Assumption journey',
     finalize: 'Finalizing result',
   },
 }

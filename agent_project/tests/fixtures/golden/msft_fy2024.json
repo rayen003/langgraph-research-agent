@@ -1,0 +1,104 @@
+{
+  "ticker": "MSFT",
+  "as_of": "2026-05-19",
+  "fiscal_year": "FY2024",
+  "horizon_years": 5,
+  "model_variant": "mature_megacap",
+
+  "assumptions": {
+    "base_revenue": {
+      "value": 245122.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement (ended June 30, 2024)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "Total revenue FY2024 ($M)"
+    },
+    "revenue_growth": {
+      "value": 0.13,
+      "tier": "consensus",
+      "source": "Y1-Y2 near-term consensus",
+      "url": "https://stockanalysis.com/stocks/msft/forecast/",
+      "note": "13% near-term — Azure 30%+ growth + Copilot ramp. Recent quarters ran 13-15%"
+    },
+    "revenue_growth_terminal": {
+      "value": 0.09,
+      "tier": "consensus",
+      "source": "Y5 fade",
+      "url": "",
+      "note": "Y5 fade to 9%. Azure decelerates as cloud TAM saturates; on-prem decline drags overall growth toward 8-10% range"
+    },
+    "fcff_margin": {
+      "value": 0.302,
+      "tier": "derived",
+      "source": "10-K FY2024 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "(OCF $118,548M - CapEx $44,477M) / Revenue $245,122M"
+    },
+    "fcff_margin_terminal": {
+      "value": 0.34,
+      "tier": "consensus",
+      "source": "Azure scale + Copilot monetization thesis",
+      "url": "",
+      "note": "30.2% → 34% over 5yr. Capex-heavy now (AI infra build) but Azure operating leverage + software margins on Copilot expand FCF margin as growth normalizes."
+    },
+    "wacc": {
+      "value": 0.0934,
+      "tier": "industry",
+      "source": "Damodaran NYU - Software (System & Application) sector (Jan 2026)",
+      "url": "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.html",
+      "note": "Sector WACC: Cost of equity 9.64% (Rf 4.18% + β 1.28 × ERP 4.23%) × 94.72% E-weight + after-tax cost of debt 3.97% × 5.28% D-weight"
+    },
+    "terminal_growth": {
+      "value": 0.025,
+      "tier": "industry",
+      "source": "convention",
+      "url": "",
+      "note": "Below long-run US GDP ~2.5%; below Rf 4.18%"
+    },
+    "net_debt": {
+      "value": -24322.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Balance Sheet (June 30, 2024)",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "Total debt $51,221M - Cash & ST investments $75,543M = -$24,322M (net cash)"
+    },
+    "shares_outstanding": {
+      "value": 7469.0,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "Diluted weighted-average shares FY2024 ($M shares)"
+    },
+    "tax_rate": {
+      "value": 0.182,
+      "tier": "factual",
+      "source": "10-K FY2024 Income Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "Provision $19,651M / Income before tax $107,787M"
+    },
+    "buyback_yield": {
+      "value": 0.015,
+      "tier": "derived",
+      "source": "10-K + capital return program",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "$60B authorization spent over ~3yrs / ~$4T market cap = 1.5% annual. MSFT prioritizes dividend + capex over buybacks vs AAPL."
+    },
+    "sbc_pct_revenue": {
+      "value": 0.044,
+      "tier": "derived",
+      "source": "10-K FY2024 Cash Flow Statement",
+      "url": "https://www.sec.gov/Archives/edgar/data/0000789019/000095017024087843/msft-20240630.htm",
+      "note": "SBC ~$10.7B / Revenue $245B = 4.4%. Large engineering workforce + AI talent retention drives ratio."
+    }
+  },
+
+  "expected_output": {
+    "implied_share_price_range": {
+      "low": 180.0,
+      "high": 420.0
+    },
+    "analyst_consensus_target": 560.0,
+    "target_source": "55-analyst S&P Global consensus (May 2026)",
+    "tolerance_rationale": "Hand DCF at conservative inputs (~$230); bull case (g=15%/margin=33%/WACC=8.5%) reaches ~$380. Analyst consensus $560 above bull case → market prices Azure/AI multiple expansion not captured in pure FCFF DCF."
+  }
+}

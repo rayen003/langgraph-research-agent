@@ -52,7 +52,16 @@ def review_assumptions_node(state: dict) -> dict:
         "message": "Approve or edit DCF assumptions before valuation.",
         "assumptions": state.get("assumptions", {}),
         "assumption_provenance": state.get("assumption_provenance", {}),
+        "assumption_memo": state.get("assumption_memo"),
         "evidence_items": evidence_items,
+        "scenarios": state.get("scenarios", []),
+        "company_state": state.get("company_state"),
+        "thesis": state.get("thesis"),
+        "features": state.get("features", {}),
+        "fundamentals": state.get("fundamentals", {}),
+        "profile": state.get("profile", "default"),
+        "profile_meta": state.get("profile_meta", {}),
+        "wacc_components": state.get("wacc_components", {}),
         "choices": ["approve", "reject", "edit"],
     })
     action = str(decision.get("action") or "approve").lower()
@@ -71,11 +80,14 @@ def review_assumptions_node(state: dict) -> dict:
                     if normalized is None:
                         continue
                     merged[key] = normalized
-                    provenance[key] = {
-                        "source": "user_override",
-                        "evidence": "User edited assumption during review.",
-                        "confidence": 1.0,
-                    }
+                    prior = dict(provenance.get(key) or {})
+                    prior["user_edited"] = True
+                    prior["approved_by"] = "user"
+                    if not prior.get("source"):
+                        prior["source"] = "user_override"
+                    if not prior.get("evidence"):
+                        prior["evidence"] = "User edited assumption during review."
+                    provenance[key] = prior
             emit_step(
                 "assumption_review", "edited", parent_step_id,
                 {"assumptions": merged, "assumption_provenance": provenance},
@@ -95,6 +107,6 @@ def review_assumptions_node(state: dict) -> dict:
 
 
 def route_after_assumptions(state: dict) -> str:
-    """Route to market data collection or end the workflow."""
+    """Route to scenario runner or end the workflow."""
     from langgraph.graph import END  # noqa: PLC0415
-    return "collect_market_data" if state.get("assumptions_approved") else END
+    return "scenario_runner" if state.get("assumptions_approved") else END

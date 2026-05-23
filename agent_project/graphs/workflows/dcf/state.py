@@ -56,12 +56,64 @@ class DCFState(TypedDict):
     confidence_breakdown: dict[str, Any] | None
     # Market-implied WACC vs CAPM sanity check (computed after valuation).
     wacc_sanity: dict[str, Any] | None
+    # Market-implied signals (computed by compute_market_signals_node).
+    implied_growth: float | None
+    implied_margin: float | None
     # Investment thesis (formulated before assumptions).
     thesis: dict[str, Any] | None
+    # Scenario-based assumptions (bear/base/bull, set by scenario_generator).
+    scenarios: list[dict[str, Any]]
+    # Scenario valuation results (populated by scenario_runner).
+    scenario_results: list[dict[str, Any]]
     # Analysis loop state.
     analysis_iteration: int
     critique: dict[str, Any] | None
     previous_valuation: dict[str, float] | None
+    # Review subgraph history — one record per completed review iteration.
+    # Each record: {"iteration": int, "adjustments": {scenario: {field: delta}},
+    #               "findings_summary": str}
+    assumption_history: list[dict[str, Any]]
+    # Snapshot of assumptions BEFORE any review adjustments. Populated by
+    # run_review_subgraph on iteration 0. Used by finalize_node to emit
+    # the assumption_journey activity event.
+    # Shape: {"base": {field: value}, "scenarios": {scenario_name: {field: value}}}
+    initial_assumptions: dict[str, Any]
+    # ── Knowledge Graph cache integration ────────────────────────────────────
+    # Set by cache_check_node — drives conditional routing to skip nodes
+    # whose outputs are already cached and fresh.
+    kg_cache_flags: dict[str, bool]
+    # Pre-loaded fundamentals from KG (when skip_fmp_fundamentals is True).
+    kg_fundamentals_hint: dict[str, float]
+    # Pre-loaded lifecycle signals from KG (when company_lifecycle is cached).
+    # Shape: {lifecycle_stage, margin_trajectory, capital_return_policy, sbc_intensity}.
+    # Helps the memo LLM pre-select which optional DCF mechanics to model.
+    kg_lifecycle_hint: dict[str, Any]
+    # Layer 1 anchored-corpus stats from cache_check.
+    # Shape: {filing_count, news_count, newest_news_ts}.
+    # Anchored facts (filings + news) are ADDITIVE: new fetches grow the corpus,
+    # never invalidate existing. Agent decides if a fresh news fetch is needed
+    # based on newest_news_ts.
+    kg_anchored_corpus_meta: dict[str, Any]
+    # Per-field cache-check results for the activity UI panel.
+    kg_cache_results: list[dict[str, Any]]
+    # ── Divergence analysis layer ───────────────────────────────────────────
+    # Quantified gaps detected after review (model vs market-implied, evidence vs
+    # assumption). Populated by detect_divergences_node.
+    divergences: list[dict[str, Any]]
+    # Output of analysis_node: reasoned position per divergence. Each entry:
+    # {divergence_id, position: "EXPLAINED"|"UNEXPLAINED", explanation,
+    #  evidence_used: [refs], new_evidence_fetched: [refs], adjustment, uncertainty_note}
+    analysis_positions: list[dict[str, Any]]
+    # Three-way model validity gate. One of: "valid", "adjusting", "invalid".
+    # Set by the convergence gate after analysis_node.
+    model_validity: str
+    # Free-text reason when model_validity == "invalid".
+    invalidation_reason: str
+    # Market reconciliation posture after analysis: aligned | structural_gap | critical_unresolved | refining
+    reconciliation_status: str
+    reconciliation_note: str
+    # Penalized confidence after analysis (base_confidence × severity_multiplier).
+    effective_confidence: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +189,34 @@ _ASSUMPTION_FIELDS = {
         "kind": "money_millions",
         "min": -1_000_000.0,
         "max": 10_000_000.0,
+    },
+    "buyback_yield": {
+        "label": "Buyback yield",
+        "aliases": ("buyback yield", "share repurchase yield", "net buyback rate", "share reduction rate"),
+        "kind": "percent",
+        "min": -0.05,  # negative = net issuance (SBC > buybacks)
+        "max": 0.10,   # 10% annual buyback is extreme
+    },
+    "fcff_margin_terminal": {
+        "label": "Terminal FCFF margin",
+        "aliases": ("terminal margin", "y5 margin", "steady state margin", "long-run fcff margin"),
+        "kind": "percent",
+        "min": -0.25,
+        "max": 0.75,
+    },
+    "revenue_growth_terminal": {
+        "label": "Terminal revenue growth",
+        "aliases": ("y5 growth", "terminal year growth", "fade growth", "long-run revenue growth"),
+        "kind": "percent",
+        "min": -0.5,
+        "max": 0.75,
+    },
+    "sbc_pct_revenue": {
+        "label": "SBC as % of revenue",
+        "aliases": ("stock based compensation", "sbc expense ratio", "share-based comp ratio"),
+        "kind": "percent",
+        "min": 0.0,
+        "max": 0.20,
     },
 }
 

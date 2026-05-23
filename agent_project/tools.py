@@ -19,7 +19,14 @@ from simpleeval import simple_eval
 
 from documents import search_documents, _session_ctx
 from graphs.workflows.dcf import run_dcf_workflow_sync, summarize_dcf_payload
-from utils import get_artifacts_dir, get_run_dir, persist_tool_result, emit_ui_event, set_dcf_hitl_payload
+from graphs.workflows.dcf.hitl_snapshot import build_hitl_snapshot
+from utils import (
+    get_artifacts_dir,
+    get_run_dir,
+    persist_tool_result,
+    emit_ui_event,
+    set_dcf_hitl_payload,
+)
 from web_search import search_exa
 
 # ---------------------------------------------------------------------------
@@ -232,28 +239,17 @@ def run_dcf_workflow(
     )
 
     if payload.get("__dcf_hitl__"):
-        assumptions = payload.get("assumptions", {})
-        provenance = payload.get("assumption_provenance", {})
+        snapshot = build_hitl_snapshot(payload)
         memo_proposals = payload.get("memo_proposals", {})
-        evidence_items = payload.get("evidence_items", [])
+        assumptions = snapshot.get("assumptions", {})
+        provenance = snapshot.get("assumption_provenance", {})
 
         # Emit DCF review event for frontend (works for both chat and research modes)
-        set_dcf_hitl_payload({
-            "ticker": payload.get("ticker", "?"),
-            "horizon_years": payload.get("horizon_years", 5),
-            "assumptions": assumptions,
-            "assumption_provenance": provenance,
-            "memo_proposals": memo_proposals,
-            "evidence_items": evidence_items,
-        })
+        set_dcf_hitl_payload(snapshot)
         emit_ui_event({
             "type": "dcf_assumptions_review",
-            "ticker": payload.get("ticker", "?"),
-            "horizon_years": payload.get("horizon_years", 5),
-            "assumptions": assumptions,
-            "assumption_provenance": provenance,
+            **snapshot,
             "memo_proposals": memo_proposals,
-            "evidence_items": evidence_items,
         })
 
         lines = [
@@ -283,17 +279,21 @@ def run_dcf_workflow(
         return "\n".join(lines)
 
     summary = summarize_dcf_payload(payload)
-    return persist_tool_result(
-        "run_dcf_workflow",
-        {
-            "ticker": ticker,
-            "horizon_years": horizon_years,
-            "allow_external_assumptions": allow_external_assumptions,
-            "assumption_overrides": assumption_overrides or {},
-        },
-        json.dumps(payload, ensure_ascii=False),
-        summary,
+    pointer = json.loads(
+        persist_tool_result(
+            "run_dcf_workflow",
+            {
+                "ticker": ticker,
+                "horizon_years": horizon_years,
+                "allow_external_assumptions": allow_external_assumptions,
+                "assumption_overrides": assumption_overrides or {},
+            },
+            json.dumps(payload, ensure_ascii=False),
+            summary,
+        )
     )
+    pointer["dcf_report_verbatim"] = True
+    return json.dumps(pointer, ensure_ascii=False)
 
 
 @tool

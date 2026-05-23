@@ -59,32 +59,48 @@ def prior_band_midpoint(profile: str, field: str) -> float | None:
 
 PROFILE_PRIORS: dict[str, dict[str, dict[str, float]]] = {
     "mega_cap_tech": {
-        "fcff_margin":     {"soft_min": 0.20, "soft_max": 0.40, "hard_min": 0.05, "hard_max": 0.55},
-        "wacc":            {"soft_min": 0.07, "soft_max": 0.10, "hard_min": 0.04, "hard_max": 0.13},
-        "revenue_growth":  {"soft_min": 0.05, "soft_max": 0.25, "hard_min": -0.10, "hard_max": 0.40},
-        "terminal_growth": {"soft_min": 0.020, "soft_max": 0.035, "hard_min": -0.01, "hard_max": 0.045},
-        "tax_rate":        {"soft_min": 0.10, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.40},
+        "fcff_margin":             {"soft_min": 0.20, "soft_max": 0.40, "hard_min": 0.05, "hard_max": 0.55},
+        "fcff_margin_terminal":    {"soft_min": 0.20, "soft_max": 0.45, "hard_min": 0.05, "hard_max": 0.60},
+        "wacc":                    {"soft_min": 0.07, "soft_max": 0.10, "hard_min": 0.04, "hard_max": 0.13},
+        "revenue_growth":          {"soft_min": 0.05, "soft_max": 0.25, "hard_min": -0.10, "hard_max": 0.40},
+        "revenue_growth_terminal": {"soft_min": 0.03, "soft_max": 0.15, "hard_min": -0.10, "hard_max": 0.30},
+        "terminal_growth":         {"soft_min": 0.020, "soft_max": 0.035, "hard_min": -0.01, "hard_max": 0.045},
+        "tax_rate":                {"soft_min": 0.10, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.40},
+        "buyback_yield":           {"soft_min": 0.01, "soft_max": 0.05, "hard_min": -0.02, "hard_max": 0.08},
+        "sbc_pct_revenue":         {"soft_min": 0.02, "soft_max": 0.10, "hard_min": 0.0, "hard_max": 0.15},
     },
     "large_cap_tech": {
-        "fcff_margin":     {"soft_min": 0.12, "soft_max": 0.30, "hard_min": -0.10, "hard_max": 0.50},
-        "wacc":            {"soft_min": 0.08, "soft_max": 0.12, "hard_min": 0.05, "hard_max": 0.15},
-        "revenue_growth":  {"soft_min": 0.05, "soft_max": 0.30, "hard_min": -0.10, "hard_max": 0.50},
-        "terminal_growth": {"soft_min": 0.020, "soft_max": 0.040, "hard_min": -0.01, "hard_max": 0.05},
-        "tax_rate":        {"soft_min": 0.10, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.40},
+        "fcff_margin":             {"soft_min": 0.12, "soft_max": 0.30, "hard_min": -0.10, "hard_max": 0.50},
+        "fcff_margin_terminal":    {"soft_min": 0.12, "soft_max": 0.35, "hard_min": -0.10, "hard_max": 0.55},
+        "wacc":                    {"soft_min": 0.08, "soft_max": 0.12, "hard_min": 0.05, "hard_max": 0.15},
+        "revenue_growth":          {"soft_min": 0.05, "soft_max": 0.30, "hard_min": -0.10, "hard_max": 0.50},
+        "revenue_growth_terminal": {"soft_min": 0.03, "soft_max": 0.20, "hard_min": -0.10, "hard_max": 0.35},
+        "terminal_growth":         {"soft_min": 0.020, "soft_max": 0.040, "hard_min": -0.01, "hard_max": 0.05},
+        "tax_rate":                {"soft_min": 0.10, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.40},
+        "buyback_yield":           {"soft_min": 0.0, "soft_max": 0.04, "hard_min": -0.03, "hard_max": 0.08},
+        "sbc_pct_revenue":         {"soft_min": 0.03, "soft_max": 0.12, "hard_min": 0.0, "hard_max": 0.20},
     },
     "mature_consumer_or_industrial": {
-        "fcff_margin":     {"soft_min": 0.04, "soft_max": 0.15, "hard_min": -0.05, "hard_max": 0.35},
-        "wacc":            {"soft_min": 0.07, "soft_max": 0.10, "hard_min": 0.05, "hard_max": 0.13},
-        "revenue_growth":  {"soft_min": 0.0, "soft_max": 0.10, "hard_min": -0.10, "hard_max": 0.25},
-        "terminal_growth": {"soft_min": 0.015, "soft_max": 0.030, "hard_min": -0.01, "hard_max": 0.040},
-        "tax_rate":        {"soft_min": 0.15, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.40},
+        "fcff_margin":             {"soft_min": 0.04, "soft_max": 0.15, "hard_min": -0.05, "hard_max": 0.35},
+        "fcff_margin_terminal":    {"soft_min": 0.04, "soft_max": 0.18, "hard_min": -0.05, "hard_max": 0.40},
+        "wacc":                    {"soft_min": 0.07, "soft_max": 0.10, "hard_min": 0.05, "hard_max": 0.13},
+        "revenue_growth":          {"soft_min": 0.0, "soft_max": 0.10, "hard_min": -0.10, "hard_max": 0.25},
+        "revenue_growth_terminal": {"soft_min": 0.0, "soft_max": 0.08, "hard_min": -0.10, "hard_max": 0.20},
+        "terminal_growth":         {"soft_min": 0.015, "soft_max": 0.030, "hard_min": -0.01, "hard_max": 0.040},
+        "tax_rate":                {"soft_min": 0.15, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.40},
+        "buyback_yield":           {"soft_min": 0.0, "soft_max": 0.03, "hard_min": -0.02, "hard_max": 0.06},
+        "sbc_pct_revenue":         {"soft_min": 0.0, "soft_max": 0.02, "hard_min": 0.0, "hard_max": 0.05},
     },
     "default": {
-        "fcff_margin":     {"soft_min": 0.05, "soft_max": 0.30, "hard_min": -0.20, "hard_max": 0.55},
-        "wacc":            {"soft_min": 0.07, "soft_max": 0.13, "hard_min": 0.04, "hard_max": 0.20},
-        "revenue_growth":  {"soft_min": 0.0, "soft_max": 0.25, "hard_min": -0.20, "hard_max": 0.50},
-        "terminal_growth": {"soft_min": 0.015, "soft_max": 0.035, "hard_min": -0.01, "hard_max": 0.05},
-        "tax_rate":        {"soft_min": 0.10, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.45},
+        "fcff_margin":             {"soft_min": 0.05, "soft_max": 0.30, "hard_min": -0.20, "hard_max": 0.55},
+        "fcff_margin_terminal":    {"soft_min": 0.05, "soft_max": 0.35, "hard_min": -0.20, "hard_max": 0.60},
+        "wacc":                    {"soft_min": 0.07, "soft_max": 0.13, "hard_min": 0.04, "hard_max": 0.20},
+        "revenue_growth":          {"soft_min": 0.0, "soft_max": 0.25, "hard_min": -0.20, "hard_max": 0.50},
+        "revenue_growth_terminal": {"soft_min": 0.0, "soft_max": 0.15, "hard_min": -0.20, "hard_max": 0.30},
+        "terminal_growth":         {"soft_min": 0.015, "soft_max": 0.035, "hard_min": -0.01, "hard_max": 0.05},
+        "tax_rate":                {"soft_min": 0.10, "soft_max": 0.30, "hard_min": 0.0, "hard_max": 0.45},
+        "buyback_yield":           {"soft_min": 0.0, "soft_max": 0.03, "hard_min": -0.03, "hard_max": 0.08},
+        "sbc_pct_revenue":         {"soft_min": 0.0, "soft_max": 0.10, "hard_min": 0.0, "hard_max": 0.20},
     },
 }
 
@@ -289,12 +305,25 @@ def compute_confidence_breakdown(
     valuation_flags: list[dict[str, Any]],
     provenance: dict[str, dict[str, Any]],
     assumption_memo: dict[str, Any] | None = None,
+    model_validity: str | None = None,
+    solver_failed: bool = False,
+    unexplained_count: int = 0,
 ) -> dict[str, Any]:
     """Return per-component confidence scores + aggregate label.
 
     All scores derived from existing state data — no new LLM calls.
-    Components: data_quality, revenue_growth, margin_stability,
-                wacc_reliability, terminal_assumptions.
+    Base components: data_quality, revenue_growth, margin_stability,
+                     wacc_reliability, terminal_assumptions.
+
+    Optional validity gate (Phase 1, post-convergence_gate recompute):
+      - ``model_validity``: when "invalid", multiplies aggregate by 0.3 AND
+        forces label "low" regardless of score. "adjusting" multiplies by 0.7.
+        "valid" or None leaves aggregate untouched.
+      - ``solver_failed``: caps ``wacc_reliability`` at 0.3 (implied WACC
+        solver could not converge — market signal unreliable).
+      - ``unexplained_count``: subtracts 0.05 per unresolved divergence from
+        the aggregate, capped at 0.20 total. Shown as ``validity_penalty``
+        component so the UI can explain WHY confidence dropped.
     """
     all_flags = list(assumption_flags) + list(valuation_flags)
 
@@ -347,6 +376,12 @@ def compute_confidence_breakdown(
     else:
         wacc_reason = f"Source: {wacc_source}"
 
+    # Solver failure caps WACC reliability — market-implied WACC could not
+    # be verified against the CAPM estimate.
+    if solver_failed and wacc_score > 0.30:
+        wacc_score = 0.30
+        wacc_reason = f"{wacc_reason}; implied-WACC solver failed"
+
     # ── aggregate (weighted) ──
     weights = {
         "data_quality": 0.20,
@@ -363,11 +398,39 @@ def compute_confidence_breakdown(
         "terminal_assumptions": tg_score,
     }
     aggregate = sum(raw_scores[k] * weights[k] for k in weights)
+
+    # ── Validity gate (Phase 1) ──────────────────────────────────────────
+    # Order: validity multiplier → unexplained-divergence penalty → block
+    # flag floor → invalid-model hard cap. Track penalty contributions so
+    # the UI can show WHY confidence dropped.
+    validity_penalty_parts: list[str] = []
+    validity_score = 1.0
+    if model_validity == "invalid":
+        aggregate *= 0.30
+        validity_score = 0.30
+        validity_penalty_parts.append("model invalid (×0.30)")
+    elif model_validity == "adjusting":
+        aggregate *= 0.70
+        validity_score = 0.70
+        validity_penalty_parts.append("model still adjusting (×0.70)")
+    if unexplained_count > 0:
+        unexplained_pen = min(0.20, 0.05 * unexplained_count)
+        aggregate = max(0.0, aggregate - unexplained_pen)
+        validity_score = max(0.0, validity_score - unexplained_pen)
+        validity_penalty_parts.append(
+            f"{unexplained_count} unexplained divergence(s) (−{unexplained_pen:.2f})"
+        )
+    if solver_failed and "implied-WACC solver failed" not in (wacc_reason or ""):
+        validity_penalty_parts.append("solver failed")
+
     label = "high" if aggregate >= 0.70 else "medium" if aggregate >= 0.50 else "low"
     # Any block flag forces low
     if any(f.get("severity") == "block" for f in all_flags):
         label = "low"
         aggregate = min(aggregate, 0.40)
+    # Invalid model hard-caps label at "low" regardless of base score
+    if model_validity == "invalid":
+        label = "low"
 
     reasons: dict[str, str] = {
         "data_quality": dq_reason,
@@ -381,6 +444,14 @@ def compute_confidence_breakdown(
         k: {"score": round(raw_scores[k], 3), "label": _label_from_score(raw_scores[k]), "reason": reasons[k]}
         for k in raw_scores
     }
+    # Surface the validity gate as a pseudo-component so the UI explains the
+    # difference between the base score and the gated aggregate.
+    if validity_penalty_parts or model_validity in {"invalid", "adjusting"} or solver_failed:
+        components["validity_penalty"] = {
+            "score": round(validity_score, 3),
+            "label": _label_from_score(validity_score),
+            "reason": "; ".join(validity_penalty_parts) or "ok",
+        }
 
     _weak_names = {
         "data_quality": "data quality", "revenue_growth": "revenue growth",
@@ -393,6 +464,12 @@ def compute_confidence_breakdown(
     else:
         verb = "carry" if len(weak) > 1 else "carries"
         summary = f"{', '.join(_weak_names[k] for k in weak)} {verb} meaningful uncertainty."
+    # Prepend validity issues to the summary so the headline reason is the
+    # validity gate, not just weak components.
+    if model_validity == "invalid":
+        summary = f"Model marked invalid — {summary.lower()}"
+    elif validity_penalty_parts and model_validity != "valid":
+        summary = f"{' / '.join(validity_penalty_parts)}. {summary}"
 
     return {
         "components": components,
