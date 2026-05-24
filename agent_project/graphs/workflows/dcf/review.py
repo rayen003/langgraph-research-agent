@@ -15,7 +15,7 @@ except ImportError:  # LangGraph >=1.0 style
         raise Interrupt(payload)
 
 from .activity import emit_step
-from .state import clip_to_field_range
+from .state import _ASSUMPTION_FIELDS, clip_to_field_range
 
 logger = logging.getLogger(__name__)
 
@@ -75,19 +75,20 @@ def review_assumptions_node(state: dict) -> dict:
             merged = dict(state.get("assumptions", {}))
             provenance = dict(state.get("assumption_provenance", {}))
             for key, value in edits.items():
-                if key in merged:
-                    normalized = clip_to_field_range(key, float(value))
-                    if normalized is None:
-                        continue
-                    merged[key] = normalized
-                    prior = dict(provenance.get(key) or {})
-                    prior["user_edited"] = True
-                    prior["approved_by"] = "user"
-                    if not prior.get("source"):
-                        prior["source"] = "user_override"
-                    if not prior.get("evidence"):
-                        prior["evidence"] = "User edited assumption during review."
-                    provenance[key] = prior
+                if key not in _ASSUMPTION_FIELDS:
+                    continue
+                normalized = clip_to_field_range(key, float(value))
+                if normalized is None:
+                    continue
+                merged[key] = normalized
+                prior = dict(provenance.get(key) or {})
+                prior["user_edited"] = True
+                prior["approved_by"] = "user"
+                if not prior.get("source"):
+                    prior["source"] = "user_override"
+                if not prior.get("evidence"):
+                    prior["evidence"] = "User edited assumption during review."
+                provenance[key] = prior
             emit_step(
                 "assumption_review", "edited", parent_step_id,
                 {"assumptions": merged, "assumption_provenance": provenance},

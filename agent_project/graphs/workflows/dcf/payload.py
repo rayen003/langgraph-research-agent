@@ -11,9 +11,12 @@ from .sources import (
     company_state_ref_ids,
     field_basis,
     humanize_evidence_refs,
+    infer_evidence_item,
     inline_cite_text,
     market_reconciliation_section_lines,
+    payload_evidence_items,
     recent_developments_section_lines,
+    resolve_evidence_item,
     wacc_input_ref_ids,
 )
 from .state import _TIER_A_FIELDS
@@ -46,6 +49,92 @@ def _provenance_ref_ids(prov: dict[str, Any]) -> list[str]:
     if reference:
         return [part.strip() for part in str(reference).split(",") if part.strip()]
     return []
+
+
+def _confidence_label(score: float) -> str:
+    return "high" if score >= 0.70 else "medium" if score >= 0.50 else "low"
+
+
+def _shareholder_mechanics_section_lines(
+    valuation: dict[str, Any],
+    assumptions: dict[str, Any],
+    horizon_years: int,
+) -> list[str]:
+    """Surface buyback/SBC/per-share mechanics from valuation + assumptions."""
+    shares_initial = valuation.get("shares_initial")
+    if shares_initial is None:
+        shares_initial = assumptions.get("shares_outstanding")
+    if not shares_initial:
+        return []
+
+    buyback_yield = float(
+        valuation.get("buyback_yield")
+        if valuation.get("buyback_yield") is not None
+        else assumptions.get("buyback_yield", 0.0) or 0.0
+    )
+    horizon = max(int(horizon_years or 5), 1)
+    shares_end = valuation.get("shares_end")
+    if shares_end is None:
+        shares_end = float(shares_initial) * ((1.0 - buyback_yield) ** horizon)
+    else:
+        shares_end = float(shares_end)
+    shares_initial = float(shares_initial)
+
+    sbc_pct = float(assumptions.get("sbc_pct_revenue", 0.0) or 0.0)
+    fcff_margin = assumptions.get("fcff_margin")
+    perpetual = valuation.get("perpetual_buyback_yield")
+    effective_g = valuation.get("effective_terminal_growth")
+    terminal_g = assumptions.get("terminal_growth")
+    cap_source = str(valuation.get("perpetual_buyback_cap_source") or "")
+
+    lines = ["## Shareholder Mechanics", ""]
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    lines.append(f"| Initial shares outstanding | {shares_initial:,.0f}M |")
+    lines.append(f"| Shares after {horizon}-year buybacks | {shares_end:,.0f}M |")
+    if shares_initial > 0:
+        reduction = (1.0 - shares_end / shares_initial) * 100.0
+        lines.append(f"| Share count reduction (explicit horizon) | {reduction:.1f}% |")
+    lines.append(f"| Annual buyback yield (assumption) | {buyback_yield:.2%} |")
+
+    if sbc_pct > 0:
+        lines.append(f"| SBC drag on FCFF margin | −{sbc_pct:.2%} of revenue |")
+        if fcff_margin is not None:
+            economic = float(fcff_margin) - sbc_pct
+            lines.append(
+                f"| Reported → economic FCFF margin | "
+                f"{float(fcff_margin):.2%} → {economic:.2%} |"
+            )
+
+    if perpetual is not None:
+        lines.append(f"| Perpetual buyback yield (terminal) | {float(perpetual):.2%} |")
+
+    if effective_g is not None:
+        if terminal_g is not None and perpetual is not None:
+            lines.append(
+                f"| Effective terminal growth (g + buyback) | "
+                f"{float(terminal_g):.2%} + {float(perpetual):.2%} = {float(effective_g):.2%} |"
+            )
+        else:
+            lines.append(f"| Effective terminal growth | {float(effective_g):.2%} |")
+
+    cap_notes = {
+        "fcff_yield_cap": "Perpetual buyback capped by terminal FCF yield.",
+        "hard_cap_4pct": "Perpetual buyback capped at 4%.",
+        "input": "Perpetual buyback equals the input buyback yield.",
+        "no_buyback": "No buyback assumed — terminal uses revenue growth only.",
+    }
+    if cap_source in cap_notes:
+        lines.append("")
+        lines.append(f"> {cap_notes[cap_source]}")
+
+    lines.append("")
+    lines.append(
+        "> Implied per-share price = equity value ÷ shares after explicit-horizon buybacks. "
+        "Terminal value uses perpetual buyback compounding at the rate above."
+    )
+    lines.append("")
+    return lines
 
 
 def _run_consistency_checks(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -94,7 +183,7 @@ def _run_consistency_checks(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if proposals:
         total_refs = sum(len(p.get("evidence_refs", [])) for p in proposals)
         filing_refs = 0
-        evidence_items = payload.get("_evidence_items") or []
+        evidence_items = payload_evidence_items(payload)
         by_id = {item.get("evidence_id", ""): item for item in evidence_items}
         for p in proposals:
             for ref in p.get("evidence_refs", []):
@@ -160,12 +249,61 @@ def _sensitivity_matrix_section_lines(payload: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _confidence_drivers_lines(payload: dict[str, Any]) -> list[str]:
+    """Render decomposition of interpretive confidence so it isn't opaque."""
+    breakdown = payload.get("confidence_breakdown") or {}
+    components = breakdown.get("components") or {}
+
+    component_labels = {
+        "data_quality": ("Data quality", 20),
+        "revenue_growth": ("Revenue growth grounding", 20),
+        "margin_stability": ("Margin stability", 20),
+        "wacc_reliability": ("WACC reliability", 25),
+        "terminal_assumptions": ("Terminal assumptions", 15),
+        "validity_penalty": ("Validity / divergence penalty", None),
+    }
+    rows: list[str] = []
+    for key, (label, weight) in component_labels.items():
+        comp = components.get(key)
+        if not isinstance(comp, dict):
+            continue
+        score = comp.get("score")
+        reason = str(comp.get("reason") or "").strip()
+        if not isinstance(score, (int, float)):
+            continue
+        weight_str = f" (weight {weight}%)" if weight else ""
+        score_pct = float(score) * 100
+        sign = "+" if score >= 0.50 else "−"
+        rows.append(f"  - {sign} **{label}**{weight_str}: {score_pct:.0f}% — {reason}")
+
+    assessment = payload.get("confidence_assessment") or {}
+    grounding = assessment.get("evidence_grounding") or {}
+    if grounding:
+        mult = grounding.get("multiplier", 1.0)
+        label = str(grounding.get("label") or "").replace("_", " ")
+        reason = grounding.get("reason") or ""
+        sign = "−" if mult < 1.0 else "+"
+        rows.append(
+            f"  - {sign} **Evidence grounding**: {label} (×{mult:.2f}) — {reason}"
+        )
+        verdicts = assessment.get("verdict_counts") or {}
+        if verdicts:
+            verdict_str = ", ".join(f"{k}: {v}" for k, v in verdicts.items() if v)
+            if verdict_str:
+                rows.append(f"  - Reconciliation verdicts: {verdict_str}")
+
+    if not rows:
+        return []
+    return ["**Interpretive confidence drivers:**", *rows, ""]
+
+
 def _executive_summary_lines(payload: dict[str, Any]) -> list[str]:
     ticker = str(payload.get("ticker") or "?").upper()
     valuation = payload.get("valuation") or {}
     implied = valuation.get("implied_share_price")
     spot = valuation.get("current_price") or (payload.get("profile_meta") or {}).get("spot_price")
     confidence = str(payload.get("confidence_label") or "medium")
+    confidence_assessment = payload.get("confidence_assessment") or {}
     model_validity = str(payload.get("model_validity") or "valid")
     reconciliation = str(payload.get("reconciliation_status") or "aligned")
 
@@ -177,7 +315,15 @@ def _executive_summary_lines(payload: dict[str, Any]) -> list[str]:
         note = str(payload.get("reconciliation_note") or "").strip()
         if note:
             lines.append(f"- **Reconciliation note:** {note}")
-    lines.append(f"- **Confidence:** {confidence.upper()}")
+    if confidence_assessment:
+        proc = confidence_assessment.get("procedural_confidence")
+        interp = confidence_assessment.get("interpretive_confidence")
+        if isinstance(proc, (int, float)):
+            lines.append(f"- **Procedural confidence:** {_confidence_label(float(proc)).upper()} ({float(proc):.0%})")
+        if isinstance(interp, (int, float)):
+            lines.append(f"- **Interpretive confidence:** {_confidence_label(float(interp)).upper()} ({float(interp):.0%})")
+    else:
+        lines.append(f"- **Confidence:** {confidence.upper()}")
 
     if model_validity != "invalid" and isinstance(implied, (int, float)) and implied:
         price_line = f"- **Model-implied share price:** ${implied:.2f}"
@@ -201,6 +347,9 @@ def _executive_summary_lines(payload: dict[str, Any]) -> list[str]:
             f"(bear / base / bull)"
         )
     lines.append("")
+    drivers = _confidence_drivers_lines(payload)
+    if drivers:
+        lines.extend(drivers)
     return lines
 
 
@@ -276,6 +425,84 @@ def extract_dcf_report_from_tool_pointer(content: str) -> str | None:
     return None
 
 
+def dcf_source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Evidence payload needed by the report citation drawer."""
+    registry = SourceRegistry.from_payload(payload)
+    citation_map = registry.citation_map()
+    evidence_items = payload_evidence_items(payload)
+    by_id = {str(item.get("evidence_id") or ""): item for item in evidence_items}
+    ticker = str(payload.get("ticker") or "")
+
+    resolved: list[dict[str, Any]] = []
+    resolved_ids: set[str] = set()
+    for evidence_id in citation_map.values():
+        if not evidence_id or evidence_id in resolved_ids:
+            continue
+        item = resolve_evidence_item(evidence_id, by_id, all_items=evidence_items)
+        if item is None:
+            item = infer_evidence_item(evidence_id, ticker=ticker)
+        resolved.append(item)
+        resolved_ids.add(evidence_id)
+
+    return {
+        "citation_map": citation_map,
+        "evidence_items": resolved,
+    }
+
+
+def _load_persisted_dcf_payload() -> dict[str, Any] | None:
+    """Read the finalized DCF JSON artifact when tool-result metadata is sparse."""
+    from utils import get_run_dir  # noqa: PLC0415
+
+    path = get_run_dir() / "dcf_output.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def extract_dcf_source_metadata_from_tool_pointer(content: str) -> dict[str, Any] | None:
+    """Return citation metadata from a run_dcf_workflow tool pointer."""
+    try:
+        pointer = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(pointer, dict):
+        return None
+    if pointer.get("tool_name") != "run_dcf_workflow" or pointer.get("dcf_hitl"):
+        return None
+
+    tool_result_id = pointer.get("tool_result_id")
+    if not tool_result_id:
+        return None
+    from utils import get_run_dir  # noqa: PLC0415
+
+    file_path = get_run_dir() / "tool_results" / f"{tool_result_id}.json"
+    if not file_path.exists():
+        return None
+    try:
+        stored = json.loads(file_path.read_text(encoding="utf-8"))
+        payload = json.loads(stored.get("result") or "{}")
+    except (json.JSONDecodeError, OSError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    if not payload_evidence_items(payload):
+        persisted = _load_persisted_dcf_payload()
+        if persisted:
+            payload = dict(payload)
+            if persisted.get("_evidence_items"):
+                payload["_evidence_items"] = persisted["_evidence_items"]
+            if persisted.get("evidence_pack"):
+                payload["evidence_pack"] = persisted["evidence_pack"]
+
+    return dcf_source_metadata(payload)
+
+
 def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) -> str:
     """Rich DCF report markdown.
 
@@ -297,7 +524,7 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
     lines.append(f"# DCF Valuation: {ticker}")
     lines.append(f"Horizon: {horizon} years")
 
-    evidence_items = payload.get("_evidence_items") or []
+    evidence_items = payload_evidence_items(payload)
     source_registry = SourceRegistry.from_payload(payload)
 
     profile_lines = company_profile_section_lines(payload, source_registry)
@@ -382,31 +609,52 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
         lines.append("")
 
     critique = payload.get("critique") or {}
-    if critique:
+    divergences = payload.get("divergences") or []
+    analysis_positions = payload.get("analysis_positions") or []
+
+    if critique or divergences or analysis_positions:
         flags = critique.get("flags") or []
         iteration = critique.get("iteration", 0)
-        stop_reason = critique.get("stop_reason", "")
+        stop_reason = str(critique.get("stop_reason") or "").strip()
+        changes = critique.get("changes") or []
+        findings = critique.get("findings") or []
+        should_refine = critique.get("should_refine", False)
+        review_summary = str(critique.get("review_summary") or "").strip()
 
         lines.append("## Analysis Journey")
         if flags:
-            lines.append(f"Self-critique after valuation (iteration {iteration}):")
+            lines.append(f"Quality signals after valuation (iteration {iteration}):")
             for f in flags:
                 sev = f.get("severity", "?").upper()
                 signal = f.get("signal", "?").replace("_", " ")
                 val = f.get("value", f.get("value_bps", f.get("value_pct", "?")))
                 unit = "bps" if "value_bps" in f else ("%" if "value_pct" in f else "")
                 lines.append(f"  [{sev}] {signal}: {val}{unit}")
-            interpretation = critique.get("interpretation", "")
-            if interpretation:
-                lines.append(f"**Interpretation:** {interpretation}")
-            adjustments = critique.get("suggested_adjustments") or {}
-            if adjustments:
-                lines.append("**Adjustments applied:**")
-                for field, delta in adjustments.items():
-                    lines.append(f"  - {field}: {'+' if delta >= 0 else ''}{delta:.4f}")
+        if findings:
+            high = sum(1 for f in findings if str(f.get("severity", "")).lower() == "high")
+            lines.append(f"Adversarial review: {len(findings)} finding(s) ({high} high-severity).")
+        if changes:
+            lines.append("**Assumption changes from review:**")
+            for change in changes[:12]:
+                lines.append(f"  - {change}")
+        if analysis_positions:
+            explained = sum(1 for p in analysis_positions if p.get("position") == "EXPLAINED")
+            unresolved = len(analysis_positions) - explained
+            lines.append(
+                f"Market reconciliation: {explained} explained, {unresolved} unresolved divergence(s)."
+            )
+        elif divergences:
+            lines.append(f"Market reconciliation: {len(divergences)} divergence(s) detected pre-analysis.")
+        interpretation = critique.get("interpretation", "")
+        if interpretation:
+            lines.append(f"**Interpretation:** {interpretation}")
+        if review_summary and review_summary != stop_reason:
+            lines.append(f"**Review note:** {review_summary[:300]}")
         if stop_reason:
             lines.append(f"**Final:** {stop_reason}")
-        if not flags or not stop_reason:
+        elif should_refine and changes:
+            lines.append("**Status:** Assumptions updated and valuation re-run with revised inputs.")
+        elif not flags and not changes and not findings and not divergences and not analysis_positions:
             lines.append("No issues found — valuation accepted as-is.")
         lines.append("")
 
@@ -421,7 +669,9 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
         lines.append("|-------|-------|-------|------|")
         for field in [
             "base_revenue", "revenue_growth", "fcff_margin",
-            "terminal_growth", "tax_rate", "wacc",
+            "revenue_growth_terminal", "fcff_margin_terminal",
+            "terminal_growth", "tax_rate", "buyback_yield",
+            "sbc_pct_revenue", "wacc",
             "shares_outstanding", "net_debt",
         ]:
             val = assumptions.get(field)
@@ -433,10 +683,10 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
             basis = field_basis(field, prov, memo_by_field.get(field))
             ref_ids = _provenance_ref_ids(prov)
             refs = source_registry.format_refs(ref_ids)
-            if field in _TIER_A_FIELDS:
-                val_str = f"${val:,.0f}M"
-            elif field == "shares_outstanding":
+            if field == "shares_outstanding":
                 val_str = f"{val:,.0f}M"
+            elif field in _TIER_A_FIELDS:
+                val_str = f"${val:,.0f}M"
             else:
                 val_str = f"{val:.2%}"
             lines.append(f"| {field} | {val_str} | {basis} | {refs} |")
@@ -465,7 +715,75 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
         wacc_basis = (provenance.get("wacc") or {}).get("evidence") if isinstance(provenance, dict) else None
         if wacc_basis:
             lines.append(f"  Basis: {inline_cite_text(str(wacc_basis), source_registry)}")
+
+        stack = wacc_comp.get("wacc_stack") or {}
+        stack_components = stack.get("components") or []
+        if stack_components:
+            band = stack.get("profile_band") or {}
+            band_str = ""
+            if band:
+                band_str = (
+                    f" — profile band {band.get('soft_min', 0):.0%}–"
+                    f"{band.get('soft_max', 0):.0%}"
+                )
+            lines.append("")
+            lines.append(f"**WACC stack{band_str}:**")
+            for comp in stack_components:
+                label = comp.get("label", "?")
+                value = comp.get("value")
+                delta = comp.get("delta")
+                if value is not None and delta in (None, 0.0) and label == "Base CAPM":
+                    lines.append(f"  - {label}: {value:.2%}")
+                elif delta is not None and delta != 0.0:
+                    lines.append(f"  - {label}: {delta:+.2%}")
+                elif value is not None:
+                    lines.append(f"  - {label}: {value:.2%}")
+            valuation_wacc = float((assumptions or {}).get("wacc") or 0.0)
+            stack_final = stack.get("final_wacc")
+            if valuation_wacc > 0:
+                lines.append(f"  - **WACC used in valuation: {valuation_wacc:.2%}**")
+                if stack_final is not None and abs(float(stack_final) - valuation_wacc) > 1e-6:
+                    lines.append(
+                        f"  - ⚠ Stack audit trail ends at {float(stack_final):.2%} "
+                        f"— differs from valuation WACC"
+                    )
+            elif stack_final is not None:
+                lines.append(f"  - **Final WACC: {float(stack_final):.2%}**")
         lines.append("")
+
+        coherence = payload.get("coherence_assessment") or {}
+        coherence_adj = payload.get("coherence_adjustments") or {}
+        if coherence or coherence_adj:
+            lines.append("## Assumption Coherence")
+            ops_tier = coherence.get("ops_tier", "neutral")
+            wacc_tier = coherence.get("wacc_tier", "unknown")
+            status = coherence.get("status", "ok")
+            badge = "✓" if status == "ok" else "⚠"
+            lines.append(
+                f"{badge} **Status:** {status} — operating bundle: `{ops_tier}`, "
+                f"WACC tier: `{wacc_tier}`"
+            )
+            rationale = coherence.get("ops_rationale") or []
+            if rationale:
+                lines.append(f"> Ops signals: {'; '.join(rationale)}")
+            for flag in coherence.get("flags", []) or []:
+                msg = flag.get("message") or flag.get("code", "")
+                if msg:
+                    lines.append(f"> {msg}")
+            if coherence_adj:
+                lines.append("")
+                lines.append("**Auto-corrections applied:**")
+                for field, change in coherence_adj.items():
+                    if not isinstance(change, dict):
+                        continue
+                    old = float(change.get("old", 0.0))
+                    new = float(change.get("new", 0.0))
+                    delta = float(change.get("delta", 0.0))
+                    reason = str(change.get("reason", ""))
+                    lines.append(
+                        f"  - `{field}`: {old:.2%} → {new:.2%} ({delta:+.2%}) — {reason}"
+                    )
+            lines.append("")
 
     recon_lines = market_reconciliation_section_lines(payload, source_registry)
     if recon_lines:
@@ -497,7 +815,9 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
     company_state = payload.get("company_state") or {}
     if company_state:
         context_refs = source_registry.format_refs(company_state_ref_ids(company_state))
-        lines.append(f"## Company Context {context_refs}".rstrip())
+        lines.append("## Company Context")
+        if context_refs != "—":
+            lines.append(f"**Sources:** {context_refs}")
         lines.append("")
         overview_items = [
             ("business_summary", "Business summary"),
@@ -585,6 +905,12 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
         else:
             lines.append(f"- ✓ **EV reconciliation:** ${pv:,.0f}M + ${tv_pv:,.0f}M = ${ev:,.0f}M {net_debt_refs}".rstrip())
         lines.append("")
+
+        shareholder_lines = _shareholder_mechanics_section_lines(
+            valuation, assumptions, int(payload.get("horizon_years") or horizon),
+        )
+        if shareholder_lines:
+            lines.extend(shareholder_lines)
 
     checks = _run_consistency_checks(payload)
     if checks:

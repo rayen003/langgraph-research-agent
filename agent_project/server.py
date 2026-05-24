@@ -11,6 +11,7 @@ GET    /runs/{thread_id}/report          final markdown report (if complete)
 GET    /runs/{thread_id}/dcf-report.md   DCF valuation report (markdown)
 GET    /runs/{thread_id}/dcf-report.pdf  DCF valuation report (PDF)
 GET    /artifacts/{thread_id}/{filename} serve generated artifact files
+GET    /sources/fmp/{ticker}              authenticated FMP source data proxy
 GET    /jobs                             list all runs as job summaries
 POST   /workflows/dcf/runs               create & start deterministic DCF workflow
 POST   /workflows/dcf/runs/{thread_id}/assumptions-decision
@@ -23,6 +24,7 @@ GET    /health                           liveness check
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 import traceback
@@ -39,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from typing import Any
 from pydantic import BaseModel
+import requests
 
 dotenv.load_dotenv(Path(__file__).parent / ".env")
 
@@ -1156,6 +1159,53 @@ def get_artifact(thread_id: str, filename: str) -> FileResponse:
             detail=f"Artifact '{filename}' not found for thread '{thread_id}'",
         )
     return FileResponse(artifact_path)
+
+
+@app.get("/sources/fmp/{ticker}")
+def get_fmp_source_data(ticker: str, field: str | None = Query(default=None)) -> dict:
+    """Return raw FMP source data using the server-side API key.
+
+    Report links must not include API keys, so DCF references point here for
+    FMP-backed assumptions. The response intentionally exposes the upstream
+    endpoint names, but never the configured API key.
+    """
+    symbol = ticker.strip().upper()
+    if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=422, detail="Invalid ticker")
+
+    api_key = os.getenv("FMP_API_KEY") or os.getenv("FINANCIAL_MODELING_PREP_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="FMP_API_KEY is not configured on the server")
+
+    endpoints = {
+        "profile": f"profile?symbol={symbol}",
+        "income_statement": f"income-statement?symbol={symbol}&period=annual&limit=5",
+        "balance_sheet": f"balance-sheet-statement?symbol={symbol}&period=annual&limit=5",
+        "cash_flow": f"cash-flow-statement?symbol={symbol}&period=annual&limit=5",
+    }
+    data: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    for name, path in endpoints.items():
+        url = f"https://financialmodelingprep.com/stable/{path}"
+        try:
+            response = requests.get(url, params={"apikey": api_key}, timeout=12)
+            response.raise_for_status()
+            data[name] = response.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("FMP source proxy failed ticker=%s endpoint=%s error=%s", symbol, name, exc)
+            errors[name] = str(exc)
+
+    if not data:
+        raise HTTPException(status_code=502, detail={"message": "FMP source fetch failed", "errors": errors})
+
+    return {
+        "provider": "financialmodelingprep",
+        "ticker": symbol,
+        "field": field,
+        "endpoints": list(data.keys()),
+        "data": data,
+        "errors": errors,
+    }
 
 
 @app.get("/jobs", response_model=list[JobSummary])

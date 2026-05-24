@@ -83,6 +83,8 @@ export default function App() {
           threadId: state.thread_id,
           artifactPaths: state.artifact_paths.length ? state.artifact_paths : undefined,
           activity: state.activity.length ? state.activity : undefined,
+          dcfEvidenceItems: state.dcf_evidence_items?.length ? state.dcf_evidence_items : undefined,
+          dcfCitationMap: state.dcf_citation_map && Object.keys(state.dcf_citation_map).length ? state.dcf_citation_map : undefined,
           validity,
           invalidationReason,
         })

@@ -8,12 +8,46 @@ from typing import Any
 
 from .activity import emit_step
 from .review_graph import build_deterministic_flags, review_dcf_app
-from .state import DCFState
+from .state import DCFState, clip_to_field_range
+from .wacc import clip_wacc_to_profile_band, append_wacc_stack_delta
 
 logger = logging.getLogger(__name__)
 
 
 _MAX_REVIEW_ITERATIONS = 2
+
+
+def _apply_bounded_delta(
+    assumptions: dict[str, float],
+    field: str,
+    delta: float,
+    *,
+    profile: str,
+    provenance: dict[str, dict[str, Any]],
+) -> float | None:
+    """Apply a review delta with profile-aware WACC clipping."""
+    if field not in assumptions:
+        return None
+    old = float(assumptions[field])
+    candidate = round(old + float(delta), 6)
+    if field == "wacc":
+        wacc_prov = provenance.get("wacc") or {}
+        user_wacc = wacc_prov.get("source") in {
+            "user_override", "user_provided", "user_edited",
+        } or bool(wacc_prov.get("user_edited"))
+        clipped, _ = clip_wacc_to_profile_band(
+            candidate,
+            profile=profile,
+            allow_override=user_wacc,
+        )
+        candidate = round(clipped, 6)
+    else:
+        bounded = clip_to_field_range(field, candidate)
+        if bounded is None:
+            return None
+        candidate = round(float(bounded), 6)
+    assumptions[field] = candidate
+    return candidate
 
 
 def run_review_subgraph(state: DCFState) -> dict:
@@ -45,8 +79,11 @@ def run_review_subgraph(state: DCFState) -> dict:
 
     if converged or iteration >= _MAX_REVIEW_ITERATIONS:
         reason = (
-            f"converged (delta={delta_pct:.1f}%)" if converged
-            else f"max review iterations reached ({iteration}/{_MAX_REVIEW_ITERATIONS})"
+            f"Reconciliation stable across iterations (Δ={delta_pct:.1f}%)" if converged
+            else (
+                f"Further iterations unlikely to materially reduce reconciliation gaps "
+                f"(reviewed {iteration}/{_MAX_REVIEW_ITERATIONS} passes)."
+            )
         )
         emit_step(
             "review_subgraph", "complete", parent_step_id,
@@ -125,15 +162,44 @@ def run_review_subgraph(state: DCFState) -> dict:
 
     new_assumptions = dict(state.get("assumptions") or {})
     new_scenarios = [dict(s) for s in (state.get("scenarios") or [])]
+    profile = state.get("profile") or "default"
+    provenance = dict(state.get("assumption_provenance") or {})
+    wacc_components = dict(state.get("wacc_components") or {})
 
     changes: list[str] = []
 
     base_deltas = adjustments.get("base") or {}
     for field, delta in base_deltas.items():
-        if field in new_assumptions:
-            old = new_assumptions[field]
-            new_assumptions[field] = round(old + delta, 6)
-            changes.append(f"base.{field}: {old:.4f} → {new_assumptions[field]:.4f}")
+        old = new_assumptions.get(field)
+        if old is None:
+            continue
+        new_val = _apply_bounded_delta(
+            new_assumptions,
+            field,
+            float(delta),
+            profile=profile,
+            provenance=provenance,
+        )
+        if new_val is not None:
+            changes.append(f"base.{field}: {old:.4f} → {new_val:.4f}")
+            if field == "wacc":
+                wacc_components = append_wacc_stack_delta(
+                    wacc_components,
+                    old_wacc=float(old),
+                    new_wacc=float(new_val),
+                    label=f"Review-loop adjustment (pass {iteration + 1})",
+                    source="review_loop",
+                )
+                wacc_prov = dict(provenance.get("wacc") or {})
+                existing_evidence = str(wacc_prov.get("evidence") or "")
+                delta = float(new_val) - float(old)
+                wacc_prov["evidence"] = (
+                    existing_evidence
+                    + (" | " if existing_evidence else "")
+                    + f"review-loop adjustment {delta:+.2%} (pass {iteration + 1})"
+                )
+                wacc_prov["review_adjusted"] = True
+                provenance["wacc"] = wacc_prov
 
     for i, scenario in enumerate(new_scenarios):
         sc_name = scenario.get("name", "")
@@ -142,10 +208,18 @@ def run_review_subgraph(state: DCFState) -> dict:
             continue
         sc_assumptions = dict(scenario.get("assumptions") or {})
         for field, delta in sc_deltas.items():
-            if field in sc_assumptions:
-                old = sc_assumptions[field]
-                sc_assumptions[field] = round(old + delta, 6)
-                changes.append(f"{sc_name}.{field}: {old:.4f} → {sc_assumptions[field]:.4f}")
+            old = sc_assumptions.get(field)
+            if old is None:
+                continue
+            new_val = _apply_bounded_delta(
+                sc_assumptions,
+                field,
+                float(delta),
+                profile=profile,
+                provenance=provenance,
+            )
+            if new_val is not None:
+                changes.append(f"{sc_name}.{field}: {old:.4f} → {new_val:.4f}")
         new_scenarios[i] = {**scenario, "assumptions": sc_assumptions}
 
     history_record = {
@@ -187,6 +261,8 @@ def run_review_subgraph(state: DCFState) -> dict:
         "assumptions": new_assumptions,
         "scenarios": new_scenarios,
         "assumption_history": new_history,
+        "assumption_provenance": provenance,
+        "wacc_components": wacc_components,
         "critique": critique,
         "analysis_iteration": iteration + 1,
         "previous_valuation": {
@@ -198,18 +274,18 @@ def run_review_subgraph(state: DCFState) -> dict:
 
 
 def route_after_review_val(state: DCFState) -> str:
-    """Fast-path router: re-enter project_cashflows or finalize."""
+    """Fast-path router: re-project cash flows after review, or proceed to divergences."""
     critique = state.get("critique") or {}
     should_refine = critique.get("should_refine", False)
-    dest = "project_cashflows" if should_refine else "finalize"
+    dest = "coherence_gate" if should_refine else "detect_divergences"
     logger.info("DCF route_after_review_val should_refine=%s → %s", should_refine, dest)
     return dest
 
 
 def route_after_review(state: DCFState) -> str:
-    """Route to scenario_runner (another pass) or finalize."""
+    """Route to coherence gate (re-valuation) after review, or proceed to divergences."""
     critique = state.get("critique") or {}
     should_refine = critique.get("should_refine", False)
-    dest = "scenario_runner" if should_refine else "finalize"
+    dest = "coherence_gate" if should_refine else "detect_divergences"
     logger.info("DCF route_after_review should_refine=%s → %s", should_refine, dest)
     return dest

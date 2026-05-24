@@ -19,6 +19,22 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-placeholder")
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "payloads"
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-dcf-e2e",
+        action="store_true",
+        default=False,
+        help="Run live DCF workflow E2E tests and write timestamped artifacts.",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "e2e: opt-in end-to-end tests that may call LLMs/external APIs",
+    )
+
+
 def _load_fixture(name: str) -> dict:
     path = FIXTURES_DIR / name
     if not path.exists():

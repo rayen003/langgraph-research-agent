@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from .activity import emit_step
 from .state import DCFState
+from .wacc import clip_wacc_to_profile_band, append_wacc_stack_delta
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +152,13 @@ def analyze_result_node(state: DCFState) -> dict:
 
     if not should_refine:
         reason = (
-            "converged (< 5% delta)" if converged
-            else f"no severe flags ({severe_count} severe, {warning_count} warnings)"
+            "Reconciliation stable across iterations (Δ<5%)" if converged
+            else f"No severe quality flags ({severe_count} severe, {warning_count} warnings)"
             if severe_count == 0
-            else f"max iterations reached ({iteration}/{_MAX_ANALYSIS_ITERATIONS})"
+            else (
+                f"Further iterations unlikely to materially reduce reconciliation gaps "
+                f"(reviewed {iteration}/{_MAX_ANALYSIS_ITERATIONS} passes)."
+            )
         )
         critique["stop_reason"] = reason
         emit_step(
@@ -266,11 +270,33 @@ def refine_assumptions_node(state: DCFState) -> dict:
                 direction = -0.01 if gap_bps > 0 else 0.01
                 adjustments["wacc"] = round(direction, 4)
 
+    profile = state.get("profile") or "default"
+    provenance = state.get("assumption_provenance") or {}
+    wacc_components = dict(state.get("wacc_components") or {})
+    wacc_prov_source = (provenance.get("wacc") or {}).get("source")
+    user_wacc = wacc_prov_source in {"user_override", "user_provided", "user_edited"}
+
     changes: list[str] = []
     for field, delta in adjustments.items():
         if field in assumptions:
             old = assumptions[field]
-            assumptions[field] = round(old + delta, 4)
+            new_value = round(old + delta, 4)
+            if field == "wacc":
+                clipped, was_clipped = clip_wacc_to_profile_band(
+                    new_value,
+                    profile=profile,
+                    allow_override=user_wacc,
+                )
+                if was_clipped:
+                    new_value = round(clipped, 4)
+                wacc_components = append_wacc_stack_delta(
+                    wacc_components,
+                    old_wacc=float(old),
+                    new_wacc=float(new_value),
+                    label="Analysis refinement adjustment",
+                    source="refinement",
+                )
+            assumptions[field] = new_value
             changes.append(f"{field}: {old:.4f} → {assumptions[field]:.4f}")
 
     interpretation = critique.get("interpretation", "No interpretation provided.")
@@ -285,7 +311,7 @@ def refine_assumptions_node(state: DCFState) -> dict:
             "had_changes": len(changes) > 0,
         },
     )
-    return {"assumptions": assumptions}
+    return {"assumptions": assumptions, "wacc_components": wacc_components}
 
 
 def route_after_analysis(state: DCFState) -> str:

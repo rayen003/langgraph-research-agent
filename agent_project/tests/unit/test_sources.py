@@ -7,15 +7,17 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-placeholder")
 
-from agent_project.graphs.workflows.dcf.payload import summarize_dcf_payload
+from agent_project.graphs.workflows.dcf.payload import dcf_source_metadata, summarize_dcf_payload
 from agent_project.graphs.workflows.dcf.review import review_assumptions_node
 from agent_project.graphs.workflows.dcf.sources import (
     SourceRegistry,
     evidence_item_url,
     field_basis,
     format_reference_line,
+    infer_evidence_item,
     inline_cite_text,
     merge_hitl_provenance,
+    payload_evidence_items,
 )
 from agent_project.tests.helpers import build_test_payload
 
@@ -26,8 +28,8 @@ def test_source_registry_stable_numbering():
         {"evidence_id": "b", "kind": "web_excerpt", "title": "News headline"},
     ]
     reg = SourceRegistry(items)
-    assert reg.format_refs(["b", "a"]) == "[1][2]"
-    assert reg.format_refs(["a", "a", "b"]) == "[1][2]"
+    assert reg.format_refs(["b", "a"]) == "[1] [2]"
+    assert reg.format_refs(["a", "a", "b"]) == "[1] [2]"
 
 
 def test_source_registry_references_section():
@@ -77,8 +79,99 @@ def test_format_reference_line_fmp_fallback_link():
         "evidence": "FMP effective tax rate from income statement.",
     }
     line = format_reference_line(4, item["evidence_id"], item)
-    assert "financialmodelingprep.com/financial-summary/AAPL" in line
+    assert line == "- **[4]** FMP · tax rate — 2025-09-27 · Financial data API · FMP effective tax rate from income statement."
     assert "FMP · tax rate" in line
+
+
+def test_source_registry_reads_evidence_pack_items_for_reference_links():
+    payload = {
+        "ticker": "AAPL",
+        "evidence_pack": {
+            "items": [
+                {
+                    "evidence_id": "ev_web_1_evb_1779577855866",
+                    "kind": "web_excerpt",
+                    "title": "Apple reports quarterly results",
+                    "url": "https://www.apple.com/newsroom/",
+                    "source_tier": "generic_web",
+                },
+            ],
+        },
+        "assumption_provenance": {
+            "revenue_growth": {
+                "evidence_refs": ["ev_web_1_evb_1779577855866"],
+            },
+        },
+    }
+
+    reg = SourceRegistry.from_payload(payload)
+    lines = reg.references_section_lines()
+
+    assert any(
+        "[Apple reports quarterly results](https://www.apple.com/newsroom/)" in line
+        for line in lines
+    )
+
+
+def test_reference_line_fallbacks_use_human_titles():
+    fmp = format_reference_line(3, "ev_fmp_fcff_margin", None, ticker="AAPL")
+    sec = format_reference_line(4, "ev_sec_0000320193260000_risk_factors", None, ticker="AAPL")
+    web = format_reference_line(8, "ev_web_2_evb_1779577855866", None, ticker="AAPL")
+    compound = format_reference_line(
+        9, "ev_fmp+fallback:yfinance_fcff_margin", None, ticker="AAPL",
+    )
+
+    assert fmp == "- **[3]** FMP · fcff margin — Financial data API"
+    assert "SEC filing · Referenced filing" in sec
+    assert "sec.gov/cgi-bin/browse-edgar?CIK=0000320193" in sec
+    assert web == "- **[8]** Web source reference — Web"
+    assert compound == "- **[9]** FMP · fcff margin — Financial data API"
+
+
+def test_payload_evidence_items_deduplicates_all_persisted_shapes():
+    item = {"evidence_id": "ev_web_0", "kind": "web_excerpt", "url": "https://example.com"}
+    payload = {
+        "_evidence_items": [item],
+        "evidence_pack": {"items": [item, {"evidence_id": "ev_fmp_tax_rate"}]},
+        "hitl_snapshot": {"evidence_items": [{"evidence_id": "ev_fmp_tax_rate"}]},
+    }
+
+    assert [i["evidence_id"] for i in payload_evidence_items(payload)] == [
+        "ev_web_0",
+        "ev_fmp_tax_rate",
+    ]
+
+
+def test_dcf_source_metadata_infers_missing_cited_items():
+    payload = {
+        "ticker": "AAPL",
+        "company_state": {
+            "evidence_refs": ["ev_web_2_evb_missing", "ev_fmp_tax_rate"],
+        },
+        "evidence_pack": {"items": []},
+    }
+
+    metadata = dcf_source_metadata(payload)
+    evidence_by_id = {
+        item["evidence_id"]: item
+        for item in metadata["evidence_items"]
+    }
+
+    assert metadata["citation_map"] == {
+        "1": "ev_web_2_evb_missing",
+        "2": "ev_fmp_tax_rate",
+    }
+    assert evidence_by_id["ev_web_2_evb_missing"]["inferred"] is True
+    assert evidence_by_id["ev_web_2_evb_missing"]["source_tier"] == "generic_web"
+    assert evidence_by_id["ev_fmp_tax_rate"]["field"] == "tax_rate"
+    assert evidence_by_id["ev_fmp_tax_rate"]["source_tier"] == "structured_api"
+
+
+def test_infer_evidence_item_adds_sec_url_when_possible():
+    item = infer_evidence_item("ev_sec_0000320193260000_risk_factors", ticker="AAPL")
+
+    assert item["source_tier"] == "filing"
+    assert item["url"].startswith("https://www.sec.gov/cgi-bin/browse-edgar?CIK=0000320193")
 
 
 def test_merge_hitl_preserves_original_source():

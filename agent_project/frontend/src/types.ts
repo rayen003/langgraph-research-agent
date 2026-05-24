@@ -66,6 +66,8 @@ export interface AgentRunState {
    */
   activity: ActivityEntry[]
   dcf_review?: DcfReviewState | null
+  dcf_evidence_items?: EvidenceItem[]
+  dcf_citation_map?: Record<string, string>
 }
 
 export interface EvidenceItem {
@@ -81,6 +83,7 @@ export interface EvidenceItem {
   value?: number
   section?: string
   filing_type?: string
+  inferred?: boolean
 }
 
 export interface ConfidenceComponent {
@@ -125,6 +128,8 @@ export interface SessionMessage {
    * Renders the same auditable view used for live runs.
    */
   activity?: ActivityEntry[]
+  dcfEvidenceItems?: EvidenceItem[]
+  dcfCitationMap?: Record<string, string>
   /**
    * DCF validity captured at commit time. When 'invalid', the message
    * renders with a red degraded banner so the user can't miss it.

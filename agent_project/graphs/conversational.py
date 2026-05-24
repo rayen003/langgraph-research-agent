@@ -125,6 +125,18 @@ def _extract_dcf_report(history: list) -> str | None:
     return None
 
 
+def _extract_dcf_source_metadata(history: list) -> dict | None:
+    """If the last completed DCF run has citation metadata, return it."""
+    from graphs.workflows.dcf.payload import extract_dcf_source_metadata_from_tool_pointer  # noqa: PLC0415
+
+    for message in reversed(history):
+        if isinstance(message, ToolMessage):
+            metadata = extract_dcf_source_metadata_from_tool_pointer(str(message.content))
+            if metadata:
+                return metadata
+    return None
+
+
 def _normalize_args(args: dict) -> dict:
     if not isinstance(args, dict):
         return {}
@@ -187,6 +199,12 @@ def _is_quota_error(exc: Exception) -> bool:
     return "insufficient_quota" in msg or "rate limit" in msg or "429" in msg or "quota" in msg
 
 
+def _is_timeout_error(exc: Exception) -> bool:
+    """Detect provider/network timeouts without importing provider-specific classes."""
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return "timeout" in msg or "timed out" in msg or "readtimeout" in msg
+
+
 _QUOTA_FALLBACK_MSG = (
     "⚠️ API quota exhausted (HTTP 429 insufficient_quota). "
     "The DCF workflow completed any deterministic steps and persisted what it could, "
@@ -230,7 +248,19 @@ def _chat_node_inner(state: dict) -> dict:
 
     # ── ReAct loop ────────────────────────────────────────────────────────────
     for round_idx in range(MAX_CHAT_ROUNDS):
-        response = chat_agent_llm.invoke(history)
+        try:
+            response = chat_agent_llm.invoke(history)
+        except Exception as exc:  # noqa: BLE001
+            # If a DCF tool call already completed, never let a post-tool
+            # synthesis timeout break the UI. The report is already in the
+            # tool result and can be emitted verbatim below.
+            if _is_timeout_error(exc) and _extract_dcf_report(history):
+                logger.warning(
+                    "chat_node: post-DCF synthesis timed out; emitting report fallback",
+                    exc_info=True,
+                )
+                break
+            raise
         history.append(response)
 
         if not response.tool_calls:
@@ -270,6 +300,12 @@ def _chat_node_inner(state: dict) -> dict:
                 result = json.dumps({"error": str(e)})
 
             history.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+            # Completed DCF reports should be shown verbatim. Do not ask the
+            # chat LLM for another round; that extra call can timeout after the
+            # expensive deterministic workflow has already succeeded.
+            if _extract_dcf_report(history):
+                break
 
             # If the tool returned a HITL result (DCF assumptions for review),
             # break the ReAct loop immediately — the LLM must present to user.
@@ -327,6 +363,9 @@ def _chat_node_inner(state: dict) -> dict:
         artifact_paths = list_artifact_paths()
         if artifact_paths:
             complete_event["artifact_paths"] = artifact_paths
+        source_metadata = _extract_dcf_source_metadata(history)
+        if source_metadata:
+            complete_event.update(source_metadata)
     emit_ui_event(complete_event)
 
     return {"messages": [AIMessage(content=final_text)]}

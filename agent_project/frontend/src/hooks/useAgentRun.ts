@@ -25,6 +25,8 @@ const INITIAL_STATE: AgentRunState = {
   chat_messages: [],
   activity: [],
   dcf_review: null,
+  dcf_evidence_items: [],
+  dcf_citation_map: {},
 }
 
 /**
@@ -256,6 +258,8 @@ export function useAgentRun() {
         case 'chat_complete': {
           const content = (data.content as string) ?? ''
           const artifactPaths = (data.artifact_paths as string[]) ?? []
+          const evidenceItems = (data.evidence_items as import('../types').EvidenceItem[]) ?? []
+          const citationMap = (data.citation_map as Record<string, string>) ?? {}
           const msgs = prev.chat_messages.map(m => {
             if (!m.streaming) return m
             // Use event content if it was never streamed token-by-token (tool-using runs)
@@ -276,6 +280,8 @@ export function useAgentRun() {
             status: nextStatus,
             chat_messages: finalMsgs,
             artifact_paths: artifactPaths.length ? artifactPaths : prev.artifact_paths,
+            dcf_evidence_items: evidenceItems.length ? evidenceItems : prev.dcf_evidence_items,
+            dcf_citation_map: Object.keys(citationMap).length ? citationMap : prev.dcf_citation_map,
           }
         }
         // ── Shared terminal states ─────────────────────────────────────────

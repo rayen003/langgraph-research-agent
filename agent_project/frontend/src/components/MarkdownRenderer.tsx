@@ -157,12 +157,43 @@ const components: Components = {
 interface Props {
   content: string
   streaming?: boolean
+  onCitationClick?: (citationNumber: string) => void
 }
 
-export function MarkdownRenderer({ content, streaming = false }: Props) {
+export function MarkdownRenderer({ content, streaming = false, onCitationClick }: Props) {
+  const activeComponents: Components = onCitationClick
+    ? {
+        ...components,
+        a: ({ href, children }) => {
+          const match = String(href ?? '').match(/^#source-(\d+)$/)
+          if (match) {
+            return (
+              <button
+                type="button"
+                onClick={() => onCitationClick(match[1])}
+                className="text-indigo-300 hover:text-indigo-200 underline underline-offset-2 decoration-indigo-500/40 transition-colors"
+              >
+                {children}
+              </button>
+            )
+          }
+          return (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-indigo-400 hover:text-indigo-300 underline underline-offset-2 decoration-indigo-500/30 transition-colors"
+            >
+              {children}
+            </a>
+          )
+        },
+      }
+    : components
+
   return (
     <div className="min-w-0">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={activeComponents}>
         {content}
       </ReactMarkdown>
       {streaming && (

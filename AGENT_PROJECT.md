@@ -58,7 +58,8 @@ agent_project/
 │           ├── sec_filings.py  # SEC EDGAR integration
 │           ├── synthesis.py    # LLM semantic synthesis (CompanyState)
 │           ├── memo.py         # LLM assumption memo (base case proposals)
-│           ├── wacc.py         # CAPM WACC estimation
+│           ├── wacc.py         # CAPM WACC + profile quality stack + post-stack audit trail
+│           ├── coherence.py    # Pre-valuation ops/WACC coherence gate
 │           ├── valuation.py    # Deterministic FCFF math + finalize_node
 │           ├── priors.py       # Profile priors + confidence breakdown
 │           ├── review.py           # HITL assumption review gate
@@ -207,6 +208,8 @@ Both show the same `DcfHitlSection` component (assumptions table, EvidencePanel,
 
 On approval, the server persists a full **HITL snapshot** (`hitl_snapshot.py`) — evidence pack, provenance, scenarios, thesis, company state — and restores it before the fast-path re-invoke. The `[DCF_APPROVED]` message carries this snapshot so post-approval runs keep numbered citations instead of falling back to `user_provided`.
 
+**Evidence persistence fix (May 2026):** `build_hitl_snapshot()` now reads from `evidence_pack.items` via `extract_evidence_items()` (not only the truncated `evidence_items` key on interrupt payloads). `finalize_node` writes both `_evidence_items` and `evidence_pack` into `dcf_output.json`. `dcf_source_metadata()` resolves cited IDs to real items for the citation drawer; falls back to `dcf_output.json` when tool-result JSON is sparse. The frontend drawer shows archived excerpts + URLs instead of generic “metadata not preserved” placeholders when items survive the fast path.
+
 HITL handling is DRYed in `server.py` via `_handle_dcf_hitl()` — one function for both chat and research paths.
 
 ### DCF Report Delivery
@@ -219,7 +222,10 @@ After HITL approval, chat mode re-invokes via `dcf_valuation_app` (fast path). T
 - Sensitivity matrix (WACC × TGR) + `[SENSITIVITY_CHART]` marker placed before thesis/assumptions
 - Assumptions table with Basis + inline `[n]` refs
 - Formatted Company Context (bullets + `###` subsections), Valuation Detail table, Consistency Checks
-- Hyperlinked References appendix via `sources.py` (`SourceRegistry`, SEC/web/FMP URLs)
+- Hyperlinked References appendix via `sources.py` (`SourceRegistry`, SEC/web/FMP URLs; inferred fallbacks when metadata missing)
+- **Shareholder Mechanics** table — initial shares, horizon buyback effect, SBC drag on FCFF margin, perpetual buyback + effective terminal growth (from `valuation` fields; no full share ledger yet)
+- **WACC stack audit trail** — Base CAPM → profile quality discounts → post-review/coherence deltas; footer shows **WACC used in valuation** (must match assumptions table + sensitivity center)
+- **Assumption Coherence** section — ops/WACC tier classification + auto-corrections when not user-pinned
 
 LLM-only instruction lines (`_assistant_instruction_lines`) are excluded from display output.
 
@@ -237,6 +243,26 @@ LLM-only instruction lines (`_assistant_instruction_lines`) are excluded from di
 PDF generation: `report_export.py` (depends on `reportlab`, `markdown`). Frontend: `DcfReportCard` + `DcfReportDownloadMenu` in `MessageThread.tsx` render inline chart at marker + PDF/MD dropdown.
 
 **Validity policy** — Unexplained market-implied WACC/growth/margin gaps set `reconciliation_status: structural_gap` but leave `model_validity: valid`. Only solver failures or critical unresolved issues mark the model `invalid`.
+
+### WACC stack, coherence gate, and audit trail (May 2026)
+
+Epistemic guardrails added so discount-rate logic is observable and internally consistent in the report.
+
+| Component | Module | Behavior |
+|-----------|--------|----------|
+| **Profile WACC stack** | `wacc.py` | Bottom-up CAPM → additive quality discounts (mega-cap durability, high FCFF margin, net-cash) → clip to profile soft band (`priors.py`). Writes `wacc_stack` into `wacc_components`. |
+| **Coherence gate** | `coherence.py` | Runs before every projection fan-out (`coherence_gate` node). Detects ops/WACC mismatch (e.g. strong growth + high WACC). Auto-pulls WACC toward profile midpoint when not user-pinned; enforces profile band. Review-loop and convergence re-routes go through this gate (not straight to `project_cashflows`). |
+| **Post-stack WACC sync** | `wacc.append_wacc_stack_delta()` | When review loop, coherence gate, or refinement adjusts WACC after the stack is built, appends a labeled delta line (e.g. `Review-loop adjustment (pass 1): +1.00%`) and sets `final_wacc` = assumptions WACC. Report footer: **WACC used in valuation** — eliminates stale 8.90% stack vs 9.90% valuation divergence. |
+| **Shareholder mechanics** | `payload.py` | Surfaces buyback/SBC/per-share fields already computed in `compute_valuation_node` — no year-by-year share ledger yet. |
+| **Report formatting** | `payload.py`, `sources.py` | `shares_outstanding` shows `15,005M` (not `$15,005M`); References use human titles via `infer_evidence_item()` + `format_reference_line()` for missing metadata. |
+| **Chat timeout fix** | `conversational.py` | Completed DCF tool results are terminal; timeout fallback emits report verbatim (`test_conversational_dcf_fallback.py`). |
+| **Interpretive confidence** | `analysis.py`, `payload.py` | Evidence grounding penalty when memo cites web/news but SEC filings exist in pack; procedural vs interpretive confidence decomposition in executive summary. |
+
+**Graph wiring:** `coherence_gate` sits between HITL/scenario runner and `project_cashflows` on both main and fast-path graphs. Review loop WACC deltas are profile-clipped (`review_loop.py`).
+
+**Tests added:** `test_wacc_stack_coherence.py`, `test_report_shareholder_mechanics.py`, `test_evidence_persistence.py`, `test_conversational_dcf_fallback.py`, `test_dcf_valuation_math.py`, `test_capital_assumption_fields.py`, e2e harness `tests/e2e/test_dcf_app_trace.py` (opt-in `--run-dcf-e2e`). Full unit suite: 262 tests.
+
+**Known philosophical tension (not yet implemented):** Profile bands and coherence midpoint-pull act as active guardrails today. Longer-term intent is CAPM-primary with profile bands as fallback/validator only and coherence flag-first (not auto-pull).
 
 ### DCF Scenario-Based Valuation
 
@@ -363,6 +389,12 @@ Unified `ActivityEvent` contract (`activity.py`) describes every unit of agent w
 - [x] DCF report with numbered citations, hyperlinked References, sensitivity matrix + heatmap artifact
 - [x] DCF report PDF + Markdown export (`report_export.py`, ReportLab wrapped tables)
 - [x] HITL snapshot restore — fast path preserves evidence/provenance after approval
+- [x] Evidence pack persisted through HITL → finalize (`extract_evidence_items`, `_evidence_items` + `evidence_pack` in `dcf_output.json`)
+- [x] Citation drawer shows real web/FMP excerpts + URLs (not generic inferred placeholders)
+- [x] WACC stack audit trail synced with valuation WACC (review/coherence/refinement deltas)
+- [x] Shareholder Mechanics report section (buyback, SBC drag, terminal buyback compounding)
+- [x] Pre-valuation coherence gate + profile-based WACC stack
+- [x] Chat DCF timeout fallback — verbatim report when LLM synthesis times out
 - [x] Verbatim DCF report in chat (no LLM re-synthesis of valuation output)
 - [x] Validity vs reconciliation policy — structural market gaps ≠ invalid model
 - [x] `start.sh` runs `uv sync` and kills stale processes before launch
@@ -428,11 +460,13 @@ Replaced the overloaded single `analyze_result_node` with a nested `review_dcf` 
 **Shipped:**
 - Reverse-solved implied WACC/growth/margin via `compute_market_signals_node`
 - `reconciliation_status: structural_gap` when price embeds different expectations but DCF math is valid
-- Numbered `[n]` citations + hyperlinked References appendix (`sources.py`)
+- Numbered `[n]` citations + hyperlinked References appendix (`sources.py`) with human titles for FMP/web/SEC fallbacks
 - Sensitivity matrix + heatmap artifact + inline `[SENSITIVITY_CHART]` marker
 - PDF/Markdown export with table width fixes (`report_export.py`)
-- Scannable report formatting (bullets, subsections, valuation table)
-- HITL snapshot restore for fast-path citation fidelity
+- Scannable report formatting (bullets, subsections, valuation table, Shareholder Mechanics, WACC stack + coherence sections)
+- HITL snapshot restore for fast-path citation fidelity + evidence pack serialization fix
+- WACC stack / coherence gate / post-adjustment audit trail (see section above)
+- Citation drawer wired via `chat_complete` → `citation_map` + `evidence_items` (`dcf_source_metadata`)
 
 **Remaining:**
 - Conviction label surfaced more prominently in UI footer
@@ -491,9 +525,8 @@ Triage for a 2-week interview-readiness sprint. Ordered by interview ROI.
 
 #### 2. Citations surfaced in UI
 
-- **Shipped:** numbered `[n]` refs in report markdown, hyperlinked References appendix (SEC, web, FMP)
-- **Remaining:** assumption table row → click → side panel with 1-3 evidence sources
-- **Why:** Rogo's entire product is citation-first. References links cover the appendix; inline row drill-down is still open.
+- **Shipped:** numbered `[n]` refs in report markdown; hyperlinked References appendix (SEC, web, FMP); click `[n]` in report → `EvidenceSourceDrawer` with title, excerpt, and “Open original source” when metadata archived; FMP “View underlying API data” for structured fundamentals
+- **Remaining:** assumption table row → click → evidence side panel (inline row drill-down; References + citation drawer cover most cases today)
 
 #### 3. Prompt extraction + versioning
 

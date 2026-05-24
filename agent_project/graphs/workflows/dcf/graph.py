@@ -49,6 +49,7 @@ from .analysis import (
     route_after_convergence_gate,
     route_after_convergence_gate_val,
 )
+from .coherence import coherence_gate_node
 from .evidence import assemble_evidence_node
 from .execution import formulate_thesis_node, scenario_runner_node
 from .lifecycle import cache_check_node, normalize_input_node, route_after_cache_check
@@ -146,6 +147,10 @@ def _build_initial_state(
         "reconciliation_status": "aligned",
         "reconciliation_note": "",
         "effective_confidence": None,
+        "confidence_assessment": None,
+        "conviction_direction": None,
+        "coherence_assessment": None,
+        "coherence_adjustments": {},
     }
 
 
@@ -182,6 +187,7 @@ graph.add_node("formulate_thesis", formulate_thesis_node)
 graph.add_node("propose_assumptions", propose_assumptions_node)
 graph.add_node("scenario_generator", scenario_generator_node)
 graph.add_node("review_assumptions", review_assumptions_node)
+graph.add_node("coherence_gate", coherence_gate_node)
 graph.add_node("scenario_runner", scenario_runner_node)
 graph.add_node("project_cashflows", project_cashflows_node)
 graph.add_node("compute_valuation", compute_valuation_node)
@@ -208,20 +214,25 @@ graph.add_edge("scenario_generator", "review_assumptions")
 graph.add_conditional_edges(
     "review_assumptions",
     route_after_assumptions,
-    {"scenario_runner": "scenario_runner", END: END},
+    {"scenario_runner": "coherence_gate", END: END},
 )
+graph.add_edge("coherence_gate", "scenario_runner")
 graph.add_edge("scenario_runner", "project_cashflows")
 graph.add_edge("project_cashflows", "compute_valuation")
 graph.add_edge("compute_valuation", "compute_market_signals")
 graph.add_edge("compute_market_signals", "sensitivity")
 graph.add_edge("sensitivity", "review_subgraph")
-graph.add_edge("review_subgraph", "detect_divergences")
+graph.add_conditional_edges(
+    "review_subgraph",
+    route_after_review,
+    {"coherence_gate": "coherence_gate", "detect_divergences": "detect_divergences"},
+)
 graph.add_edge("detect_divergences", "analysis")
 graph.add_edge("analysis", "convergence_gate")
 graph.add_conditional_edges(
     "convergence_gate",
     route_after_convergence_gate,
-    {"scenario_runner": "scenario_runner", "finalize": "finalize"},
+    {"coherence_gate": "coherence_gate", "finalize": "finalize"},
 )
 graph.add_edge("finalize", END)
 
@@ -231,6 +242,7 @@ dcf_workflow_app = graph.compile(checkpointer=MemorySaver())
 _val_graph = StateGraph(DCFState)
 _val_graph.add_node("normalize_input", normalize_input_node)
 _val_graph.add_node("collect_market_data", collect_market_data_node)
+_val_graph.add_node("coherence_gate", coherence_gate_node)
 _val_graph.add_node("project_cashflows", project_cashflows_node)
 _val_graph.add_node("compute_valuation", compute_valuation_node)
 _val_graph.add_node("compute_market_signals", compute_market_signals_node)
@@ -242,18 +254,23 @@ _val_graph.add_node("convergence_gate", convergence_gate_node)
 _val_graph.add_node("finalize", finalize_node)
 _val_graph.add_edge(START, "normalize_input")
 _val_graph.add_edge("normalize_input", "collect_market_data")
-_val_graph.add_edge("collect_market_data", "project_cashflows")
+_val_graph.add_edge("collect_market_data", "coherence_gate")
+_val_graph.add_edge("coherence_gate", "project_cashflows")
 _val_graph.add_edge("project_cashflows", "compute_valuation")
 _val_graph.add_edge("compute_valuation", "compute_market_signals")
 _val_graph.add_edge("compute_market_signals", "sensitivity")
 _val_graph.add_edge("sensitivity", "review_subgraph")
-_val_graph.add_edge("review_subgraph", "detect_divergences")
+_val_graph.add_conditional_edges(
+    "review_subgraph",
+    route_after_review_val,
+    {"coherence_gate": "coherence_gate", "detect_divergences": "detect_divergences"},
+)
 _val_graph.add_edge("detect_divergences", "analysis")
 _val_graph.add_edge("analysis", "convergence_gate")
 _val_graph.add_conditional_edges(
     "convergence_gate",
     route_after_convergence_gate_val,
-    {"project_cashflows": "project_cashflows", "finalize": "finalize"},
+    {"coherence_gate": "coherence_gate", "finalize": "finalize"},
 )
 _val_graph.add_edge("finalize", END)
 dcf_valuation_app = _val_graph.compile()
@@ -262,13 +279,15 @@ dcf_valuation_app = _val_graph.compile()
 _scenario_graph = StateGraph(DCFState)
 _scenario_graph.add_node("normalize_input", normalize_input_node)
 _scenario_graph.add_node("collect_market_data", collect_market_data_node)
+_scenario_graph.add_node("coherence_gate", coherence_gate_node)
 _scenario_graph.add_node("project_cashflows", project_cashflows_node)
 _scenario_graph.add_node("compute_valuation", compute_valuation_node)
 _scenario_graph.add_node("compute_market_signals", compute_market_signals_node)
 _scenario_graph.add_node("sensitivity", sensitivity_node)
 _scenario_graph.add_edge(START, "normalize_input")
 _scenario_graph.add_edge("normalize_input", "collect_market_data")
-_scenario_graph.add_edge("collect_market_data", "project_cashflows")
+_scenario_graph.add_edge("collect_market_data", "coherence_gate")
+_scenario_graph.add_edge("coherence_gate", "project_cashflows")
 _scenario_graph.add_edge("project_cashflows", "compute_valuation")
 _scenario_graph.add_edge("compute_valuation", "compute_market_signals")
 _scenario_graph.add_edge("compute_market_signals", "sensitivity")

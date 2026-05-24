@@ -107,6 +107,21 @@ def test_sensitivity_matrix_before_assumptions(aapl_payload):
     assert SENSITIVITY_CHART_MARKER in summary
 
 
+def test_company_context_refs_render_outside_heading():
+    payload = build_test_payload(
+        company_state={
+            "business_summary": "Apple designs devices and services.",
+            "key_risks": ["Supply chain risk (ev_sec_0000320193260000_risk_factors)."],
+        },
+    )
+
+    summary = summarize_dcf_payload(payload)
+
+    assert "## Company Context [" not in summary
+    assert "## Company Context" in summary
+    assert "Supply chain risk [1]" in summary
+
+
 def test_aapl_invalid_model_summary_has_banner(aapl_payload):
     """Live AAPL run detected divergence → model_validity=invalid."""
     if aapl_payload.get("model_validity") != "invalid":

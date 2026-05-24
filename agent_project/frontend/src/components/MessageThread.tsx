@@ -3,7 +3,7 @@ import { MarkdownRenderer } from './MarkdownRenderer'
 import { QueryInput } from './QueryInput'
 import { ActivityTrace, ResearchStepsTrace } from './ActivityTrace'
 import type { ActivityEntry } from '../lib/activity'
-import type { AgentRunState, DocumentInfo, DcfReviewState, Mode, Session, SessionMessage, StepState, ToolCall } from '../types'
+import type { AgentRunState, DocumentInfo, DcfReviewState, EvidenceItem, Mode, Session, SessionMessage, StepState, ToolCall } from '../types'
 
 const IMAGE_RE = /\.(png|jpg|jpeg|webp|gif|svg)$/i
 const ARTIFACT_MARKER_RE = /\[ARTIFACTS?\]|\[CHART\]/i
@@ -26,6 +26,24 @@ function splitOnSensitivityChart(text: string): [string, string] {
 
 function isDcfReport(content: string): boolean {
   return content.startsWith('# DCF Valuation:')
+}
+
+function linkifyCitations(content: string, citationMap?: Record<string, string>): string {
+  if (!citationMap || !Object.keys(citationMap).length) return content
+  return content.replace(/\[(\d+)\](?!\()/g, (match, number: string) => {
+    return citationMap[number] ? `[${number}](#source-${number})` : match
+  })
+}
+
+function formatEvidenceValue(item: EvidenceItem): string | null {
+  if (item.value == null) return null
+  const value = Number(item.value)
+  if (!Number.isFinite(value)) return String(item.value)
+  const field = item.field ?? ''
+  if (Math.abs(value) <= 1 && /(rate|margin|growth|tax|wacc|yield)/i.test(field)) {
+    return `${(value * 100).toFixed(2)}%`
+  }
+  return value.toLocaleString(undefined, { maximumFractionDigits: 4 })
 }
 
 function DcfReportDownloadMenu({ threadId }: { threadId: string }) {
@@ -91,6 +109,147 @@ function DcfReportDownloadMenu({ threadId }: { threadId: string }) {
       {error && (
         <p className="max-w-xs text-right text-[10px] text-red-300/90 leading-snug">{error}</p>
       )}
+    </div>
+  )
+}
+
+function EvidenceSourceDrawer({
+  citationNumber,
+  evidence,
+  ticker,
+  onClose,
+}: {
+  citationNumber: string
+  evidence?: EvidenceItem
+  ticker: string
+  onClose: () => void
+}) {
+  const [rawOpen, setRawOpen] = useState(false)
+  const [rawData, setRawData] = useState<string | null>(null)
+  const [loadingRaw, setLoadingRaw] = useState(false)
+  const [rawError, setRawError] = useState<string | null>(null)
+
+  const title = evidence?.title || evidence?.field || evidence?.source || evidence?.evidence_id || `Citation [${citationNumber}]`
+  const tier = evidence?.source_tier ?? 'unknown'
+  const value = evidence ? formatEvidenceValue(evidence) : null
+  const isApiBacked = !!evidence && (tier === 'structured_api' || evidence.kind === 'structured_fundamental' || evidence.kind === 'market_data' || evidence.kind === 'profile')
+
+  const loadRawData = async () => {
+    if (!evidence || !isApiBacked) return
+    setRawOpen(true)
+    if (rawData || loadingRaw) return
+    setLoadingRaw(true)
+    setRawError(null)
+    try {
+      const params = evidence.field ? `?field=${encodeURIComponent(evidence.field)}` : ''
+      const res = await fetch(`/sources/fmp/${encodeURIComponent(ticker)}${params}`)
+      if (!res.ok) throw new Error(`Source fetch failed (${res.status})`)
+      const data = await res.json()
+      setRawData(JSON.stringify(data, null, 2))
+    } catch (err) {
+      setRawError(err instanceof Error ? err.message : 'Source fetch failed')
+    } finally {
+      setLoadingRaw(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/45" role="dialog" aria-modal="true" aria-label={`Source for citation ${citationNumber}`}>
+      <button className="flex-1 cursor-default" aria-label="Close source drawer" onClick={onClose} />
+      <aside className="h-full w-full max-w-md border-l border-[#24242a] bg-[#08080b] shadow-2xl flex flex-col">
+        <div className="flex items-start justify-between gap-3 border-b border-[#1d1d22] px-5 py-4">
+          <div className="min-w-0">
+            <div className="text-[11px] uppercase tracking-wide text-indigo-300">Source [{citationNumber}]</div>
+            <h2 className="mt-1 text-sm font-semibold text-zinc-100 leading-snug break-words">{title}</h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md px-2 py-1 text-sm text-zinc-500 hover:bg-zinc-900 hover:text-zinc-200"
+            aria-label="Close source drawer"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {!evidence ? (
+            <p className="text-sm text-zinc-400">No source metadata was available for this citation.</p>
+          ) : (
+            <>
+              <div className="rounded-lg border border-[#1d1d22] bg-[#0d0d11] p-3 space-y-2">
+                <div className="flex flex-wrap gap-2 text-[10px]">
+                  <span className="rounded bg-indigo-500/10 px-2 py-0.5 font-medium text-indigo-300">{tier.replace('_', ' ')}</span>
+                  <span className="rounded bg-zinc-900 px-2 py-0.5 text-zinc-400">{evidence.kind}</span>
+                  {'inferred' in evidence && evidence.inferred && (
+                    <span className="rounded bg-amber-500/10 px-2 py-0.5 text-amber-300">metadata inferred</span>
+                  )}
+                  {evidence.as_of && <span className="rounded bg-zinc-900 px-2 py-0.5 text-zinc-400">{evidence.as_of.slice(0, 10)}</span>}
+                </div>
+                {value && (
+                  <div>
+                    <div className="text-[11px] text-zinc-500">Value used</div>
+                    <div className="text-lg font-semibold text-zinc-100">{value}</div>
+                  </div>
+                )}
+                {evidence.field && (
+                  <div className="text-xs text-zinc-400">
+                    Field: <span className="font-mono text-zinc-200">{evidence.field}</span>
+                  </div>
+                )}
+                <div className="text-xs text-zinc-500 break-all">Evidence ID: {evidence.evidence_id}</div>
+              </div>
+
+              {evidence.text && !evidence.inferred && (
+                <div className="rounded-lg border border-[#1d1d22] bg-[#0b0b0e] p-3">
+                  <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-zinc-500">Excerpt</div>
+                  <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-zinc-300">{evidence.text}</p>
+                </div>
+              )}
+
+              {evidence.inferred && !evidence.url && (
+                <p className="text-sm text-zinc-400">
+                  Source metadata was not archived with this completed run. The numbered citation still marks where this claim was anchored in the report.
+                </p>
+              )}
+
+              {evidence.url && (
+                <a
+                  href={evidence.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex text-sm text-indigo-300 hover:text-indigo-200 underline underline-offset-2"
+                >
+                  Open original source
+                </a>
+              )}
+
+              {isApiBacked && (
+                <div className="rounded-lg border border-[#1d1d22] bg-[#0b0b0e] p-3">
+                  <button
+                    type="button"
+                    onClick={loadRawData}
+                    className="text-sm font-medium text-zinc-200 hover:text-white"
+                  >
+                    {rawOpen ? 'Underlying FMP API data' : 'View underlying FMP API data'}
+                  </button>
+                  {rawOpen && (
+                    <div className="mt-3">
+                      {loadingRaw && <p className="text-xs text-zinc-500">Loading source data…</p>}
+                      {rawError && <p className="text-xs text-red-300">{rawError}</p>}
+                      {rawData && (
+                        <pre className="max-h-72 overflow-auto rounded-md bg-black/40 p-3 text-[10px] leading-relaxed text-zinc-400">
+                          {rawData}
+                        </pre>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </aside>
     </div>
   )
 }
@@ -161,6 +320,8 @@ function ChatBubble({
   onDcfReject,
   threadId,
   artifactPaths,
+  dcfEvidenceItems,
+  dcfCitationMap,
   hideLabel,
   validity,
   invalidationReason,
@@ -178,6 +339,8 @@ function ChatBubble({
   onDcfReject?: () => void
   threadId?: string
   artifactPaths?: string[]
+  dcfEvidenceItems?: EvidenceItem[]
+  dcfCitationMap?: Record<string, string>
   hideLabel?: boolean
   validity?: 'valid' | 'invalid' | 'adjusting'
   invalidationReason?: string
@@ -222,6 +385,8 @@ function ChatBubble({
                 content={content}
                 threadId={threadId}
                 artifactPaths={artifactPaths}
+                evidenceItems={dcfEvidenceItems}
+                citationMap={dcfCitationMap}
               />
             ) : (
               <MarkdownRenderer content={content} streaming={streaming} />
@@ -239,19 +404,29 @@ function DcfReportCard({
   content,
   threadId,
   artifactPaths,
+  evidenceItems,
+  citationMap,
 }: {
   content: string
   threadId?: string
   artifactPaths?: string[]
+  evidenceItems?: EvidenceItem[]
+  citationMap?: Record<string, string>
 }) {
   const canDownload = !!threadId
   const hasMarker = content.includes(SENSITIVITY_CHART_MARKER)
   const [preChart, postChart] = hasMarker ? splitOnSensitivityChart(content) : [content, '']
   const sensitivityImage = artifactPaths?.find(p => p.includes('sensitivity') && IMAGE_RE.test(p))
+  const [openCitation, setOpenCitation] = useState<string | null>(null)
+  const evidenceById = new Map((evidenceItems ?? []).map(item => [item.evidence_id, item]))
+  const ticker = content.match(/^# DCF Valuation:\s*([A-Z0-9.-]+)/)?.[1] ?? ''
+  const linkifiedPreChart = linkifyCitations(preChart, citationMap)
+  const linkifiedPostChart = linkifyCitations(postChart, citationMap)
+  const openEvidence = openCitation && citationMap ? evidenceById.get(citationMap[openCitation]) : undefined
 
   return (
     <div className="rounded-xl border border-[#1e1e1e] bg-[#080808] px-6 py-5">
-      <MarkdownRenderer content={preChart} streaming={false} />
+      <MarkdownRenderer content={linkifiedPreChart} streaming={false} onCitationClick={setOpenCitation} />
 
       {hasMarker && sensitivityImage && threadId && (
         <figure className="my-5 space-y-2">
@@ -266,12 +441,21 @@ function DcfReportCard({
         </figure>
       )}
 
-      {postChart && <MarkdownRenderer content={postChart} streaming={false} />}
+      {postChart && <MarkdownRenderer content={linkifiedPostChart} streaming={false} onCitationClick={setOpenCitation} />}
 
       {canDownload && (
         <div className="mt-6 pt-4 border-t border-[#1e1e1e] flex justify-end">
           <DcfReportDownloadMenu threadId={threadId!} />
         </div>
+      )}
+
+      {openCitation && (
+        <EvidenceSourceDrawer
+          citationNumber={openCitation}
+          evidence={openEvidence}
+          ticker={ticker}
+          onClose={() => setOpenCitation(null)}
+        />
       )}
     </div>
   )
@@ -431,6 +615,8 @@ function CommittedMessage({ msg }: { msg: SessionMessage }) {
         activities={msg.activity}
         threadId={msg.threadId}
         artifactPaths={msg.artifactPaths}
+        dcfEvidenceItems={msg.dcfEvidenceItems}
+        dcfCitationMap={msg.dcfCitationMap}
         persisted
         validity={msg.validity}
         invalidationReason={msg.invalidationReason}
@@ -666,6 +852,8 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
                   } : undefined}
                   threadId={activeRun.thread_id || undefined}
                   artifactPaths={activeRun.artifact_paths.length ? activeRun.artifact_paths : undefined}
+                  dcfEvidenceItems={activeRun.dcf_evidence_items}
+                  dcfCitationMap={activeRun.dcf_citation_map}
                   hideLabel={hideLabel}
                   validity={liveValidity}
                   invalidationReason={liveInvalidationReason}

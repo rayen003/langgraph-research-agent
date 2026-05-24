@@ -37,7 +37,7 @@ def test_render_report_pdf_wide_assumptions_table():
         "## Assumptions\n\n"
         "| Field | Value | Basis | Refs |\n"
         "|-------|-------|-------|------|\n"
-        f"| revenue_growth | 17.50% | {long_basis} | [1][2] |\n"
+        f"| revenue_growth | 17.50% | {long_basis} | [1] [2] |\n"
         "| wacc | 10.15% | CAPM-derived WACC from env rates. | — |\n"
     )
     pdf = render_report_pdf(md)

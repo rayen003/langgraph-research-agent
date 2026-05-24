@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -49,6 +50,13 @@ _MAX_TARGETED_FETCHES: int = 3  # per divergence
 _MAX_DIVERGENCES_ANALYZED: int = 4  # cap LLM calls per iteration
 _WACC_GAP_BPS_THRESHOLD: int = 100  # flag gap above this
 _GROWTH_GAP_PCT_THRESHOLD: float = 0.04  # 4pp gap = divergence
+
+_DIVERGENCE_VERDICTS = {
+    "explained",
+    "contradicted",
+    "unsupported",
+    "insufficient_evidence",
+}
 
 # severity → confidence multiplier (penalty when divergence is UNEXPLAINED)
 _SEVERITY_PENALTY: dict[str, float] = {
@@ -81,6 +89,13 @@ class AnalysisPosition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     divergence_id: str
     position: str = Field(description="EXPLAINED if evidence justifies a view, UNEXPLAINED if gap remains unresolved")
+    divergence_verdict: str = Field(
+        default="unsupported",
+        description=(
+            "One of: explained, contradicted, unsupported, insufficient_evidence. "
+            "Use contradicted only when evidence directly conflicts with the market-implied expectation."
+        ),
+    )
     explanation: str = Field(description="Reasoning chain — what the evidence shows and why it does or doesn't close the gap")
     evidence_used: list[str] = Field(description="evidence_ids cited from state (existing or newly fetched)")
     adjustment: AnalysisAdjustment | None = Field(
@@ -125,6 +140,8 @@ def detect_divergences_node(state: dict) -> dict:
     wacc_sanity = state.get("wacc_sanity") or {}
     implied_growth = state.get("implied_growth")
     implied_margin = state.get("implied_margin")
+    signals_meta = state.get("market_signals_meta") or {}
+    wacc_binding = bool(signals_meta.get("wacc_binding"))
     thesis = state.get("thesis") or {}
     evidence_pack = state.get("evidence_pack") or {}
 
@@ -153,13 +170,18 @@ def detect_divergences_node(state: dict) -> dict:
                 "implied_wacc": wacc_sanity.get("implied_wacc"),
                 "gap_bps": gap,
                 "direction": wacc_sanity.get("direction"),
+                "wacc_gap_interpretation": wacc_gap_interpretation(wacc_sanity),
             },
             "summary": wacc_sanity.get("interpretation", f"WACC gap {gap}bps"),
         })
 
     # ── Revenue growth: model vs market-implied ─────────────────────────────
     model_growth = assumptions.get("revenue_growth")
-    if isinstance(implied_growth, (int, float)) and isinstance(model_growth, (int, float)):
+    if (
+        not wacc_binding
+        and isinstance(implied_growth, (int, float))
+        and isinstance(model_growth, (int, float))
+    ):
         gap = abs(model_growth - implied_growth)
         if gap > _GROWTH_GAP_PCT_THRESHOLD:
             divergences.append({
@@ -171,12 +193,16 @@ def detect_divergences_node(state: dict) -> dict:
                     "implied_growth": round(implied_growth, 4),
                     "gap_pct": round(gap, 4),
                 },
-                "summary": f"Model growth {model_growth:.1%} vs market-implied {implied_growth:.1%} ({gap*100:+.1f}pp)",
+                "summary": f"Model growth {model_growth:.1%} vs DCF-consistent implied growth {implied_growth:.1%} ({gap*100:+.1f}pp)",
             })
 
     # ── Margin: model vs market-implied ─────────────────────────────────────
     model_margin = assumptions.get("fcff_margin")
-    if isinstance(implied_margin, (int, float)) and isinstance(model_margin, (int, float)):
+    if (
+        not wacc_binding
+        and isinstance(implied_margin, (int, float))
+        and isinstance(model_margin, (int, float))
+    ):
         gap = abs(model_margin - implied_margin)
         if gap > _GROWTH_GAP_PCT_THRESHOLD:
             divergences.append({
@@ -188,7 +214,7 @@ def detect_divergences_node(state: dict) -> dict:
                     "implied_margin": round(implied_margin, 4),
                     "gap_pct": round(gap, 4),
                 },
-                "summary": f"Model margin {model_margin:.1%} vs market-implied {implied_margin:.1%} ({gap*100:+.1f}pp)",
+                "summary": f"Model margin {model_margin:.1%} vs DCF-consistent implied margin {implied_margin:.1%} ({gap*100:+.1f}pp)",
             })
 
     # ── Unanchored thesis: no key drivers cited from evidence ───────────────
@@ -382,10 +408,15 @@ _SYSTEM_PROMPT = """You are a valuation analyst examining a single divergence be
 
 Your job:
 1. Read the divergence signal and the evidence inventory.
-2. Reason about whether the evidence EXPLAINS the gap or leaves it UNEXPLAINED.
+2. Classify the divergence verdict:
+   - explained: evidence supports the market-implied expectation or the model gap is otherwise reconciled.
+   - contradicted: evidence directly conflicts with the market-implied expectation.
+   - unsupported: evidence exists but does not justify the magnitude of the market-implied expectation.
+   - insufficient_evidence: retrieval/coverage is too weak to make a judgment.
 3. If EXPLAINED and an adjustment is warranted, propose a small, justified delta with a reason citing evidence_ids.
-4. If EXPLAINED but no adjustment needed (model is right, market is wrong, and you have evidence), say so — adjustment=null.
-5. If UNEXPLAINED, do NOT invent an adjustment. Write an uncertainty_note for the final report.
+4. If evidence directly contradicts the market-implied expectation, use position=UNEXPLAINED, divergence_verdict=contradicted, adjustment=null.
+5. If evidence is merely insufficient or unsupported, do NOT call the market wrong. Use unsupported or insufficient_evidence and write an uncertainty_note.
+6. For WACC gaps, reason directionally. If market-implied WACC is below model/CAPM WACC, possible causes include overstated CAPM risk, quality/moat premium, low perceived cyclicality, liquidity regime, or market irrationality. Do NOT assume WACC should move upward.
 
 Rules:
 - NEVER invent facts. Cite only evidence_ids present in the input.
@@ -453,13 +484,19 @@ def analysis_node(state: dict) -> dict:
     )
 
     if not divergences:
+        base_conf = _confidence_from_label(state.get("confidence_label", "medium"))
         emit_step(
             "analysis", "complete", parent_step_id,
             {"summary_line": "No divergences — model accepted as-is", "positions": []},
         )
         return {
             "analysis_positions": [],
-            "effective_confidence": _confidence_from_label(state.get("confidence_label", "medium")),
+            "effective_confidence": base_conf,
+            "confidence_assessment": confidence_assessment_from_positions(
+                positions=[],
+                model_validity="valid",
+                base_confidence=base_conf,
+            ),
         }
 
     positions: list[dict[str, Any]] = []
@@ -498,6 +535,7 @@ def analysis_node(state: dict) -> dict:
             positions.append({
                 "divergence_id": d_id,
                 "position": "UNEXPLAINED",
+                "divergence_verdict": "insufficient_evidence",
                 "explanation": "Analysis LLM call failed (rate limit, quota, or schema error).",
                 "evidence_used": [],
                 "new_evidence_fetched": [f["evidence_id"] for f in fetched],
@@ -509,9 +547,18 @@ def analysis_node(state: dict) -> dict:
             continue
 
         pos_dict = position.model_dump()
+        pos_dict["divergence_verdict"] = normalize_divergence_verdict(pos_dict)
+        pos_dict["divergence_kind"] = divergence.get("kind", "")
         pos_dict["divergence_summary"] = divergence.get("summary", "")
         pos_dict["divergence_severity"] = divergence.get("severity", "medium")
         pos_dict["new_evidence_fetched"] = [f["evidence_id"] for f in fetched]
+
+        # WACC / reverse-DCF gaps are structural by default — a large discount-rate
+        # spread does not prove the market is "wrong", only that CAPM ≠ price-implied.
+        if divergence.get("kind") == "wacc_vs_implied" and pos_dict["divergence_verdict"] == "contradicted":
+            pos_dict["divergence_verdict"] = "unsupported"
+            pos_dict["position"] = "UNEXPLAINED"
+            pos_dict["adjustment"] = None
 
         # Phase 4: solver failures are STRUCTURAL — no narrative justifies
         # them. Override any LLM "EXPLAINED" verdict so convergence_gate sees
@@ -522,6 +569,7 @@ def analysis_node(state: dict) -> dict:
                 d_id,
             )
             pos_dict["position"] = "UNEXPLAINED"
+            pos_dict["divergence_verdict"] = "insufficient_evidence"
             pos_dict["explanation"] = (
                 "Solver failure cannot be explained narratively — the numerical "
                 "computation itself did not produce a usable result."
@@ -535,7 +583,19 @@ def analysis_node(state: dict) -> dict:
             delta = _clamp_adjustment(adj.field, adj.delta)
             if delta != 0.0:
                 old = new_assumptions[adj.field]
-                new_assumptions[adj.field] = round(old + delta, 6)
+                proposed = round(old + delta, 6)
+                if adj.field == "wacc":
+                    from .wacc import clip_wacc_to_profile_band  # noqa: PLC0415
+                    profile = state.get("profile") or "default"
+                    wacc_prov = (state.get("assumption_provenance") or {}).get("wacc") or {}
+                    user_wacc = wacc_prov.get("source") in {
+                        "user_override", "user_provided", "user_edited",
+                    }
+                    proposed, _ = clip_wacc_to_profile_band(
+                        proposed, profile=profile, allow_override=user_wacc,
+                    )
+                    proposed = round(proposed, 6)
+                new_assumptions[adj.field] = proposed
                 changes.append(f"{adj.field}: {old:.4f} → {new_assumptions[adj.field]:.4f} ({adj.reason[:60]})")
 
     # ── Confidence propagation ──────────────────────────────────────────────
@@ -546,6 +606,17 @@ def analysis_node(state: dict) -> dict:
         sev = p.get("divergence_severity", "medium")
         penalty *= _SEVERITY_PENALTY.get(sev, 0.9)
     effective_confidence = round(base_conf * penalty, 3)
+    breakdown = state.get("confidence_breakdown") or {}
+    procedural_base = breakdown.get("aggregate_score") or base_conf
+    confidence_assessment = confidence_assessment_from_positions(
+        positions=positions,
+        model_validity="valid",
+        procedural_base=procedural_base,
+    )
+    confidence_assessment["interpretive_confidence"] = min(
+        confidence_assessment["interpretive_confidence"],
+        effective_confidence,
+    )
 
     emit_step(
         "analysis", "complete", parent_step_id,
@@ -559,6 +630,7 @@ def analysis_node(state: dict) -> dict:
             "changes": changes,
             "effective_confidence": effective_confidence,
             "base_confidence": base_conf,
+            "confidence_assessment": confidence_assessment,
         },
     )
 
@@ -566,6 +638,7 @@ def analysis_node(state: dict) -> dict:
         "analysis_positions": positions,
         "assumptions": new_assumptions,
         "effective_confidence": effective_confidence,
+        "confidence_assessment": confidence_assessment,
     }
 
 
@@ -596,13 +669,23 @@ def convergence_gate_node(state: dict) -> dict:
     iteration = state.get("analysis_iteration", 0)
     max_iter = 2  # mirrors _MAX_ANALYSIS_ITERATIONS in graph.py
 
-    unexplained = [p for p in positions if p["position"] == "UNEXPLAINED"]
+    for p in positions:
+        p["divergence_verdict"] = normalize_divergence_verdict(p)
+
+    unresolved = [
+        p for p in positions
+        if p.get("divergence_verdict") in {"contradicted", "unsupported", "insufficient_evidence"}
+        or p.get("position") == "UNEXPLAINED"
+    ]
+    contradicted = [p for p in positions if p.get("divergence_verdict") == "contradicted"]
+    unsupported = [p for p in positions if p.get("divergence_verdict") == "unsupported"]
+    insufficient = [p for p in positions if p.get("divergence_verdict") == "insufficient_evidence"]
     explained_with_adj = [
         p for p in positions
         if p["position"] == "EXPLAINED" and p.get("adjustment")
     ]
     critical_unexplained = [
-        p for p in unexplained
+        p for p in unresolved
         if p.get("divergence_severity") == "critical"
     ]
 
@@ -635,19 +718,50 @@ def convergence_gate_node(state: dict) -> dict:
             )
         else:
             reason = f"{len(explained_with_adj)} justified adjustments queued; re-running valuation."
-    elif unexplained:
+    elif contradicted:
+        validity = "valid"
+        reconciliation_status = "contradicted_market_expectations"
+        reason = (
+            f"{len(contradicted)} market expectation gap(s) are directly contradicted by cited evidence. "
+            "The DCF math is intact, but economic persuasiveness depends on whether that contradiction is decisive."
+        )
+    elif unsupported:
         # Market-implied gaps remain — DCF math is fine; price embeds different expectations.
         validity = "valid"
         reconciliation_status = "structural_gap"
         reason = (
-            f"{len(unexplained)} market reconciliation gap(s) remain after analysis. "
+            f"{len(unsupported)} market reconciliation gap(s) remain unsupported after analysis. "
             f"The DCF math is intact; the share price may embed expectations "
-            f"the cited assumptions do not support."
+            f"the cited assumptions do not yet justify."
+        )
+    elif insufficient:
+        validity = "valid"
+        reconciliation_status = "insufficient_evidence"
+        reason = (
+            f"{len(insufficient)} market reconciliation gap(s) have insufficient evidence coverage. "
+            "The DCF math is intact, but interpretive reliability is limited."
         )
     else:
         validity = "valid"
         reconciliation_status = "aligned"
         reason = "All divergences explained; model accepted."
+
+    breakdown = state.get("confidence_breakdown") or {}
+    procedural_base = breakdown.get("aggregate_score") or _confidence_from_label(
+        state.get("confidence_label", "medium"),
+    )
+    grounding = assess_evidence_grounding(
+        assumption_memo=state.get("assumption_memo"),
+        evidence_pack=state.get("evidence_pack"),
+        extra_evidence_refs=_collect_evidence_refs(state.get("company_state")),
+    )
+    confidence_assessment = confidence_assessment_from_positions(
+        positions=positions,
+        model_validity=validity,
+        procedural_base=procedural_base,
+        evidence_grounding=grounding,
+    )
+    conviction_direction = conviction_direction_from_positions(positions)
 
     emit_step(
         "convergence_gate", "complete", parent_step_id,
@@ -658,7 +772,9 @@ def convergence_gate_node(state: dict) -> dict:
             "reason": reason,
             "iteration": iteration,
             "hard_stop": hard_stop,
-            "unexplained_count": len(unexplained),
+            "unexplained_count": len(unresolved),
+            "verdict_counts": confidence_assessment.get("verdict_counts", {}),
+            "conviction_direction": conviction_direction,
             "adjustments_pending": len(explained_with_adj),
             "critical_unexplained": len(critical_unexplained),
         },
@@ -667,8 +783,10 @@ def convergence_gate_node(state: dict) -> dict:
     return {
         "model_validity": validity,
         "reconciliation_status": reconciliation_status,
-        "reconciliation_note": reason if reconciliation_status == "structural_gap" else "",
+        "reconciliation_note": reason if reconciliation_status != "aligned" else "",
         "invalidation_reason": reason if validity == "invalid" else "",
+        "confidence_assessment": confidence_assessment,
+        "conviction_direction": conviction_direction,
         "analysis_iteration": iteration + 1,
     }
 
@@ -677,17 +795,17 @@ def route_after_convergence_gate(state: dict) -> str:
     """Three-way route based on model_validity."""
     validity = state.get("model_validity", "valid")
     if validity == "adjusting":
-        return "scenario_runner"  # re-run valuation chain with adjusted assumptions
+        return "coherence_gate"  # re-run valuation chain with adjusted assumptions
     # Both "valid" and "invalid" route to finalize — invalid is surfaced in the
     # output payload with reason; we don't drop the report.
     return "finalize"
 
 
 def route_after_convergence_gate_val(state: dict) -> str:
-    """Fast-path variant: re-enter project_cashflows instead of scenario_runner."""
+    """Fast-path variant: re-enter coherence gate before projection."""
     validity = state.get("model_validity", "valid")
     if validity == "adjusting":
-        return "project_cashflows"
+        return "coherence_gate"
     return "finalize"
 
 
@@ -703,6 +821,263 @@ _ADJUSTMENT_CAP: dict[str, float] = {
     "terminal_growth": 0.005,
     "tax_rate": 0.030,
 }
+
+
+def wacc_gap_interpretation(wacc_sanity: dict[str, Any]) -> dict[str, Any] | None:
+    """Directional interpretation of model/CAPM WACC vs DCF-consistent WACC."""
+    capm = wacc_sanity.get("capm_wacc")
+    implied = wacc_sanity.get("implied_wacc")
+    if not isinstance(capm, (int, float)) or not isinstance(implied, (int, float)):
+        return None
+    if implied < capm:
+        return {
+            "gap_direction": "market_lower_than_model",
+            "possible_causes": [
+                "CAPM may overstate business risk",
+                "quality or moat premium may compress discount rate",
+                "market may perceive lower cyclicality or higher durability",
+                "liquidity regime may compress required returns",
+            ],
+            "suggested_actions": [
+                "review beta and equity risk premium assumptions",
+                "look for evidence of durable moat, pricing power, or low cyclicality",
+                "do not increase WACC solely because the gap is large",
+            ],
+            "confidence": 0.6,
+        }
+    return {
+        "gap_direction": "market_higher_than_model",
+        "possible_causes": [
+            "CAPM or model WACC may understate risk",
+            "market may price cyclicality, leverage, or execution risk",
+            "cash-flow path may be too optimistic for the current price",
+        ],
+        "suggested_actions": [
+            "review beta, spread, and cyclicality assumptions",
+            "stress-test lower growth or margin scenarios",
+        ],
+        "confidence": 0.6,
+    }
+
+
+def normalize_divergence_verdict(position: dict[str, Any]) -> str:
+    """Backfill/normalize the four-state divergence verdict taxonomy."""
+    raw = str(position.get("divergence_verdict") or "").strip().lower()
+    if raw in _DIVERGENCE_VERDICTS:
+        return raw
+    legacy_position = str(position.get("position") or "").upper()
+    if legacy_position == "EXPLAINED":
+        return "explained"
+    if position.get("divergence_severity") == "critical":
+        return "insufficient_evidence"
+    evidence_count = len(position.get("evidence_used") or []) + len(position.get("new_evidence_fetched") or [])
+    return "unsupported" if evidence_count else "insufficient_evidence"
+
+
+def conviction_direction_from_positions(positions: list[dict[str, Any]]) -> str:
+    verdicts = [normalize_divergence_verdict(p) for p in positions]
+    contradicted = verdicts.count("contradicted")
+    unsupported = verdicts.count("unsupported")
+    insufficient = verdicts.count("insufficient_evidence")
+    explained = verdicts.count("explained")
+    if unsupported or insufficient:
+        return "unresolved_expectations"
+    if contradicted:
+        return "evidence_conflicts_with_implied"
+    if explained:
+        return "model_too_conservative"
+    return "genuine_uncertainty"
+
+
+def confidence_assessment_from_positions(
+    *,
+    positions: list[dict[str, Any]],
+    model_validity: str = "valid",
+    procedural_base: float | None = None,
+    base_confidence: float | None = None,
+    evidence_grounding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Split procedural confidence from interpretive/reconciliation confidence.
+
+    ``procedural_base`` reflects valuation math / input quality (from
+    ``compute_confidence_breakdown``). It must NOT be penalized by unresolved
+    market-reconciliation divergences — those only affect interpretive confidence.
+
+    ``evidence_grounding`` (optional) lets the caller surface grounding
+    penalties (e.g. memo proposals lack SEC filing references) — applied as a
+    multiplier on interpretive confidence and returned as a transparent
+    component for the report.
+
+    ``base_confidence`` is deprecated alias for ``procedural_base``.
+    """
+    proc_seed = procedural_base if procedural_base is not None else base_confidence
+    if proc_seed is None:
+        proc_seed = 0.7
+    procedural = float(proc_seed)
+    if model_validity == "invalid":
+        procedural = min(procedural, 0.3)
+    elif model_validity == "adjusting":
+        procedural = min(procedural, 0.6)
+    grounding_multiplier = 1.0
+    grounding_label = None
+    grounding_reason = None
+    if isinstance(evidence_grounding, dict):
+        m = evidence_grounding.get("interpretive_multiplier")
+        if isinstance(m, (int, float)):
+            grounding_multiplier = max(0.0, min(1.0, float(m)))
+        grounding_label = evidence_grounding.get("label")
+        grounding_reason = evidence_grounding.get("reason")
+
+    if not positions:
+        interpretive_no_pos = procedural * grounding_multiplier
+        result = {
+            "procedural_confidence": round(procedural, 3),
+            "interpretive_confidence": round(interpretive_no_pos, 3),
+            "evidence_coverage": 1.0,
+            "reconciliation_confidence": 1.0,
+            "verdict_counts": {
+                "explained": 0,
+                "contradicted": 0,
+                "unsupported": 0,
+                "insufficient_evidence": 0,
+            },
+        }
+        if grounding_label:
+            result["evidence_grounding"] = {
+                "label": grounding_label,
+                "reason": grounding_reason or "",
+                "multiplier": round(grounding_multiplier, 3),
+            }
+        return result
+
+    verdicts = [normalize_divergence_verdict(p) for p in positions]
+    total = max(len(verdicts), 1)
+    explained = verdicts.count("explained")
+    unsupported = verdicts.count("unsupported")
+    insufficient = verdicts.count("insufficient_evidence")
+    contradicted = verdicts.count("contradicted")
+
+    evidence_coverage = max(0.0, min(1.0, (explained + unsupported + contradicted) / total))
+    reconciliation = max(
+        0.0,
+        min(1.0, (explained / total) - (0.25 * contradicted) - (0.15 * unsupported) - (0.25 * insufficient)),
+    )
+    interpretive = max(
+        0.0,
+        min(1.0, (0.55 * evidence_coverage) + (0.45 * reconciliation)),
+    )
+    interpretive *= grounding_multiplier
+    interpretive = max(0.0, min(1.0, interpretive))
+    result = {
+        "procedural_confidence": round(procedural, 3),
+        "interpretive_confidence": round(interpretive, 3),
+        "evidence_coverage": round(evidence_coverage, 3),
+        "reconciliation_confidence": round(reconciliation, 3),
+        "verdict_counts": {
+            "explained": explained,
+            "contradicted": contradicted,
+            "unsupported": unsupported,
+            "insufficient_evidence": insufficient,
+        },
+    }
+    if grounding_label:
+        result["evidence_grounding"] = {
+            "label": grounding_label,
+            "reason": grounding_reason or "",
+            "multiplier": round(grounding_multiplier, 3),
+        }
+    return result
+
+
+def assess_evidence_grounding(
+    *,
+    assumption_memo: dict[str, Any] | None,
+    evidence_pack: dict[str, Any] | None,
+    extra_evidence_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Score whether memo proposals are grounded in authoritative (filing) evidence.
+
+    Returns a dict with ``interpretive_multiplier``, ``label``, and ``reason`` so
+    the convergence gate can pass it to ``confidence_assessment_from_positions``
+    and the report can surface a transparent component.
+    """
+    items = ((evidence_pack or {}).get("items") or [])
+    by_id = {it.get("evidence_id", ""): it for it in items if isinstance(it, dict)}
+
+    def _item_tier(it: dict[str, Any]) -> str:
+        return str(it.get("source_tier") or it.get("src_tier") or "")
+
+    def _is_filing_ref(ref: str) -> bool:
+        return _item_tier(by_id.get(ref) or {}) == "filing" or str(ref).startswith("ev_sec_")
+
+    extra_refs = list(extra_evidence_refs or [])
+    has_filings_in_pack = any(_item_tier(it) == "filing" for it in items) or any(
+        _is_filing_ref(ref) for ref in extra_refs
+    )
+
+    proposals = (assumption_memo or {}).get("proposals") or []
+    if not proposals:
+        return {
+            "interpretive_multiplier": 1.0,
+            "label": "ungraded",
+            "reason": "No memo proposals to grade.",
+        }
+
+    total_refs = 0
+    filing_refs = 0
+    for p in proposals:
+        if not isinstance(p, dict):
+            continue
+        for ref in p.get("evidence_refs") or []:
+            total_refs += 1
+            if _is_filing_ref(str(ref)):
+                filing_refs += 1
+
+    if total_refs == 0:
+        return {
+            "interpretive_multiplier": 0.65,
+            "label": "ungrounded",
+            "reason": "No memo proposals cite any evidence.",
+        }
+    if filing_refs == 0 and has_filings_in_pack:
+        return {
+            "interpretive_multiplier": 0.80,
+            "label": "weak_grounding",
+            "reason": (
+                f"{total_refs} memo references but 0 cite SEC filings even though "
+                "filings are present in the evidence pack — narrative leans on "
+                "web/news rather than authoritative disclosure."
+            ),
+        }
+    if filing_refs == 0 and not has_filings_in_pack:
+        return {
+            "interpretive_multiplier": 0.90,
+            "label": "no_filings_available",
+            "reason": "No SEC filings in evidence pack; narrative relies on web/news/API data.",
+        }
+    return {
+        "interpretive_multiplier": 1.0,
+        "label": "grounded",
+        "reason": f"{filing_refs}/{total_refs} memo references cite SEC filings.",
+    }
+
+
+def _collect_evidence_refs(value: Any) -> list[str]:
+    """Extract evidence IDs from nested reasoning artifacts."""
+    refs: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for nested in node.values():
+                _walk(nested)
+        elif isinstance(node, list):
+            for nested in node:
+                _walk(nested)
+        elif isinstance(node, str):
+            refs.extend(re.findall(r"\bev_[\w+\-:.]+\b", node))
+
+    _walk(value)
+    return refs
 
 
 def _clamp_adjustment(field: str, delta: float) -> float:

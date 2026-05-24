@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .sources import extract_evidence_items
+
 
 def build_hitl_snapshot(source: dict[str, Any]) -> dict[str, Any]:
     """Extract fields needed to complete valuation after user approval."""
@@ -14,7 +16,7 @@ def build_hitl_snapshot(source: dict[str, Any]) -> dict[str, Any]:
         "assumption_provenance": source.get("assumption_provenance") or {},
         "assumption_memo": source.get("assumption_memo"),
         "memo_proposals": source.get("memo_proposals") or {},
-        "evidence_items": source.get("evidence_items") or [],
+        "evidence_items": extract_evidence_items(source, text_limit=4000),
         "scenarios": source.get("scenarios") or [],
         "company_state": source.get("company_state"),
         "thesis": source.get("thesis"),

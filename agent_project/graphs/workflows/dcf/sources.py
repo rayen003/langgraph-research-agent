@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 _EVIDENCE_ID_PATTERN = re.compile(r"\bev_[\w+\-:.]+\b")
 _NEWS_SOURCE_TIERS = frozenset({"news", "generic_web"})
-_FMP_SUMMARY_URL = "https://financialmodelingprep.com/financial-summary/{ticker}"
+_SEC_COMPANY_URL = "https://www.sec.gov/cgi-bin/browse-edgar?CIK={cik}&action=getcompany&count=40&owner=include"
+_SEC_TICKER_URL = "https://www.sec.gov/cgi-bin/browse-edgar?CIK={ticker}"
 
 
 def humanize_evidence_item(item: dict[str, Any]) -> str:
@@ -56,17 +57,33 @@ def humanize_evidence_refs(
     return result
 
 
-def evidence_item_url(item: dict[str, Any] | None) -> str | None:
+def evidence_item_url(
+    item: dict[str, Any] | None,
+    evidence_id: str = "",
+    ticker: str = "",
+) -> str | None:
     """Best-effort URL for verifying a cited source."""
-    if not item:
+    if item:
+        url = str(item.get("url") or "").strip()
+        if url.startswith("http"):
+            return url
+        kind = item.get("kind")
+        ticker = str(item.get("ticker") or ticker or "").strip().upper()
+    else:
+        kind = ""
+        ticker = str(ticker or "").strip().upper()
+    # API-backed evidence is presented in the report source drawer. Do not emit
+    # local proxy URLs into markdown/PDF; they are implementation details.
+    if kind in {"structured_fundamental", "market_data", "profile"}:
         return None
-    url = str(item.get("url") or "").strip()
-    if url.startswith("http"):
-        return url
-    kind = item.get("kind")
-    ticker = str(item.get("ticker") or "").strip().upper()
-    if kind in {"structured_fundamental", "market_data", "profile"} and ticker:
-        return _FMP_SUMMARY_URL.format(ticker=ticker)
+    if evidence_id.startswith(("ev_fmp_", "ev_feature_", "ev_profile_")):
+        return None
+    if evidence_id.startswith("ev_sec_"):
+        match = re.match(r"ev_sec_(\d{10})", evidence_id)
+        if match:
+            return _SEC_COMPANY_URL.format(cik=match.group(1))
+        if ticker:
+            return _SEC_TICKER_URL.format(ticker=quote_plus(ticker))
     return None
 
 
@@ -138,16 +155,192 @@ def evidence_reference_meta(item: dict[str, Any] | None) -> str:
     return " · ".join(parts)
 
 
-def format_reference_line(number: int, evidence_id: str, item: dict[str, Any] | None) -> str:
+def format_reference_line(
+    number: int,
+    evidence_id: str,
+    item: dict[str, Any] | None,
+    ticker: str = "",
+) -> str:
     """Bullet reference with optional markdown hyperlink."""
+    if item is None and evidence_id:
+        item = infer_evidence_item(evidence_id, ticker=ticker)
     title = evidence_reference_title(item, evidence_id)
-    url = evidence_item_url(item)
+    url = evidence_item_url(item, evidence_id=evidence_id, ticker=ticker)
     meta = evidence_reference_meta(item)
     body = f"[{title}]({url})" if url else title
     line = f"- **[{number}]** {body}"
     if meta:
         line += f" — {meta}"
     return line
+
+
+def extract_evidence_items(
+    source: dict[str, Any],
+    *,
+    text_limit: int = 4000,
+) -> list[dict[str, Any]]:
+    """Normalize evidence items from HITL snapshots or live workflow state."""
+    raw_items: list[Any] = list(source.get("evidence_items") or [])
+    if not raw_items:
+        raw_items = list((source.get("evidence_pack") or {}).get("items") or [])
+
+    items: list[dict[str, Any]] = []
+    for candidate in raw_items:
+        if not isinstance(candidate, dict):
+            continue
+        evidence_id = str(candidate.get("evidence_id") or "")
+        if not evidence_id:
+            continue
+        entry = {k: v for k, v in candidate.items() if k != "metadata"}
+        if "text" in entry and text_limit > 0:
+            entry["text"] = str(entry["text"])[:text_limit]
+        items.append(entry)
+    return items
+
+
+def resolve_evidence_item(
+    evidence_id: str,
+    by_id: dict[str, dict[str, Any]],
+    *,
+    all_items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Look up a cited evidence_id, including common provider/field aliases."""
+    if not evidence_id:
+        return None
+    direct = by_id.get(evidence_id)
+    if direct:
+        return direct
+
+    field_hint = ""
+    if evidence_id.startswith("ev_fmp+"):
+        field_hint = evidence_id.split(":", 1)[-1].removeprefix("yfinance_").removeprefix("fmp_")
+    elif evidence_id.startswith("ev_fmp_"):
+        field_hint = evidence_id.removeprefix("ev_fmp_")
+    elif evidence_id.startswith("ev_feature_"):
+        field_hint = evidence_id.removeprefix("ev_feature_")
+
+    if field_hint:
+        for item in all_items or []:
+            if str(item.get("field") or "") == field_hint:
+                return item
+        alt_ids = (
+            f"ev_fmp_{field_hint}",
+            f"ev_fmp+fallback:yfinance_{field_hint}",
+            f"ev_feature_{field_hint}",
+        )
+        for alt in alt_ids:
+            if alt in by_id:
+                return by_id[alt]
+
+    return None
+
+
+def payload_evidence_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return de-duplicated evidence items from all payload shapes we persist."""
+    candidates: list[Any] = []
+    candidates.extend(payload.get("_evidence_items") or [])
+
+    evidence_pack = payload.get("evidence_pack") or {}
+    if isinstance(evidence_pack, dict):
+        candidates.extend(evidence_pack.get("items") or [])
+
+    hitl_snapshot = payload.get("hitl_snapshot") or {}
+    if isinstance(hitl_snapshot, dict):
+        candidates.extend(hitl_snapshot.get("evidence_items") or [])
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        evidence_id = str(candidate.get("evidence_id") or "")
+        if not evidence_id or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        items.append(candidate)
+    return items
+
+
+def infer_evidence_item(evidence_id: str, ticker: str = "") -> dict[str, Any]:
+    """Create a presentable source-card fallback for a cited-but-missing ID."""
+    symbol = str(ticker or "").strip().upper()
+    base: dict[str, Any] = {
+        "evidence_id": evidence_id,
+        "as_of": "",
+        "source": "inferred",
+        "inferred": True,
+    }
+
+    if evidence_id.startswith("ev_sec_"):
+        return {
+            **base,
+            "kind": "filing_excerpt",
+            "source_tier": "filing",
+            "source": "sec",
+            "filing_type": "SEC filing",
+            "section": "Referenced filing",
+            "title": "SEC filing reference",
+            "url": evidence_item_url(None, evidence_id=evidence_id, ticker=symbol),
+        }
+
+    if evidence_id.startswith("ev_web_"):
+        return {
+            **base,
+            "kind": "web_excerpt",
+            "source_tier": "generic_web",
+            "source": "web",
+            "title": "Web source reference",
+        }
+
+    if evidence_id.startswith("ev_feature_"):
+        field = evidence_id.removeprefix("ev_feature_")
+        return {
+            **base,
+            "kind": "market_data",
+            "source_tier": "structured_api",
+            "source": "fmp+yfinance",
+            "field": field,
+            "title": f"Market data · {field.replace('_', ' ')}",
+        }
+
+    if evidence_id.startswith("ev_fmp_"):
+        field = evidence_id.removeprefix("ev_fmp_")
+        return {
+            **base,
+            "kind": "structured_fundamental",
+            "source_tier": "structured_api",
+            "source": "fmp",
+            "field": field,
+            "title": f"FMP · {field.replace('_', ' ')}",
+        }
+
+    if evidence_id.startswith("ev_fmp+"):
+        _, _, field_raw = evidence_id.removeprefix("ev_fmp+").partition(":")
+        field = field_raw.removeprefix("yfinance_").removeprefix("fmp_") or field_raw
+        return {
+            **base,
+            "kind": "structured_fundamental",
+            "source_tier": "structured_api",
+            "source": "fmp",
+            "field": field,
+            "title": f"FMP · {field.replace('_', ' ')}",
+        }
+
+    if evidence_id.startswith("ev_profile_"):
+        return {
+            **base,
+            "kind": "profile",
+            "source_tier": "structured_api",
+            "source": "derived",
+            "title": "Company profile reference",
+        }
+
+    return {
+        **base,
+        "kind": "unknown",
+        "source_tier": "unknown",
+        "title": evidence_id,
+    }
 
 
 def _parse_reference_ids(reference: str) -> list[str]:
@@ -191,6 +384,13 @@ def company_state_ref_ids(company_state: dict[str, Any]) -> list[str]:
             refs.append(str(entry["evidence_id"]))
         elif isinstance(entry, str):
             refs.append(entry)
+    for value in company_state.values():
+        if isinstance(value, str):
+            refs.extend(_EVIDENCE_ID_PATTERN.findall(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    refs.extend(_EVIDENCE_ID_PATTERN.findall(item))
     return refs
 
 
@@ -279,10 +479,11 @@ def company_profile_section_lines(
     registry: SourceRegistry,
 ) -> list[str]:
     profile_meta = payload.get("profile_meta") or {}
-    if not profile_meta and not filter_profile_item(payload.get("_evidence_items") or []):
+    evidence_items = payload_evidence_items(payload)
+    if not profile_meta and not filter_profile_item(evidence_items):
         return []
 
-    profile_item = filter_profile_item(payload.get("_evidence_items") or [])
+    profile_item = filter_profile_item(evidence_items)
     profile_ref = registry.format_refs(
         [profile_item["evidence_id"]] if profile_item and profile_item.get("evidence_id") else [],
     )
@@ -320,7 +521,7 @@ def recent_developments_section_lines(
     *,
     limit: int = 5,
 ) -> list[str]:
-    news_items = filter_news_items(payload.get("_evidence_items") or [], limit=limit)
+    news_items = filter_news_items(payload_evidence_items(payload), limit=limit)
     if not news_items:
         return []
 
@@ -350,7 +551,7 @@ def market_reconciliation_section_lines(
     wacc_sanity = payload.get("wacc_sanity") or {}
     assumptions = payload.get("assumptions") or {}
     features = payload.get("features") or {}
-    evidence_items = payload.get("_evidence_items") or []
+    evidence_items = payload_evidence_items(payload)
     wacc_refs = registry.format_refs(
         wacc_input_ref_ids(payload.get("wacc_components") or {}, features, evidence_items),
     )
@@ -364,11 +565,11 @@ def market_reconciliation_section_lines(
     lines = [
         "## Market Reconciliation",
         "",
-        "Reverse-DCF signals compare **model assumptions** to what the **current share price implies**.",
-        "A large gap means the price embeds different growth/margin/discount-rate expectations — "
+        "Reverse-DCF signals compare **model assumptions** to values required under the **current DCF structure**.",
+        "These are DCF-consistent implied values, not direct market forecasts. A large gap means the price embeds different growth/margin/discount-rate expectations — "
         "**not** that the spreadsheet failed or the model is invalid.",
         "",
-        "| Signal | Model | Market-implied | Gap / status | Refs |",
+        "| Signal | Model | DCF-consistent implied | Gap / status | Refs |",
         "|--------|-------|----------------|--------------|------|",
     ]
 
@@ -409,10 +610,35 @@ def market_reconciliation_section_lines(
             f"| FCFF margin | {float(model_margin):.2%} | {float(implied_margin):.2%} | {gap_pp:+.1f}pp | {margin_refs} |"
         )
 
+    plausibility = wacc_sanity.get("implied_plausibility") or {}
+    plaus_label = plausibility.get("label")
+    if plaus_label and plaus_label != "unavailable":
+        badge = {
+            "economically_implausible": "⚠ Economically implausible",
+            "aggressive": "⚠ Aggressive",
+            "reasonable": "✓ Reasonable",
+            "conservative": "✓ Conservative",
+        }.get(plaus_label, plaus_label)
+        lines.append("")
+        lines.append(f"**Implied WACC plausibility:** {badge}")
+        narrative = plausibility.get("narrative")
+        if narrative:
+            lines.append(f"> {narrative}")
+
     interpretation = wacc_sanity.get("interpretation")
     if interpretation:
         lines.append("")
         lines.append(f"**Read-through:** {inline_cite_text(str(interpretation), registry)}")
+
+    signals_meta = payload.get("market_signals_meta") or {}
+    if signals_meta.get("growth_margin_suppressed"):
+        lines.append("")
+        lines.append(
+            "**Note:** Implied revenue growth and FCFF margin are omitted because the "
+            "WACC gap is the binding constraint at fixed model structure — holding WACC "
+            "constant, no plausible growth/margin lever alone reconciles spot. Consider "
+            "quality/moat premium, duration, or non-FCF value not captured in this DCF."
+        )
 
     lines.append("")
     return lines
@@ -421,7 +647,8 @@ def market_reconciliation_section_lines(
 class SourceRegistry:
     """Assign stable [1], [2], … citation numbers to evidence_ids."""
 
-    def __init__(self, evidence_items: list[dict[str, Any]] | None = None):
+    def __init__(self, evidence_items: list[dict[str, Any]] | None = None, ticker: str = ""):
+        self._ticker = str(ticker or "").strip().upper()
         self._by_id: dict[str, dict[str, Any]] = {
             item.get("evidence_id", ""): item
             for item in (evidence_items or [])
@@ -448,11 +675,14 @@ class SourceRegistry:
 
     def format_refs(self, evidence_ids: list[str]) -> str:
         nums = sorted(set(self.register_many(evidence_ids)))
-        return "".join(f"[{n}]" for n in nums) if nums else "—"
+        return " ".join(f"[{n}]" for n in nums) if nums else "—"
+
+    def citation_map(self) -> dict[str, str]:
+        return {str(number): evidence_id for evidence_id, number in self._numbers.items()}
 
     def reference_line(self, number: int, evidence_id: str) -> str:
         item = self._by_id.get(evidence_id)
-        return format_reference_line(number, evidence_id, item)
+        return format_reference_line(number, evidence_id, item, ticker=self._ticker)
 
     def references_section_lines(self) -> list[str]:
         if not self._order:
@@ -472,7 +702,7 @@ class SourceRegistry:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> SourceRegistry:
-        registry = cls(payload.get("_evidence_items") or [])
+        registry = cls(payload_evidence_items(payload), ticker=str(payload.get("ticker") or ""))
 
         memo = payload.get("assumption_memo") or {}
         if isinstance(memo, dict):
@@ -490,18 +720,19 @@ class SourceRegistry:
         if isinstance(company_state, dict):
             registry.register_many(company_state_ref_ids(company_state))
 
-        profile_item = filter_profile_item(payload.get("_evidence_items") or [])
+        evidence_items = payload_evidence_items(payload)
+        profile_item = filter_profile_item(evidence_items)
         if profile_item and profile_item.get("evidence_id"):
             registry.register(str(profile_item["evidence_id"]))
 
-        for item in filter_news_items(payload.get("_evidence_items") or [], limit=5):
+        for item in filter_news_items(evidence_items, limit=5):
             if item.get("evidence_id"):
                 registry.register(str(item["evidence_id"]))
 
         features = payload.get("features") or {}
         wacc_comp = payload.get("wacc_components") or {}
         registry.register_many(
-            wacc_input_ref_ids(wacc_comp, features, payload.get("_evidence_items") or []),
+            wacc_input_ref_ids(wacc_comp, features, evidence_items),
         )
 
         return registry

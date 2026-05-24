@@ -31,6 +31,7 @@ from .priors import check_assumption_plausibility, prior_band_midpoint
 from .state import (
     _DEFAULT_EQUITY_RISK_PREMIUM,
     _DEFAULT_RISK_FREE_RATE,
+    _ASSUMPTION_FIELDS,
     _TIER_A_FIELDS,
     clip_to_field_range,
 )
@@ -466,6 +467,82 @@ def _fmt_assumptions_line(
     return ", ".join(parts) if parts else "assumptions built"
 
 
+def _evidence_refs_for_field(evidence_pack: dict[str, Any], field: str) -> list[str]:
+    """Return evidence IDs for structured evidence carrying a specific field."""
+    refs: list[str] = []
+    for item in evidence_pack.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "structured_fundamental" and item.get("field") == field:
+            eid = item.get("evidence_id")
+            if eid:
+                refs.append(str(eid))
+    return refs
+
+
+def _backfill_capital_mechanics(
+    *,
+    assumptions: dict[str, float],
+    provenance: dict[str, dict[str, Any]],
+    fundamentals: dict[str, dict[str, Any]],
+    evidence_pack: dict[str, Any],
+    memo_dict: dict[str, Any] | None,
+) -> None:
+    """Ensure buyback/SBC mechanics reach HITL when structured data exists.
+
+    The LLM is allowed to omit optional fields, but for repurchase-heavy tech
+    names those omissions materially change per-share value. Structured
+    statement data is more reliable than a memo omission, so backfill only from
+    canonical fundamentals and leave any LLM/user value intact.
+    """
+    for field in ("buyback_yield", "sbc_pct_revenue"):
+        if field in assumptions:
+            continue
+        meta = fundamentals.get(field)
+        if not isinstance(meta, dict) or meta.get("value") is None:
+            continue
+        clipped = clip_to_field_range(field, float(meta["value"]))
+        if clipped is None:
+            logger.warning(
+                "DCF memo capital backfill skipped field=%s value=%s out of range",
+                field, meta.get("value"),
+            )
+            continue
+
+        refs = _evidence_refs_for_field(evidence_pack, field)
+        assumptions[field] = clipped
+        provenance[field] = {
+            "source": meta.get("source", "structured_fundamental"),
+            "evidence": meta.get("evidence", "Structured financial-statement-derived assumption."),
+            "reference": ", ".join(refs),
+            "evidence_refs": refs,
+            "confidence": meta.get("confidence", 0.8),
+            "field": meta.get("field"),
+            "as_of": meta.get("as_of"),
+        }
+
+        if memo_dict is not None:
+            proposals = memo_dict.setdefault("proposals", [])
+            if isinstance(proposals, list) and not any(
+                isinstance(p, dict) and p.get("field") == field
+                for p in proposals
+            ):
+                proposals.append({
+                    "field": field,
+                    "value": clipped,
+                    "rationale": str(provenance[field]["evidence"]),
+                    "evidence_refs": refs,
+                    "confidence": float(provenance[field]["confidence"]),
+                    "range_low": None,
+                    "range_high": None,
+                })
+            evidence_refs = memo_dict.setdefault("evidence_refs", [])
+            if isinstance(evidence_refs, list):
+                for ref in refs:
+                    if ref not in evidence_refs:
+                        evidence_refs.append(ref)
+
+
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
@@ -645,9 +722,17 @@ def propose_assumptions_node(state: dict) -> dict:
                 )
         memo_dict = None
 
+    _backfill_capital_mechanics(
+        assumptions=assumptions,
+        provenance=provenance,
+        fundamentals=fundamentals,
+        evidence_pack=evidence_pack,
+        memo_dict=memo_dict,
+    )
+
     # ── Step 4: Apply user overrides ────────────────────────────────────────
     for key, value in overrides.items():
-        if key not in assumptions:
+        if key not in _ASSUMPTION_FIELDS:
             continue
         normalized = clip_to_field_range(key, float(value))
         if normalized is None:

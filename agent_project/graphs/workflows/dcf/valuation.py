@@ -16,9 +16,27 @@ from typing import Any
 from utils import get_artifacts_dir, get_run_dir
 
 from .activity import emit_step, emit_workflow_terminal
+from .analysis import (
+    confidence_assessment_from_positions,
+    conviction_direction_from_positions,
+    normalize_divergence_verdict,
+)
 from .priors import check_valuation_sanity, compute_confidence_breakdown, compute_confidence_label
+from .sources import extract_evidence_items
 
 logger = logging.getLogger(__name__)
+
+
+def _persisted_evidence_fields(state: dict[str, Any]) -> dict[str, Any]:
+    """Serialize evidence pack items for report citations and the source drawer."""
+    items = extract_evidence_items(state, text_limit=4000)
+    pack = dict(state.get("evidence_pack") or {})
+    if items:
+        pack["items"] = items
+    return {
+        "_evidence_items": items,
+        "evidence_pack": pack,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -210,20 +228,40 @@ def compute_valuation_node(state: dict) -> dict:
         year = int(row["year"])
         pv_sum += float(row["fcff"]) / ((1.0 + wacc) ** year)
 
-    terminal_fcf = float(projected[-1]["fcff"]) * (1.0 + terminal_growth)
-    terminal_value = terminal_fcf / max((wacc - terminal_growth), 1e-6)
-    terminal_pv = terminal_value / ((1.0 + wacc) ** int(projected[-1]["year"]))
-    enterprise_value = pv_sum + terminal_pv
-    equity_value = enterprise_value - float(a["net_debt"])
-
-    # Apply buyback yield: shares decay over horizon. Buybacks return cash to
-    # shareholders without changing enterprise value — they just concentrate
-    # equity per remaining share. shares_end = shares × (1 - yield)^horizon.
-    # Defaults to 0 (no buybacks) for backward compatibility.
     horizon = int(projected[-1]["year"]) if projected else 5
     buyback_yield = float(a.get("buyback_yield", 0.0) or 0.0)
     shares_initial = float(a["shares_outstanding"])
     shares_end = shares_initial * ((1.0 - buyback_yield) ** horizon)
+
+    # Terminal buyback compounding: a holder of one share today sees their
+    # claim on aggregate equity grow at the buyback yield in perpetuity, since
+    # other shares are being retired. So per-share equity grows at
+    # (terminal_growth + effective_perpetual_buyback) in steady state.
+    #
+    # Economic cap: the perpetual buyback rate cannot exceed the FCF yield
+    # against terminal equity, otherwise buybacks would consume more cash
+    # than the business produces. Cap at min(buyback_yield, fcff_yield, 0.04)
+    # to prevent runaway compounding.
+    terminal_fcf_aggregate = float(projected[-1]["fcff"]) * (1.0 + terminal_growth)
+    pre_buyback_terminal_value = terminal_fcf_aggregate / max((wacc - terminal_growth), 1e-6)
+    pre_buyback_terminal_equity = pre_buyback_terminal_value - float(a["net_debt"])
+    fcff_yield_terminal = (
+        terminal_fcf_aggregate / pre_buyback_terminal_equity
+        if pre_buyback_terminal_equity > 0
+        else 0.0
+    )
+    perpetual_buyback_cap = max(0.0, min(buyback_yield, fcff_yield_terminal, 0.04))
+    perpetual_buyback_yield = perpetual_buyback_cap
+    # Safety: keep WACC strictly above (g + buyback) with min spread of 50bps
+    if wacc - terminal_growth - perpetual_buyback_yield < 0.005:
+        perpetual_buyback_yield = max(0.0, wacc - terminal_growth - 0.005)
+
+    effective_terminal_growth = terminal_growth + perpetual_buyback_yield
+    terminal_value = terminal_fcf_aggregate / max((wacc - effective_terminal_growth), 1e-6)
+    terminal_pv = terminal_value / ((1.0 + wacc) ** int(projected[-1]["year"]))
+    enterprise_value = pv_sum + terminal_pv
+    equity_value = enterprise_value - float(a["net_debt"])
+
     implied_share_price = equity_value / max(shares_end, 1e-6)
 
     valuation = {
@@ -236,6 +274,13 @@ def compute_valuation_node(state: dict) -> dict:
         "shares_end": shares_end,                     # after horizon of buybacks
         "shares_initial": shares_initial,
         "buyback_yield": buyback_yield,
+        "perpetual_buyback_yield": perpetual_buyback_yield,
+        "perpetual_buyback_cap_source": (
+            "input" if perpetual_buyback_cap == buyback_yield
+            else "fcff_yield_cap" if perpetual_buyback_cap == fcff_yield_terminal
+            else "hard_cap_4pct"
+        ) if buyback_yield > 0 else "no_buyback",
+        "effective_terminal_growth": effective_terminal_growth,
         "current_price": float(state["market_snapshot"].get("price", 0.0)),
     }
 
@@ -424,8 +469,11 @@ def sensitivity_node(state: dict) -> dict:
     projected = state["projected_fcff"]
     terminal_base = float(state["assumptions"]["terminal_growth"])
     wacc_base = float(state["assumptions"]["wacc"])
-    shares = max(float(state["assumptions"]["shares_outstanding"]), 1e-6)
+    shares_initial = max(float(state["assumptions"]["shares_outstanding"]), 1e-6)
     net_debt = float(state["assumptions"]["net_debt"])
+    buyback_yield = float(state["assumptions"].get("buyback_yield", 0.0) or 0.0)
+    horizon = int(projected[-1]["year"]) if projected else int(state.get("horizon_years", 5))
+    shares_end = shares_initial * ((1.0 - buyback_yield) ** horizon)
     table: list[dict[str, float]] = []
 
     for wacc in [wacc_base - 0.01, wacc_base, wacc_base + 0.01]:
@@ -435,7 +483,18 @@ def sensitivity_node(state: dict) -> dict:
                 year = int(row["year"])
                 pv_sum += float(row["fcff"]) / ((1.0 + wacc) ** year)
             terminal_fcf = float(projected[-1]["fcff"]) * (1.0 + tg)
-            terminal_value = terminal_fcf / max((wacc - tg), 1e-6)
+            pre_buyback_terminal_value = terminal_fcf / max((wacc - tg), 1e-6)
+            pre_buyback_terminal_equity = pre_buyback_terminal_value - net_debt
+            fcff_yield_terminal = (
+                terminal_fcf / pre_buyback_terminal_equity
+                if pre_buyback_terminal_equity > 0
+                else 0.0
+            )
+            perpetual_buyback_yield = max(0.0, min(buyback_yield, fcff_yield_terminal, 0.04))
+            if wacc - tg - perpetual_buyback_yield < 0.005:
+                perpetual_buyback_yield = max(0.0, wacc - tg - 0.005)
+            effective_terminal_growth = tg + perpetual_buyback_yield
+            terminal_value = terminal_fcf / max((wacc - effective_terminal_growth), 1e-6)
             terminal_pv = terminal_value / (
                 (1.0 + wacc) ** int(projected[-1]["year"])
             )
@@ -443,7 +502,7 @@ def sensitivity_node(state: dict) -> dict:
             table.append({
                 "wacc": round(wacc, 4),
                 "terminal_growth": round(tg, 4),
-                "implied_share_price": round(equity / shares, 4),
+                "implied_share_price": round(equity / max(shares_end, 1e-6), 4),
             })
 
     logger.info("DCF sensitivity rows=%d", len(table))
@@ -475,16 +534,20 @@ def finalize_node(state: dict) -> dict:
 
     # ── Phase 1: re-gate confidence with validity / solver / divergence info ─
     # compute_valuation_node ran before convergence_gate, so its confidence
-    # score doesn't yet reflect model_validity, solver_failed, or unexplained
-    # divergences. Recompute here so finalize-time confidence is honest.
+    # score doesn't yet reflect model_validity, solver_failed, or unresolved
+    # divergence verdicts. Recompute here so finalize-time confidence is honest.
     _model_validity = state.get("model_validity", "valid")
     _solver_status = (state.get("wacc_sanity") or {}).get("solver_status", "ok")
     _solver_failed = _solver_status in {"no_convergence", "degenerate", "exception", "no_input"}
     _positions = state.get("analysis_positions") or []
-    _unexplained = sum(1 for p in _positions if p.get("position") == "UNEXPLAINED")
+    _unresolved = sum(
+        1
+        for p in _positions
+        if normalize_divergence_verdict(p) in {"contradicted", "unsupported", "insufficient_evidence"}
+    )
     final_confidence_breakdown = state.get("confidence_breakdown")
     final_confidence_label = state.get("confidence_label", "medium")
-    if _model_validity != "valid" or _solver_failed or _unexplained > 0:
+    if _model_validity != "valid" or _solver_failed or _unresolved > 0:
         regated = compute_confidence_breakdown(
             assumption_flags=state.get("assumption_flags") or [],
             valuation_flags=state.get("valuation_flags") or [],
@@ -492,14 +555,14 @@ def finalize_node(state: dict) -> dict:
             assumption_memo=state.get("assumption_memo"),
             model_validity=_model_validity,
             solver_failed=_solver_failed,
-            unexplained_count=_unexplained,
+            unexplained_count=_unresolved,
         )
         final_confidence_breakdown = regated
         final_confidence_label = regated["label"]
         logger.info(
-            "DCF finalize re-gated confidence label=%s aggregate=%.3f validity=%s solver_failed=%s unexplained=%d",
+            "DCF finalize re-gated confidence label=%s aggregate=%.3f validity=%s solver_failed=%s unresolved=%d",
             regated["label"], regated.get("aggregate_score", 0.0),
-            _model_validity, _solver_failed, _unexplained,
+            _model_validity, _solver_failed, _unresolved,
         )
         # Leak fix #2: the earlier compute_valuation activity card still
         # shows the pre-gate (often HIGH) confidence — re-emit the same
@@ -520,6 +583,12 @@ def finalize_node(state: dict) -> dict:
             )
         except Exception:
             logger.exception("Failed to re-emit compute_valuation activity after re-gate")
+
+    final_confidence_assessment = state.get("confidence_assessment") or confidence_assessment_from_positions(
+        positions=_positions,
+        model_validity=_model_validity,
+        procedural_base=(final_confidence_breakdown or {}).get("aggregate_score"),
+    )
 
     # Leak fix #3: when the model is invalid AND the analysis loop produced
     # queued adjustments, surface whether those adjustments affected the price.
@@ -604,6 +673,7 @@ def finalize_node(state: dict) -> dict:
         "company_state": state.get("company_state") or {},
         # ── Confidence decomposition & WACC sanity ──
         "confidence_breakdown": final_confidence_breakdown or {},
+        "confidence_assessment": final_confidence_assessment or {},
         "wacc_sanity": state.get("wacc_sanity") or {},
         # ── Thesis & analysis loop (new) ──
         "thesis": state.get("thesis") or {},
@@ -617,12 +687,17 @@ def finalize_node(state: dict) -> dict:
         "reconciliation_note": state.get("reconciliation_note", ""),
         "implied_growth": state.get("implied_growth"),
         "implied_margin": state.get("implied_margin"),
+        "market_signals_meta": state.get("market_signals_meta") or {},
         "effective_confidence": state.get("effective_confidence"),
+        "conviction_direction": state.get("conviction_direction"),
+        # ── Coherence gate (pre-valuation) ──
+        "coherence_assessment": state.get("coherence_assessment") or {},
+        "coherence_adjustments": state.get("coherence_adjustments") or {},
         # ── Scenario-based valuation ──
         "scenarios": state.get("scenarios") or [],
         "scenario_results": state.get("scenario_results") or [],
         # ── Evidence items (for human-readable ref resolution) ──
-        "_evidence_items": (state.get("evidence_pack") or {}).get("items", []),
+        **_persisted_evidence_fields(state),
     }
     out_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -637,22 +712,30 @@ def finalize_node(state: dict) -> dict:
     market_price = float((state.get("market_snapshot") or {}).get("price", 0))
     scenarios = state.get("scenario_results") or []
 
-    conviction = {"direction": "low_conviction", "confidence": 0.3, "gap_pct": 0.0, "dispersion_pct": 0.0, "unanchored_count": 0}
+    conviction = {
+        "direction": state.get("conviction_direction") or "genuine_uncertainty",
+        "confidence": 0.3,
+        "gap_pct": 0.0,
+        "dispersion_pct": 0.0,
+        "unanchored_count": 0,
+    }
     try:
         gap = abs(payload["valuation"]["implied_share_price"] / max(market_price, 1) - 1)
         prices = [r["valuation"].get("implied_share_price", 0) for r in scenarios if r.get("valuation", {}).get("implied_share_price")]
         dispersion = (max(prices) - min(prices)) / (sum(prices) / len(prices)) if len(prices) >= 3 else 0
         unanchored = sum(1 for f in critique.get("findings", []) if f.get("is_unanchored"))
 
-        if unanchored >= 3:
-            direction, conf = "genuine_uncertainty", 0.2
-        elif gap > 0.3 and dispersion < 0.4:
-            direction = "market_overpaying" if implied_growth and implied_growth > thesis.get("growth_estimate", 0) * 1.5 else "model_too_conservative"
+        direction = state.get("conviction_direction") or conviction_direction_from_positions(_positions)
+        if unanchored >= 3 or dispersion > 0.5:
+            direction, conf = "genuine_uncertainty", 0.25
+        elif direction == "market_overpaying":
             conf = 0.6
-        elif dispersion > 0.5:
-            direction, conf = "genuine_uncertainty", 0.3
+        elif direction in {"unresolved_expectations", "structural_premium"}:
+            conf = 0.4
+        elif direction == "model_too_conservative":
+            conf = 0.5
         else:
-            direction, conf = "low_conviction", 0.3
+            direction, conf = "genuine_uncertainty", 0.3
 
         conviction = {"direction": direction, "confidence": conf, "gap_pct": round(gap * 100, 1), "dispersion_pct": round(dispersion * 100, 1), "unanchored_count": unanchored}
         payload["conviction"] = conviction
@@ -943,38 +1026,83 @@ def _compute_dcf_value(
     horizon: int,
     net_debt: float,
     shares_outstanding: float,
+    *,
+    revenue_growth_terminal: float | None = None,
+    fcff_margin_terminal: float | None = None,
+    sbc_pct_revenue: float = 0.0,
+    buyback_yield: float = 0.0,
 ) -> float:
-    """Compute implied share price from assumptions (pure function, no state)."""
+    """Compute implied share price from assumptions (pure function, no state).
+
+    Mirrors ``project_cashflows_node`` + ``compute_valuation_node`` so reverse-DCF
+    implied growth/margin are comparable to the forward model.
+    """
+    growth_start = float(revenue_growth)
+    growth_end = float(revenue_growth_terminal if revenue_growth_terminal is not None else revenue_growth)
+    margin_start = float(fcff_margin)
+    margin_end = float(fcff_margin_terminal if fcff_margin_terminal is not None else fcff_margin)
+    denom = max(horizon - 1, 1)
+
     revenue = base_revenue
     projected: list[dict[str, float]] = []
     for year in range(1, horizon + 1):
-        revenue *= (1.0 + revenue_growth)
-        fcff = revenue * fcff_margin
+        growth_n = growth_start + (growth_end - growth_start) * (year - 1) / denom
+        margin_n = margin_start + (margin_end - margin_start) * (year - 1) / denom
+        effective_margin_n = margin_n - float(sbc_pct_revenue)
+        revenue *= 1.0 + growth_n
+        fcff = revenue * effective_margin_n
         projected.append({"year": float(year), "fcff": fcff})
 
     pv_sum = sum(row["fcff"] / ((1.0 + wacc) ** int(row["year"])) for row in projected)
     terminal_fcf = projected[-1]["fcff"] * (1.0 + terminal_growth)
-    terminal_value = terminal_fcf / max((wacc - terminal_growth), 1e-6)
+    pre_buyback_terminal_value = terminal_fcf / max((wacc - terminal_growth), 1e-6)
+    pre_buyback_terminal_equity = pre_buyback_terminal_value - net_debt
+    fcff_yield_terminal = (
+        terminal_fcf / pre_buyback_terminal_equity
+        if pre_buyback_terminal_equity > 0 else 0.0
+    )
+    perpetual_buyback = max(0.0, min(float(buyback_yield), fcff_yield_terminal, 0.04))
+    if wacc - terminal_growth - perpetual_buyback < 0.005:
+        perpetual_buyback = max(0.0, wacc - terminal_growth - 0.005)
+    effective_terminal_growth = terminal_growth + perpetual_buyback
+    terminal_value = terminal_fcf / max((wacc - effective_terminal_growth), 1e-6)
     terminal_pv = terminal_value / ((1.0 + wacc) ** horizon)
     enterprise_value = pv_sum + terminal_pv
     equity_value = enterprise_value - net_debt
-    return equity_value / max(shares_outstanding, 1e-6)
+    shares_end = shares_outstanding * ((1.0 - float(buyback_yield)) ** horizon)
+    return equity_value / max(shares_end, 1e-6)
+
+
+def _dcf_value_from_assumptions(assumptions: dict[str, float]) -> float:
+    """Shared forward-DCF price from a full assumptions dict."""
+    horizon = 5
+    return _compute_dcf_value(
+        base_revenue=float(assumptions.get("base_revenue", 0)),
+        revenue_growth=float(assumptions.get("revenue_growth", 0)),
+        fcff_margin=float(assumptions.get("fcff_margin", 0)),
+        wacc=float(assumptions.get("wacc", 0.10)),
+        terminal_growth=float(assumptions.get("terminal_growth", 0.025)),
+        horizon=horizon,
+        net_debt=float(assumptions.get("net_debt", 0)),
+        shares_outstanding=float(assumptions.get("shares_outstanding", 1)),
+        revenue_growth_terminal=assumptions.get("revenue_growth_terminal"),  # type: ignore[arg-type]
+        fcff_margin_terminal=assumptions.get("fcff_margin_terminal"),  # type: ignore[arg-type]
+        sbc_pct_revenue=float(assumptions.get("sbc_pct_revenue", 0.0) or 0.0),
+        buyback_yield=float(assumptions.get("buyback_yield", 0.0) or 0.0),
+    )
 
 
 def compute_implied_growth(assumptions: dict[str, float], market_price: float) -> float | None:
-    """Bisection: find revenue_growth that makes implied_price == market_price."""
-    base_revenue = float(assumptions.get("base_revenue", 0))
-    fcff_margin = float(assumptions.get("fcff_margin", 0))
-    wacc = float(assumptions.get("wacc", 0.10))
-    terminal_growth = float(assumptions.get("terminal_growth", 0.025))
-    horizon = 5
-    net_debt = float(assumptions.get("net_debt", 0))
-    shares = float(assumptions.get("shares_outstanding", 1))
-
+    """Bisection: find revenue_growth (Y1) that makes implied_price == market_price."""
     lo, hi = 0.01, 0.50
+    if _dcf_value_from_assumptions({**assumptions, "revenue_growth": hi}) < market_price:
+        return None
+    if _dcf_value_from_assumptions({**assumptions, "revenue_growth": lo}) > market_price:
+        return None
     for _ in range(60):
         mid = (lo + hi) / 2.0
-        price = _compute_dcf_value(base_revenue, mid, fcff_margin, wacc, terminal_growth, horizon, net_debt, shares)
+        trial = {**assumptions, "revenue_growth": mid}
+        price = _dcf_value_from_assumptions(trial)
         if abs(price - market_price) < 1.0:
             return round(mid, 4)
         if price < market_price:
@@ -986,19 +1114,16 @@ def compute_implied_growth(assumptions: dict[str, float], market_price: float) -
 
 
 def compute_implied_margin(assumptions: dict[str, float], market_price: float) -> float | None:
-    """Bisection: find fcff_margin that makes implied_price == market_price."""
-    base_revenue = float(assumptions.get("base_revenue", 0))
-    revenue_growth = float(assumptions.get("revenue_growth", 0))
-    wacc = float(assumptions.get("wacc", 0.10))
-    terminal_growth = float(assumptions.get("terminal_growth", 0.025))
-    horizon = 5
-    net_debt = float(assumptions.get("net_debt", 0))
-    shares = float(assumptions.get("shares_outstanding", 1))
-
+    """Bisection: find fcff_margin (Y1) that makes implied_price == market_price."""
     lo, hi = 0.01, 0.60
+    if _dcf_value_from_assumptions({**assumptions, "fcff_margin": hi}) < market_price:
+        return None
+    if _dcf_value_from_assumptions({**assumptions, "fcff_margin": lo}) > market_price:
+        return None
     for _ in range(60):
         mid = (lo + hi) / 2.0
-        price = _compute_dcf_value(base_revenue, revenue_growth, mid, wacc, terminal_growth, horizon, net_debt, shares)
+        trial = {**assumptions, "fcff_margin": mid}
+        price = _dcf_value_from_assumptions(trial)
         if abs(price - market_price) < 1.0:
             return round(mid, 4)
         if price < market_price:
@@ -1009,9 +1134,82 @@ def compute_implied_margin(assumptions: dict[str, float], market_price: float) -
     return result if 0.005 <= result <= 0.60 else None
 
 
-# ---------------------------------------------------------------------------
-# Market signals node — replaces compute_implied_wacc_node
-# ---------------------------------------------------------------------------
+def classify_implied_signal(
+    implied_wacc: float | None,
+    risk_free_rate: float,
+) -> dict[str, Any]:
+    """Classify the plausibility of a market-implied discount rate.
+
+    Returns a dict with ``label``, ``spread_bps``, and ``narrative``.
+    A market-implied WACC that prices equity at less than ~150bps over the
+    risk-free rate is economically implausible for any equity claim, and
+    typically reflects terminal-value dominance, solver edge, or unmodeled
+    structural premium — not a literal market discount rate.
+    """
+    if not isinstance(implied_wacc, (int, float)) or implied_wacc <= 0:
+        return {
+            "label": "unavailable",
+            "spread_bps": None,
+            "narrative": "Implied discount rate unavailable.",
+        }
+    spread = float(implied_wacc) - float(risk_free_rate)
+    spread_bps = int(round(spread * 10_000))
+    if spread < 0.015:
+        label = "economically_implausible"
+        narrative = (
+            f"Implied WACC of {implied_wacc:.2%} sits only {spread_bps:+d}bps over the risk-free rate, "
+            "which is economically implausible for an equity claim. This typically reflects "
+            "terminal-value dominance, reverse-solver instability, or a structural premium the DCF "
+            "does not model — not a literal market discount rate."
+        )
+    elif spread < 0.030:
+        label = "aggressive"
+        narrative = (
+            f"Implied WACC of {implied_wacc:.2%} ({spread_bps:+d}bps over Rf) is aggressive for equity. "
+            "Interpret as a signal that the market embeds either a quality/duration premium or growth "
+            "expectations beyond the modeled assumptions, rather than a literal discount-rate consensus."
+        )
+    elif spread < 0.060:
+        label = "reasonable"
+        narrative = (
+            f"Implied WACC of {implied_wacc:.2%} ({spread_bps:+d}bps over Rf) sits in a defensible range "
+            "for equity claims; comparison to model WACC is meaningful."
+        )
+    else:
+        label = "conservative"
+        narrative = (
+            f"Implied WACC of {implied_wacc:.2%} ({spread_bps:+d}bps over Rf) is conservative — the market "
+            "may be pricing significant cyclical, leverage, or execution risk above the model."
+        )
+    return {"label": label, "spread_bps": spread_bps, "narrative": narrative}
+
+
+def wacc_gap_is_binding(
+    wacc_sanity: dict[str, Any],
+    *,
+    implied_share_price: float | None = None,
+    spot_price: float | None = None,
+    gap_bps_threshold: int = 150,
+) -> bool:
+    """True when discount-rate gap likely drives the model-vs-spot spread.
+
+    When binding, implied growth/margin at fixed WACC are misleading — the
+    price is reconciled primarily via WACC (or non-modeled premium), not via
+    absurd growth/margin levers.
+    """
+    if wacc_sanity.get("solver_status") != "ok":
+        return False
+    gap_bps = abs(int(wacc_sanity.get("gap_bps") or 0))
+    if gap_bps < gap_bps_threshold:
+        return False
+    if (
+        isinstance(implied_share_price, (int, float))
+        and isinstance(spot_price, (int, float))
+        and spot_price > 0
+        and implied_share_price > 0
+    ):
+        return implied_share_price / spot_price < 0.85
+    return gap_bps >= 250
 
 
 def compute_market_signals_node(state: dict) -> dict:
@@ -1024,10 +1222,10 @@ def compute_market_signals_node(state: dict) -> dict:
     ticker = state.get("ticker", "?")
 
     # Implied WACC (existing logic + solver-failure flag)
-    capm_seed = (state.get("wacc_components") or {}).get("wacc_pre_clip", assumptions.get("wacc", 0.10))
+    model_wacc = float(assumptions.get("wacc", 0.10))
     wacc_sanity = {
         "method": "capm_vs_implied",
-        "capm_wacc": capm_seed,
+        "capm_wacc": model_wacc,
         "implied_wacc": None,
         "gap_bps": None,
         "direction": "neutral",
@@ -1055,7 +1253,13 @@ def compute_market_signals_node(state: dict) -> dict:
                 f"projection_rows={len(projected_fcff)}"
             )
         else:
-            implied_wacc = solve_implied_wacc(projected_fcff, terminal_growth, implied_ev_M)
+            implied_wacc = solve_implied_wacc(
+                projected_fcff,
+                terminal_growth,
+                implied_ev_M,
+                buyback_yield=float(assumptions.get("buyback_yield", 0.0) or 0.0),
+                net_debt_M=float(assumptions.get("net_debt", 0)),
+            )
             if implied_wacc is None:
                 wacc_sanity["solver_status"] = "no_convergence"
                 wacc_sanity["flag"] = "solver_failed"
@@ -1076,6 +1280,8 @@ def compute_market_signals_node(state: dict) -> dict:
                 gap = round((capm - implied_wacc) * 10000)
                 direction = "model_wacc_above_implied" if gap > 0 else "model_wacc_below_implied"
                 flag = "severe" if abs(gap) > 200 else ("warning" if abs(gap) > 100 else "ok")
+                rf = (state.get("wacc_components") or {}).get("risk_free_rate", 0.045)
+                plausibility = classify_implied_signal(implied_wacc, float(rf))
                 wacc_sanity = {
                     "method": "capm_vs_implied",
                     "capm_wacc": capm,
@@ -1084,6 +1290,7 @@ def compute_market_signals_node(state: dict) -> dict:
                     "direction": direction,
                     "flag": flag,
                     "solver_status": "ok",
+                    "implied_plausibility": plausibility,
                     "interpretation": (
                         f"CAPM {capm:.1%} vs implied {implied_wacc:.1%} "
                         f"({'+' if gap > 0 else ''}{gap}bps {'⚠' if abs(gap) > 100 else ''})"
@@ -1095,21 +1302,37 @@ def compute_market_signals_node(state: dict) -> dict:
         wacc_sanity["flag"] = "solver_failed"
         wacc_sanity["interpretation"] = f"Solver raised exception: {exc!s}"
 
-    # Implied growth
+    # Implied growth / margin — skip when WACC gap is the binding constraint
+    implied_share = (state.get("valuation") or {}).get("implied_share_price")
+    wacc_binding = wacc_gap_is_binding(
+        wacc_sanity,
+        implied_share_price=implied_share,
+        spot_price=market_price if market_price > 0 else None,
+    )
     implied_growth: float | None = None
-    if market_price > 0:
+    implied_margin: float | None = None
+    if market_price > 0 and not wacc_binding:
         try:
             implied_growth = compute_implied_growth(assumptions, market_price)
         except Exception:
             logger.warning("Implied growth computation failed for %s", ticker, exc_info=True)
-
-    # Implied margin
-    implied_margin: float | None = None
-    if market_price > 0:
         try:
             implied_margin = compute_implied_margin(assumptions, market_price)
         except Exception:
             logger.warning("Implied margin computation failed for %s", ticker, exc_info=True)
+
+    market_signals_meta = {
+        "wacc_binding": wacc_binding,
+        "growth_margin_suppressed": wacc_binding,
+    }
+    if wacc_binding:
+        wacc_sanity = dict(wacc_sanity)
+        wacc_sanity["binding_constraint"] = "wacc"
+        wacc_sanity["interpretation"] = (
+            f"{wacc_sanity.get('interpretation', '').rstrip('.')}. "
+            "At fixed model WACC, growth/margin alone cannot reconcile spot — "
+            "discount-rate or structural-premium gap is the primary read-through."
+        )
 
     # Summary
     parts: list[str] = []
@@ -1118,13 +1341,13 @@ def compute_market_signals_node(state: dict) -> dict:
     model_margin = assumptions.get("fcff_margin", 0)
     iw = wacc_sanity.get("implied_wacc")
     if isinstance(iw, (int, float)) and iw > 0:
-        parts.append(f"WACC: {model_wacc:.1%} vs imp {iw:.1%}")
+        parts.append(f"WACC: {model_wacc:.1%} vs DCF-implied {iw:.1%}")
     else:
         parts.append(f"WACC: {model_wacc:.1%} (solver: {wacc_sanity.get('solver_status', 'unknown')})")
     if implied_growth is not None:
-        parts.append(f"growth: {model_growth:.1%} vs imp {implied_growth:.1%}")
+        parts.append(f"growth: {model_growth:.1%} vs DCF-implied {implied_growth:.1%}")
     if implied_margin is not None:
-        parts.append(f"margin: {model_margin:.1%} vs imp {implied_margin:.1%}")
+        parts.append(f"margin: {model_margin:.1%} vs DCF-implied {implied_margin:.1%}")
 
     emit_step(
         "compute_market_signals", "complete", parent_step_id,
@@ -1133,6 +1356,12 @@ def compute_market_signals_node(state: dict) -> dict:
             "wacc_sanity": wacc_sanity,
             "implied_growth": implied_growth,
             "implied_margin": implied_margin,
+            "market_signals_meta": market_signals_meta,
         },
     )
-    return {"wacc_sanity": wacc_sanity, "implied_growth": implied_growth, "implied_margin": implied_margin}
+    return {
+        "wacc_sanity": wacc_sanity,
+        "implied_growth": implied_growth,
+        "implied_margin": implied_margin,
+        "market_signals_meta": market_signals_meta,
+    }

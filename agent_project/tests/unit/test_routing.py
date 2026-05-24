@@ -63,22 +63,23 @@ from agent_project.graphs.workflows.dcf.review_loop import (
 
 def test_route_after_review_should_refine():
     state = build_test_state(critique={"should_refine": True})
-    assert route_after_review(state) == "scenario_runner"
+    assert route_after_review(state) == "coherence_gate"
 
 
 def test_route_after_review_no_refine():
+    """When no refinement, route to divergences (analysis runs every loop)."""
     state = build_test_state(critique={"should_refine": False})
-    assert route_after_review(state) == "finalize"
+    assert route_after_review(state) == "detect_divergences"
 
 
 def test_route_after_review_val_should_refine():
     state = build_test_state(critique={"should_refine": True})
-    assert route_after_review_val(state) == "project_cashflows"
+    assert route_after_review_val(state) == "coherence_gate"
 
 
 def test_route_after_review_val_no_refine():
     state = build_test_state(critique={"should_refine": False})
-    assert route_after_review_val(state) == "finalize"
+    assert route_after_review_val(state) == "detect_divergences"
 
 
 # ---------------------------------------------------------------------------

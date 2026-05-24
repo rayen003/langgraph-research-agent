@@ -154,11 +154,11 @@ def test_none_critique_no_changes():
     assert result["assumptions"] == orig
 
 
-def test_result_contains_only_assumptions_key():
-    """Node returns just {"assumptions": ...} — no other state pollution."""
+def test_result_contains_expected_keys_only():
+    """Node returns assumptions and, when WACC moves, synced wacc_components."""
     state = build_test_state(critique={"suggested_adjustments": {"wacc": 0.005}, "flags": []})
     result = refine_assumptions_node(state)
-    assert set(result.keys()) == {"assumptions"}
+    assert set(result.keys()) == {"assumptions", "wacc_components"}
 
 
 def test_assumption_values_rounded_to_4_decimals():

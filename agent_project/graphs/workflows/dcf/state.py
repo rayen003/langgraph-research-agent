@@ -114,6 +114,18 @@ class DCFState(TypedDict):
     reconciliation_note: str
     # Penalized confidence after analysis (base_confidence × severity_multiplier).
     effective_confidence: float | None
+    # Split confidence axes: procedural math validity vs interpretive/evidence strength.
+    confidence_assessment: dict[str, Any] | None
+    # Softer final interpretation: model_too_conservative | market_overpaying |
+    # unresolved_expectations | genuine_uncertainty | structural_premium.
+    conviction_direction: str | None
+    # ── Pre-valuation coherence gate ─────────────────────────────────────
+    # Output of ``coherence_gate_node``. Captures ops/WACC tier classification
+    # and any flags raised when the bundle is internally contradictory.
+    coherence_assessment: dict[str, Any] | None
+    # Per-field auto-corrections applied by the coherence gate. Each entry:
+    # {"old": float, "new": float, "delta": float, "reason": str}.
+    coherence_adjustments: dict[str, dict[str, float]]
 
 
 # ---------------------------------------------------------------------------

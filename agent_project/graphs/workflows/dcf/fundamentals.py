@@ -347,6 +347,65 @@ def _fetch_fundamentals_fmp(ticker: str) -> dict[str, dict[str, Any]]:
             "evidence": "FMP FCF margin (proxy: components for full FCFF unavailable).",
         }
 
+    # --- Capital return / dilution mechanics (Tier B, surfaced for HITL) ---
+    # Repurchases are cash-flow statement amounts in USD. FMP may expose them
+    # as negative outflows, so use absolute value and net out share issuance.
+    repurchase_raw = (
+        cashflow.get("commonStockRepurchased")
+        or cashflow.get("repurchaseOfCapitalStock")
+        or cashflow.get("repurchasesOfCommonStock")
+    )
+    issuance_raw = (
+        cashflow.get("commonStockIssued")
+        or cashflow.get("issuanceOfCapitalStock")
+        or cashflow.get("commonStockIssuance")
+    )
+    if (
+        isinstance(repurchase_raw, (int, float))
+        and isinstance(market_cap, (int, float))
+        and market_cap > 0
+    ):
+        repurchases = abs(float(repurchase_raw))
+        issuance = abs(float(issuance_raw)) if isinstance(issuance_raw, (int, float)) else 0.0
+        net_repurchases = repurchases - issuance
+        buyback_yield = net_repurchases / float(market_cap)
+        if abs(buyback_yield) >= 0.001:
+            out["buyback_yield"] = {
+                "value": buyback_yield,
+                "source": "fmp",
+                "field": "net share repurchases / market cap",
+                "raw_value": net_repurchases,
+                "raw_unit": "USD",
+                "as_of": as_of,
+                "confidence": 0.82,
+                "evidence": (
+                    "FMP cash-flow statement net share repurchases divided by market cap."
+                ),
+            }
+
+    sbc_raw = (
+        cashflow.get("stockBasedCompensation")
+        or cashflow.get("stockBasedCompensationExpense")
+        or cashflow.get("shareBasedCompensation")
+    )
+    if (
+        isinstance(sbc_raw, (int, float))
+        and isinstance(revenue_raw, (int, float))
+        and revenue_raw > 0
+    ):
+        sbc_pct_revenue = float(sbc_raw) / float(revenue_raw)
+        if sbc_pct_revenue > 0:
+            out["sbc_pct_revenue"] = {
+                "value": sbc_pct_revenue,
+                "source": "fmp",
+                "field": "stockBasedCompensation / revenue",
+                "raw_value": float(sbc_raw),
+                "raw_unit": "USD",
+                "as_of": as_of,
+                "confidence": 0.82,
+                "evidence": "FMP cash-flow statement stock-based compensation divided by revenue.",
+            }
+
     # --- profile metadata ---
     profile_meta: dict[str, Any] = {}
     if isinstance(profile, dict) and profile:
