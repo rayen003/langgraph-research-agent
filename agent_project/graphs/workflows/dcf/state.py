@@ -112,6 +112,10 @@ class DCFState(TypedDict):
     # Market reconciliation posture after analysis: aligned | structural_gap | critical_unresolved | refining
     reconciliation_status: str
     reconciliation_note: str
+    # Consolidated market signals (enriched by compute_market_signals_node).
+    # Keys: model_wacc, implied_wacc, wacc_gap_bps, modeled_growth, implied_growth,
+    #       growth_gap_pp, plausibility_label, wacc_binding, growth_margin_suppressed.
+    market_signals_meta: dict[str, Any]
     # Penalized confidence after analysis (base_confidence × severity_multiplier).
     effective_confidence: float | None
     # Split confidence axes: procedural math validity vs interpretive/evidence strength.

@@ -77,7 +77,9 @@ export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy 
     const a: KgNode[] = []
     const o: KgNode[] = []
     for (const n of allNodes) {
-      if (n.run_id !== runId) continue
+      // Must match BOTH run_id AND ticker — multiple tickers can share the same
+      // run_id (e.g. "workflow_dcf") when runs are batched in one session.
+      if (n.run_id !== runId || n.ticker !== ticker) continue
       if (n.node_type === 'run_assumption') a.push(n)
       else if (n.node_type === 'run_output') o.push(n)
     }

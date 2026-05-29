@@ -7,6 +7,7 @@ import { SessionsSidebar } from './components/SessionsSidebar'
 import { MessageThread } from './components/MessageThread'
 import { ExecutionSidebar } from './components/ExecutionSidebar'
 import { DocumentPreview } from './components/DocumentPreview'
+import { DeckPreview } from './components/DeckPreview'
 import { JobsPanel } from './components/JobsPanel'
 import { KnowledgePanel } from './components/KnowledgePanel'
 import { RerunToast, type RerunToastState } from './components/RerunToast'
@@ -16,20 +17,54 @@ let _msgCounter = 0
 const nextMsgId = () => `m_${Date.now()}_${++_msgCounter}`
 
 export default function App() {
-  const { state, startRun, approve, reject, reset } = useAgentRun()
-  const { sessions, activeSession, newSession, selectSession, deleteSession, addMessage, updateChatThreadId } = useSessionManager()
+  const { state, startRun, amendMessage, approve, reject, reset } = useAgentRun()
+  const { sessions, activeSession, newSession, selectSession, deleteSession, addMessage, truncateMessagesFrom, updateChatThreadId } = useSessionManager()
   const { researchJobs, runningCount } = useJobs(true)
   const { docs, upload, remove: removeDoc } = useDocuments(activeSession?.id ?? '')
   const [mode, setMode] = useState<Mode>('auto')
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null)
+  const [selectedDeck, setSelectedDeck] = useState<{ threadId: string; filename: string; title?: string } | null>(null)
   const [kgPanelOpen, setKgPanelOpen] = useState(false)
   const [rerunToast, setRerunToast] = useState<RerunToastState | null>(null)
+  // Increments when a rerun completes so KnowledgePanel can refresh the KG
+  // and pick up the new DCF run nodes written during the workflow.
+  const [kgRefreshTrigger, setKgRefreshTrigger] = useState(0)
 
   // Auto-clear selection when doc disappears or session changes
   useEffect(() => {
     if (!selectedDocId) return
     if (!docs.some(d => d.doc_id === selectedDocId)) setSelectedDocId(null)
   }, [docs, selectedDocId])
+
+  const handleOpenDeckPreview = useCallback((filename: string, title: string | undefined, threadId: string) => {
+    if (!threadId) return
+    setSelectedDocId(null)
+    setSelectedDeck({ threadId, filename, title })
+  }, [])
+
+  /**
+   * Amend a previously-sent user message. Truncates the session locally from
+   * the edited index forward (the old assistant reply becomes stale) and asks
+   * the backend to fork the LangGraph thread at the pre-message checkpoint
+   * and re-run with the new content.
+   */
+  const handleAmendMessage = useCallback(
+    (messageIndex: number, originalContent: string, newContent: string) => {
+      if (!activeSession) return
+      const threadId = activeSession.chatThreadId
+      // Local truncate first so the UI feels instant.
+      truncateMessagesFrom(activeSession.id, messageIndex)
+      // Allow the new run's `complete` event to commit a fresh assistant turn.
+      committedRef.current.delete(threadId)
+      runTargetSessionIdRef.current = activeSession.id
+      void amendMessage(threadId, originalContent, newContent, mode, activeSession.id)
+    },
+    [activeSession, amendMessage, mode, truncateMessagesFrom],
+  )
+
+  const handleCloseDeckPreview = useCallback(() => {
+    setSelectedDeck(null)
+  }, [])
 
   // Track which thread_ids have already been committed to a session
   const committedRef = useRef<Set<string>>(new Set())
@@ -102,6 +137,10 @@ export default function App() {
       ? { ...prev, status: 'complete' } : prev)
     runTargetSessionIdRef.current = null
 
+    // Nudge KnowledgePanel to refresh so the new DCF run nodes (written to
+    // the target session during the rerun) appear in the KG graph immediately.
+    setKgRefreshTrigger(t => t + 1)
+
     // Small delay so the final token renders before we flip back to idle
     const tid = setTimeout(reset, 150)
     return () => clearTimeout(tid)
@@ -171,11 +210,11 @@ export default function App() {
   const selectedDoc = docs.find(d => d.doc_id === selectedDocId) ?? null
   // Priority: doc preview > execution sidebar.  KG now opens as a full-screen
   // modal (rendered below at z-50) so it doesn't compete for sidebar space.
-  const rightPanel: 'doc' | 'execution' | null =
-    selectedDoc ? 'doc' : showExecutionPanel ? 'execution' : null
+  const rightPanel: 'doc' | 'execution' | 'deck' | null =
+    selectedDeck ? 'deck' : selectedDoc ? 'doc' : showExecutionPanel ? 'execution' : null
   const rightPanelOpen = rightPanel !== null
   const rightPanelWidth =
-    rightPanel === 'doc' ? 520 : 360
+    rightPanel === 'doc' || rightPanel === 'deck' ? 520 : 360
 
   return (
     <div className="h-screen bg-[#0a0a0a] text-zinc-100 flex overflow-hidden">
@@ -200,9 +239,14 @@ export default function App() {
         onUpload={upload}
         docs={docs}
         selectedDocId={selectedDocId}
-        onSelectDoc={(id) => setSelectedDocId(id === selectedDocId ? null : id)}
+        onSelectDoc={(id) => {
+          setSelectedDeck(null)
+          setSelectedDocId(id === selectedDocId ? null : id)
+        }}
         onRemoveDoc={removeDoc}
         disabled={false}
+        onOpenDeckPreview={handleOpenDeckPreview}
+        onAmendMessage={handleAmendMessage}
       />
 
       {/* ── Right: Doc preview OR Execution panel (slides in) ───── */}
@@ -214,6 +258,14 @@ export default function App() {
           {rightPanel === 'doc' && selectedDoc && (
             <DocumentPreview doc={selectedDoc} onClose={() => setSelectedDocId(null)} />
           )}
+          {rightPanel === 'deck' && selectedDeck && (
+            <DeckPreview
+              threadId={selectedDeck.threadId}
+              filename={selectedDeck.filename}
+              title={selectedDeck.title}
+              onClose={handleCloseDeckPreview}
+            />
+          )}
           {rightPanel === 'execution' && (
             <ExecutionSidebar
               status={state.status}
@@ -222,6 +274,7 @@ export default function App() {
               error={state.error}
               activity={state.activity}
               dcfReview={state.dcf_review ?? undefined}
+              deckReview={state.deck_review ?? undefined}
               threadId={state.thread_id}
               onApprove={approve}
               onReject={reject}
@@ -257,6 +310,7 @@ export default function App() {
           onClose={() => setKgPanelOpen(false)}
           activeSessionTitle={activeSession?.title ?? '(unnamed)'}
           activeChatThreadId={activeSession?.chatThreadId}
+          refreshTrigger={kgRefreshTrigger}
           onCreateNewSession={() => {
             // Do NOT auto-activate. KG stays attached to the session you're
             // viewing so it doesn't flash empty mid-rerun. Toast's
@@ -277,6 +331,15 @@ export default function App() {
             // so brand-new sessions work even pre-render.
             if (sessionId) {
               addMessage(sessionId, { id: nextMsgId(), type: 'user', content: diffText })
+            }
+
+            // "New chat" must actually open a new chat. The live run stream is
+            // global (activeRun), so without switching the view the rerun would
+            // appear in whatever chat is on screen — making "new" and "current"
+            // indistinguishable. Switch only AFTER the diff message exists so the
+            // new session never renders empty mid-rerun.
+            if (target === 'new' && sessionId) {
+              selectSession(sessionId)
             }
 
             // Optimistic toast — threadId filled in once /runs returns.

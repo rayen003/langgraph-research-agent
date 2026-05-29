@@ -146,6 +146,7 @@ def _build_initial_state(
         "invalidation_reason": "",
         "reconciliation_status": "aligned",
         "reconciliation_note": "",
+        "market_signals_meta": {},
         "effective_confidence": None,
         "confidence_assessment": None,
         "conviction_direction": None,
@@ -319,9 +320,25 @@ def run_dcf_workflow_sync(
     completion, returning the full dcf_output.json payload.
     """
     overrides = assumption_overrides or {}
+    # Fast path only when a prior HITL snapshot exists — ensures thesis and
+    # company_state are always available (synthesis ran in the full workflow).
+    # Without a snapshot, run the full workflow so evidence/synthesis execute.
+    _has_hitl_snapshot = bool(get_dcf_hitl_payload())
+    # Fast path: all explicit assumption fields supplied + no review needed.
+    # A prior HITL snapshot is preferred (enriches provenance/memo) but NOT
+    # required — if missing we just use simple user-provided provenance.
+    # This ensures KG-triggered reruns (no snapshot in thread context) still
+    # use the lightweight valuation graph instead of the full evidence+memo
+    # workflow, which would exceed LangGraph's 25-step recursion limit.
     use_fast_path = (
         not assumption_review_mode
         and _ALL_ASSUMPTION_FIELDS.issubset(overrides.keys())
+    )
+    logger.info(
+        "run_dcf_workflow_sync: ticker=%s review_mode=%s fast_path=%s "
+        "has_snapshot=%s override_keys=%s",
+        ticker, assumption_review_mode, use_fast_path,
+        _has_hitl_snapshot, sorted(overrides.keys()),
     )
     initial_state = _build_initial_state(
         ticker=ticker,
@@ -333,7 +350,10 @@ def run_dcf_workflow_sync(
         session_id=session_id,
     )
 
-    config = {"configurable": {"thread_id": get_run_dir().name}}
+    # 50-step limit: full workflow = ~18 steps/pass × up to 2 convergence
+    # retries = 36 steps; fast-path = ~11 steps × 2 = 22. Default 25 is too
+    # tight for the full workflow when convergence_gate loops.
+    config = {"configurable": {"thread_id": get_run_dir().name}, "recursion_limit": 50}
 
     try:
         if use_fast_path:

@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback } from 'react'
+import { useMemo, useState, useCallback, useEffect } from 'react'
 import { useKnowledgeGraph, type KgNode } from '../hooks/useKnowledgeGraph'
 import { KgCanvas } from './KgCanvas'
 import { KgFilterSidebar } from './KgFilterSidebar'
@@ -32,9 +32,14 @@ interface Props {
   }) => Promise<string | null>
   /** Whether App's run state is currently active (disables rerun button). */
   isRunActive?: boolean
+  /** Increments when a rerun completes so the KG can refresh to show new nodes. */
+  refreshTrigger?: number
 }
 
-const MAX_EXPANDED_RUNS_PER_TICKER = 3
+// Show assumption/output leaf nodes only for the most recent run per ticker by
+// default — older runs stay collapsed to prevent graph saturation. User can
+// toggle "show all run details" to expand all.
+const MAX_EXPANDED_RUNS_PER_TICKER = 1
 
 interface PendingRerun {
   ticker: string
@@ -52,13 +57,25 @@ export function KnowledgePanel({
   onCreateNewSession,
   onStartRerun,
   isRunActive = false,
+  refreshTrigger,
 }: Props) {
   const kg = useKnowledgeGraph(sessionId)
+
+  // Refresh the KG whenever App signals a rerun has completed — picks up the
+  // new dcf_run / run_assumption / run_output nodes written by the workflow.
+  useEffect(() => {
+    if (refreshTrigger == null || refreshTrigger === 0) return
+    void kg.refresh()
+  }, [refreshTrigger]) // eslint-disable-line react-hooks/exhaustive-deps
   const [rerunBusy, setRerunBusy] = useState(false)
 
   const [selectedNode, setSelectedNode] = useState<KgNode | null>(null)
   const [queryOpen, setQueryOpen] = useState(false)
-  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set())
+  // Default-hide high-volume detail nodes that make the graph unreadable.
+  // User can toggle them back via the filter sidebar.
+  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(
+    new Set(['driver', 'news_item', 'filing', 'run_scenario', 'deck_slide']),
+  )
   const [hiddenTickers, setHiddenTickers] = useState<Set<string>>(new Set())
   const [hiddenSources, setHiddenSources] = useState<Set<string>>(new Set())
   const [hideOrphans, setHideOrphans] = useState(false)
@@ -147,6 +164,10 @@ export function KnowledgePanel({
   }, [kg.nodes, kg.edges, hiddenTypes, hiddenTickers, hiddenSources, hideOrphans, edgeCountByNodeId, expandedRunIds])
 
   const highlightSet = useMemo(() => new Set(kg.highlightPath), [kg.highlightPath])
+  const highlightEdgeSet = useMemo(
+    () => new Set(kg.highlightEdges.map(e => `${e.src_id}->${e.tgt_id}`)),
+    [kg.highlightEdges],
+  )
 
   // ── Filter toggles ─────────────────────────────────────────────────────────
   const toggleType = useCallback((t: string) => {
@@ -159,7 +180,8 @@ export function KnowledgePanel({
     setHiddenSources(prev => { const n = new Set(prev); n.has(s) ? n.delete(s) : n.add(s); return n })
   }, [])
   const resetFilters = useCallback(() => {
-    setHiddenTypes(new Set()); setHiddenTickers(new Set()); setHiddenSources(new Set())
+    setHiddenTypes(new Set(['driver', 'news_item', 'filing', 'run_scenario', 'deck_slide']))
+    setHiddenTickers(new Set()); setHiddenSources(new Set())
     setHideOrphans(false); setShowAllRuns(false)
   }, [])
 
@@ -341,6 +363,7 @@ export function KnowledgePanel({
               nodes={visibleNodes}
               edges={visibleEdges}
               highlightSet={highlightSet}
+              highlightEdgeSet={highlightEdgeSet}
               onNodeClick={handleNodeClick}
               companySummary={companySummary}
             />

@@ -104,26 +104,44 @@ export function KgQueryPanel({ onClose, onQuery, onClearHighlight, highlightCoun
               </pre>
             </div>
 
-            {result.traversal_path.length > 0 && (
+            {(result.traversal_edges?.length ?? 0) > 0 && (
               <div>
                 <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-1">
-                  Traversal path ({result.traversal_path.length} nodes)
+                  Traversal route ({result.traversal_edges.length} hops)
                 </div>
                 <div className="space-y-1">
-                  {result.traversal_path.slice(0, 30).map(nid => (
-                    <div key={nid} className="text-[10px] font-mono text-zinc-500 truncate">
-                      {nid}
-                    </div>
-                  ))}
-                  {result.traversal_path.length > 30 && (
+                  {result.traversal_edges.slice(0, 30).map((e, i) => {
+                    const labels = (() => {
+                      const m = new Map(result.matched_nodes.map(n => [n.id, n.field || n.node_type]))
+                      const short = (id: string) => m.get(id) ?? id.split('-').slice(-1)[0]
+                      return { src: short(e.src_id), tgt: short(e.tgt_id) }
+                    })()
+                    return (
+                      <div key={`${e.src_id}->${e.tgt_id}-${i}`} className="text-[10px] flex items-center gap-1 truncate">
+                        <span className="font-mono text-zinc-400 truncate">{labels.src}</span>
+                        <span className="text-teal-500">─{e.relation ?? 'REL'}→</span>
+                        <span className="font-mono text-zinc-400 truncate">{labels.tgt}</span>
+                      </div>
+                    )
+                  })}
+                  {result.traversal_edges.length > 30 && (
                     <div className="text-[10px] text-zinc-600">
-                      … {result.traversal_path.length - 30} more
+                      … {result.traversal_edges.length - 30} more hops
                     </div>
                   )}
                 </div>
                 <div className="mt-2 text-[10px] text-teal-400">
-                  ✓ Highlighted in graph
+                  ✓ Route animated in graph · {result.traversal_path.length} nodes highlighted
                 </div>
+              </div>
+            )}
+
+            {(result.traversal_edges?.length ?? 0) === 0 && result.traversal_path.length > 0 && (
+              <div>
+                <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-1">
+                  Matched nodes ({result.traversal_path.length})
+                </div>
+                <div className="mt-1 text-[10px] text-teal-400">✓ Highlighted in graph</div>
               </div>
             )}
           </>

@@ -10,12 +10,16 @@ GET    /runs/{thread_id}/plan            latest plan JSON for the thread
 GET    /runs/{thread_id}/report          final markdown report (if complete)
 GET    /runs/{thread_id}/dcf-report.md   DCF valuation report (markdown)
 GET    /runs/{thread_id}/dcf-report.pdf  DCF valuation report (PDF)
+GET    /runs/{thread_id}/decks/{filename} download generated deck PPTX
+GET    /runs/{thread_id}/deck-output      deck JSON snapshot for slide preview
 GET    /artifacts/{thread_id}/{filename} serve generated artifact files
 GET    /sources/fmp/{ticker}              authenticated FMP source data proxy
 GET    /jobs                             list all runs as job summaries
 POST   /workflows/dcf/runs               create & start deterministic DCF workflow
 POST   /workflows/dcf/runs/{thread_id}/assumptions-decision
                                          approve/edit optional assumption review
+POST   /runs/{thread_id}/dcf-decision      approve/edit/reject DCF assumptions review
+POST   /runs/{thread_id}/deck-decision      approve/edit/reject deck outline review
 GET    /workflows/dcf/runs/{thread_id}/result
                                          get persisted DCF workflow result JSON
 GET    /health                           liveness check
@@ -66,14 +70,24 @@ AGENT_DIR = Path(__file__).parent
 RUNS_DIR = AGENT_DIR / "runs"
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(RUNS_DIR / "server.log", encoding="utf-8"),
-    ],
+# Console: rich, level-colored, human-scannable. File: plain, grep-friendly.
+# (rich shares the agent_log console palette so structured + stdlib logs match.)
+from rich.logging import RichHandler  # noqa: E402
+
+_console_handler = RichHandler(
+    rich_tracebacks=True,
+    show_path=False,          # [name] in the message is enough; full paths are noise
+    omit_repeated_times=True,  # collapse identical HH:MM:SS prefixes
+    markup=False,
 )
+_console_handler.setFormatter(logging.Formatter("[%(name)s] %(message)s", datefmt="%H:%M:%S"))
+
+_file_handler = logging.FileHandler(RUNS_DIR / "server.log", encoding="utf-8")
+_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 mark_stale_running_jobs()
 
 
@@ -88,7 +102,7 @@ class RunState:
     __slots__ = (
         "thread_id", "loop", "event_queue", "hitl_future",
         "status", "query", "mode", "intent", "created_at", "session_id",
-        "dcf_hitl_payload",
+        "dcf_hitl_payload", "deck_hitl_payload",
     )
 
     def __init__(self, thread_id: str, loop: asyncio.AbstractEventLoop, query: str, mode: str, session_id: str = "") -> None:
@@ -103,6 +117,7 @@ class RunState:
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.session_id = session_id
         self.dcf_hitl_payload: dict | None = None
+        self.deck_hitl_payload: dict | None = None
 
 
 _run_registry: dict[str, RunState] = {}
@@ -112,6 +127,7 @@ _RUNNING_STATUSES = {
     "planning",
     "awaiting_approval",
     "awaiting_assumptions",
+    "awaiting_outline_review",
     "workflow_running",
     "executing",
     "synthesizing",
@@ -281,6 +297,92 @@ async def _handle_dcf_hitl(rs: RunState, thread_id: str, dcf_data: dict) -> dict
     return overrides
 
 
+async def _handle_deck_hitl(rs: RunState, thread_id: str) -> dict | None:
+    """Wait for deck outline approval, resume the paused deck graph, return payload."""
+    from pathlib import Path  # noqa: PLC0415
+
+    from graphs.workflows.deck import deck_workflow_app  # noqa: PLC0415
+    from lg_compat import Command  # noqa: PLC0415
+    from utils import get_run_dir, set_thread_id, set_ui_event_handler  # noqa: PLC0415
+
+    rs.hitl_future = rs.loop.create_future()
+    decision = await rs.hitl_future
+
+    set_thread_id(thread_id)
+    set_ui_event_handler(_make_event_bridge(rs))
+
+    def _invoke_deck_resume(resume_payload: dict) -> dict:
+        # run_in_executor drops contextvars — bind the chat thread before disk I/O.
+        set_thread_id(thread_id)
+        deck_config = {"configurable": {"thread_id": f"{get_run_dir().name}_deck"}}
+        return deck_workflow_app.invoke(Command(resume=resume_payload), config=deck_config)
+
+    if not decision.get("approved"):
+        feedback = decision.get("feedback") or ""
+        _send_event(
+            rs,
+            {
+                "type": "deck_outline_rejected",
+                "workflow": "deck",
+                "feedback": feedback,
+            },
+        )
+        try:
+            await rs.loop.run_in_executor(
+                None,
+                lambda: _invoke_deck_resume({"action": "reject", "feedback": feedback or None}),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Deck reject resume failed for thread=%s", thread_id, exc_info=True)
+        finally:
+            set_ui_event_handler(None)
+        return None
+
+    action = str(decision.get("action") or "approve").lower()
+    resume_payload: dict = {"action": action}
+    outline = decision.get("outline")
+    if action == "edit" and isinstance(outline, dict):
+        resume_payload["outline"] = outline
+    feedback = decision.get("feedback")
+    if feedback:
+        resume_payload["feedback"] = feedback
+
+    rs.status = "workflow_running"
+    update_job(thread_id, status=rs.status)
+    _send_event(
+        rs,
+        {
+            "type": "deck_outline_submitted",
+            "workflow": "deck",
+            "action": action,
+        },
+    )
+
+    try:
+        result = await rs.loop.run_in_executor(
+            None,
+            lambda: _invoke_deck_resume(resume_payload),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Deck resume failed for thread=%s: %s", thread_id, exc, exc_info=True)
+        rs.status = "error"
+        update_job(thread_id, status=rs.status)
+        _send_event(rs, {"type": "error", "workflow": "deck", "message": str(exc)})
+        return None
+    finally:
+        set_ui_event_handler(None)
+
+    if result.get("outline_approved") is False:
+        return None
+
+    deck_output_path = result.get("deck_output_path")
+    if deck_output_path:
+        return json.loads(Path(deck_output_path).read_text(encoding="utf-8"))
+
+    logger.warning("Deck resume finished without deck_output_path for thread=%s", thread_id)
+    return None
+
+
 def _make_event_bridge(rs: RunState):
     """Return a sync callback safe to call from any thread."""
     def bridge(event: dict) -> None:
@@ -310,6 +412,16 @@ def _make_event_bridge(rs: RunState):
             }
             rs.status = "awaiting_assumptions"
             update_job(rs.thread_id, status=rs.status)
+        elif event.get("type") == "deck_outline_review":
+            rs.deck_hitl_payload = {
+                "deck_title": event.get("deck_title", ""),
+                "hitl_mode": event.get("hitl_mode", "partial"),
+                "outline": event.get("outline", {}),
+                "blocks_preview": event.get("blocks_preview", []),
+                "slide_count": event.get("slide_count", 0),
+            }
+            rs.status = "awaiting_outline_review"
+            update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "synthesis_start":
             rs.status = "synthesizing"
             update_job(rs.thread_id, status=rs.status)
@@ -317,8 +429,8 @@ def _make_event_bridge(rs: RunState):
             rs.status = "complete"
             update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "chat_complete":
-            # Skip marking complete if DCF HITL is pending — keep SSE alive
-            if not rs.dcf_hitl_payload:
+            # Skip marking complete if workflow HITL is pending — keep SSE alive
+            if not rs.dcf_hitl_payload and not rs.deck_hitl_payload:
                 rs.status = "complete"
                 update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "execution_started":
@@ -405,6 +517,68 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
             rs.event_queue.put_nowait(None)
             return
 
+        if rs.deck_hitl_payload:
+            rs.deck_hitl_payload = None  # consumed
+            deck_result = await _handle_deck_hitl(rs, thread_id)
+            if deck_result is None:
+                rs.status = "complete"
+                update_job(thread_id, status=rs.status)
+                _send_event(rs, {"type": "run_complete", "workflow": "deck", "status": "rejected"})
+                rs.event_queue.put_nowait(None)
+                return
+
+            rs.status = "chat_responding"
+            update_job(thread_id, status=rs.status)
+            complete_payload = {
+                "deck_title": deck_result.get("brief", {}).get("title"),
+                "pptx_path": deck_result.get("pptx_path"),
+                "deck_output_path": deck_result.get("deck_output_path")
+                if "deck_output_path" in deck_result
+                else None,
+                "slide_count": len(deck_result.get("slides") or []),
+            }
+            if not complete_payload.get("deck_output_path"):
+                run_dir = _runs_dir_for(thread_id)
+                candidate = run_dir / "decks" / "deck_output.json"
+                if candidate.exists():
+                    complete_payload["deck_output_path"] = str(candidate)
+
+            complete_message = f"[DECK_COMPLETE]:{json.dumps(complete_payload, ensure_ascii=False)}"
+            set_ui_event_handler(_make_event_bridge(rs))
+            await agent_graph.ainvoke(
+                {
+                    "messages": [HumanMessage(content=complete_message)],
+                    "mode": mode,
+                    "resolved_intent": "chat",
+                    "session_id": session_id,
+                    "session_memory": session_memory,
+                },
+                config=config,
+            )
+            rel_pptx = None
+            pptx_abs = complete_payload.get("pptx_path")
+            if pptx_abs:
+                from utils import relative_run_path  # noqa: PLC0415
+
+                rel_pptx = relative_run_path(pptx_abs)
+            if not rel_pptx:
+                from utils import list_deck_artifact_paths  # noqa: PLC0415
+
+                deck_paths = list_deck_artifact_paths(_runs_dir_for(thread_id))
+                rel_pptx = deck_paths[0] if deck_paths else None
+            update_job(thread_id, status="complete")
+            _send_event(
+                rs,
+                {
+                    "type": "run_complete",
+                    "workflow": "deck",
+                    "pptx_path": rel_pptx or pptx_abs,
+                    "artifact_paths": [rel_pptx] if rel_pptx else [],
+                },
+            )
+            rs.event_queue.put_nowait(None)
+            return
+
         # No interrupt → chat run or plan-less completion
         if not interrupts:
             update_job(thread_id, status="complete")
@@ -473,6 +647,124 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
         agent_log.run_done(thread_id, _run_t, "error")
     finally:
         rs.event_queue.put_nowait(None)  # sentinel — closes SSE stream
+
+
+# ---------------------------------------------------------------------------
+# Amend a previous user message (LangGraph checkpoint fork)
+# ---------------------------------------------------------------------------
+
+
+async def _find_amend_checkpoint(
+    agent_graph: Any,
+    config: dict,
+    original_content: str,
+) -> tuple[dict | None, int]:
+    """Find the checkpoint to fork from when amending a user message.
+
+    Walks the thread's state history newest → oldest. Locates the most
+    recent ``HumanMessage`` whose ``.content`` exactly matches
+    ``original_content``, then finds a snapshot whose ``messages`` length
+    is exactly the index of that message (i.e. the state right before
+    it was added). Invoking from that checkpoint with a new
+    ``HumanMessage`` recreates the conversation from that point forward.
+
+    Returns ``(target_config, target_msg_index)`` or ``(None, -1)`` when
+    no matching message is found.
+    """
+    target_index = -1
+    snapshots: list[Any] = []
+    # MemorySaver returns a sync iterator; iterate without async-for.
+    for snap in agent_graph.get_state_history(config):
+        snapshots.append(snap)
+        msgs = (snap.values or {}).get("messages") or []
+        if target_index == -1:
+            # Latest snapshot — scan its messages for the most recent match.
+            for i in range(len(msgs) - 1, -1, -1):
+                msg = msgs[i]
+                content = getattr(msg, "content", None)
+                msg_type = getattr(msg, "type", None) or msg.__class__.__name__.lower()
+                if (msg_type in {"human", "humanmessage"}
+                    or msg.__class__.__name__ == "HumanMessage") \
+                   and content == original_content:
+                    target_index = i
+                    break
+            if target_index == -1:
+                return None, -1
+        # Among the collected snapshots, find one whose state has exactly
+        # target_index messages — that is, the state *before* the target
+        # message was appended.
+        if len(msgs) == target_index:
+            return snap.config, target_index
+    return None, -1
+
+
+async def _run_amended_agent_task(
+    thread_id: str,
+    original_content: str,
+    new_content: str,
+    mode: str,
+    session_id: str = "",
+) -> None:
+    """Re-invoke the agent graph at a forked checkpoint with an amended user message."""
+    from file import app as agent_graph  # noqa: PLC0415
+    from langchain_core.messages import HumanMessage  # noqa: PLC0415
+    from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
+
+    rs = _run_registry[thread_id]
+    set_thread_id(thread_id)
+    set_ui_event_handler(_make_event_bridge(rs))
+    session_memory = get_session_memory(session_id)
+    config = {"configurable": {"thread_id": thread_id}}
+    _run_t = agent_log.run_start(thread_id, new_content, mode)
+
+    try:
+        target_config, target_index = await _find_amend_checkpoint(
+            agent_graph, config, original_content,
+        )
+        if target_config is None:
+            raise RuntimeError(
+                f"Could not locate user message to amend in thread '{thread_id}'. "
+                "The original content may no longer match (server restart?)."
+            )
+
+        # Tell frontend to drop messages from the rewind point and reset UI.
+        _send_event(rs, {
+            "type": "chat_amended",
+            "message_index": target_index,
+            "new_content": new_content,
+        })
+
+        result = await agent_graph.ainvoke(
+            {
+                "messages": [HumanMessage(content=new_content)],
+                "mode": mode,
+                "resolved_intent": None,
+                "session_id": session_id,
+                "session_memory": session_memory,
+            },
+            config=target_config,
+        )
+
+        # Mirror the simple completion path from _run_agent_task. The amended
+        # turn is conversational by design — research/DCF HITL flows are not
+        # supported here yet (would require replaying the full interrupt loop).
+        interrupts = result.get("__interrupt__", ())
+        if interrupts:
+            logger.warning("Amend produced an unsupported interrupt; ignoring.")
+
+        update_job(thread_id, status="complete")
+        _send_event(rs, {"type": "run_complete"})
+        agent_log.run_done(thread_id, _run_t, "done")
+
+    except Exception as exc:  # noqa: BLE001
+        tb = traceback.format_exc()
+        logger.error("Amend task failed:\n%s", tb)
+        rs.status = "error"
+        update_job(thread_id, status=rs.status, error=f"{type(exc).__name__}: {exc}")
+        _send_event(rs, {"type": "error", "message": f"{type(exc).__name__}: {exc}\n\n{tb}"})
+        agent_log.run_done(thread_id, _run_t, "error")
+    finally:
+        rs.event_queue.put_nowait(None)
         if rs.status not in _RUNNING_STATUSES:
             _run_registry.pop(thread_id, None)
         set_ui_event_handler(None)
@@ -664,6 +956,21 @@ class DecisionRequest(BaseModel):
     approved: bool
 
 
+class AmendRequest(BaseModel):
+    """Amend a previously-sent user message in a chat thread.
+
+    The backend locates the most recent ``HumanMessage`` matching
+    ``original_content`` in the LangGraph thread state, rewinds the
+    checkpoint to just before that message, and re-invokes the graph
+    with ``new_content``. Old messages after the rewind point are
+    discarded by the frontend.
+    """
+    original_content: str
+    new_content: str
+    mode: str = "auto"
+    session_id: str | None = None
+
+
 class DCFRunRequest(BaseModel):
     ticker: str
     horizon_years: int = 5
@@ -792,6 +1099,46 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
         session_id=session_id,
     )
     asyncio.create_task(_run_agent_task(thread_id, body.query, body.mode, session_id))
+    return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
+
+
+@app.post("/runs/{thread_id}/amend", response_model=RunCreatedResponse)
+async def amend_message(thread_id: str, body: AmendRequest) -> RunCreatedResponse:
+    """Amend a previously-sent user message, re-running the chat from that point.
+
+    Refuses to run when the thread is currently active. Returns the same
+    ``thread_id`` and a fresh ``start_event_id`` so the frontend can re-open
+    its SSE stream from that point.
+    """
+    existing = _run_registry.get(thread_id)
+    if existing and existing.status in _RUNNING_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thread '{thread_id}' is currently running (status={existing.status}).",
+        )
+
+    if not body.original_content or not body.new_content:
+        raise HTTPException(status_code=400, detail="original_content and new_content are required")
+
+    session_id = body.session_id or (existing.session_id if existing else "")
+    start_event_id = _latest_event_id_for(thread_id)
+
+    loop = asyncio.get_running_loop()
+    rs = RunState(thread_id, loop, body.new_content, body.mode, session_id)
+    _run_registry[thread_id] = rs
+    upsert_job(
+        thread_id=thread_id,
+        query=body.new_content,
+        mode=body.mode,
+        status=rs.status,
+        session_id=session_id,
+    )
+    asyncio.create_task(
+        _run_amended_agent_task(
+            thread_id, body.original_content, body.new_content,
+            body.mode, session_id,
+        )
+    )
     return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
 
 
@@ -999,6 +1346,13 @@ class DcfDecisionRequest(BaseModel):
     assumptions_overrides: dict[str, float] | None = None
 
 
+class DeckDecisionRequest(BaseModel):
+    approved: bool = True
+    action: str = "approve"
+    outline: dict | None = None
+    feedback: str | None = None
+
+
 class DcfContinueRequest(BaseModel):
     action: str = "approve"
     assumptions: dict[str, float] | None = None
@@ -1022,6 +1376,31 @@ async def submit_dcf_decision(
             {
                 "approved": body.approved,
                 "assumptions_overrides": body.assumptions_overrides or {},
+            }
+        )
+    return {"ok": True}
+
+
+@app.post("/runs/{thread_id}/deck-decision")
+async def submit_deck_decision(
+    thread_id: str,
+    body: DeckDecisionRequest,
+) -> dict:
+    """Submit user decision on deck outline review (approve/edit/reject)."""
+    rs = _run_registry.get(thread_id)
+    if rs is None or rs.status != "awaiting_outline_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thread '{thread_id}' is not awaiting deck outline review.",
+        )
+
+    if rs.hitl_future and not rs.hitl_future.done():
+        rs.hitl_future.set_result(
+            {
+                "approved": body.approved,
+                "action": "reject" if not body.approved else body.action,
+                "outline": body.outline,
+                "feedback": body.feedback,
             }
         )
     return {"ok": True}
@@ -1148,6 +1527,55 @@ def get_dcf_result(thread_id: str) -> dict:
         return json.loads(result_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=500, detail=f"Corrupt DCF result payload: {exc}") from exc
+
+
+@app.get("/runs/{thread_id}/decks/{filename}")
+def get_deck_pptx(thread_id: str, filename: str) -> FileResponse:
+    """Download a generated deck PPTX from ``runs/<thread>/decks/``."""
+    from utils import resolve_deck_pptx_path  # noqa: PLC0415
+
+    safe_name = Path(filename).name
+    if safe_name != filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid deck filename.")
+    deck_path = resolve_deck_pptx_path(thread_id, safe_name)
+    if deck_path is None or not deck_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Deck '{safe_name}' not found for thread '{thread_id}'",
+        )
+    return FileResponse(
+        deck_path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=safe_name,
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
+@app.get("/runs/{thread_id}/deck-output")
+def get_deck_output(thread_id: str) -> dict:
+    """Return ``deck_output.json`` for in-app slide preview."""
+    from utils import resolve_deck_output_path  # noqa: PLC0415
+
+    output_path = resolve_deck_output_path(thread_id)
+    if output_path is None or not output_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No deck output found for thread '{thread_id}'",
+        )
+    try:
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read deck output: {exc}") from exc
+    pptx_path = payload.get("pptx_path")
+    rel_pptx = None
+    if pptx_path:
+        try:
+            rel_pptx = str(Path(str(pptx_path)).resolve().relative_to(_runs_dir_for(thread_id).resolve()))
+        except ValueError:
+            rel_pptx = f"decks/{Path(str(pptx_path)).name}"
+    payload["pptx_relpath"] = rel_pptx
+    payload["pptx_filename"] = Path(str(pptx_path)).name if pptx_path else None
+    return payload
 
 
 @app.get("/artifacts/{thread_id}/{filename}")
@@ -1344,20 +1772,31 @@ class KGQueryRequest(BaseModel):
 
 @app.get("/kg/{session_id}")
 async def kg_full(session_id: str) -> dict[str, Any]:
-    """Return all KG nodes + edges for a session."""
+    """Return all KG nodes + edges (cross-session, full ticker corpus).
+
+    The session_id param is kept for URL compatibility but is NOT used as a
+    filter. The KG is a global knowledge base about tickers — a DCF rerun that
+    targets a new session must not make the old session's nodes disappear from
+    the graph panel. Callers (KnowledgePanel) already filter client-side by
+    ticker / node_type / source.
+    """
     from storage import list_kg_nodes, list_kg_edges  # noqa: PLC0415
-    nodes = list_kg_nodes(session_id=session_id)
-    edges = list_kg_edges(session_id=session_id)
+    nodes = list_kg_nodes()   # all sessions, all tickers
+    edges = list_kg_edges()   # all sessions
     return {"nodes": nodes, "edges": edges}
 
 
 @app.get("/kg/{session_id}/subgraph/{ticker}")
 async def kg_subgraph(session_id: str, ticker: str) -> dict[str, Any]:
-    """Ticker-scoped subgraph for a session."""
+    """Cross-session ticker subgraph.
+
+    Ignores session_id for the same reason as kg_full — DCF reruns in new
+    sessions must not hide prior run artifacts when the panel refreshes.
+    """
     from storage import list_kg_nodes, list_kg_edges  # noqa: PLC0415
-    nodes = list_kg_nodes(session_id=session_id, ticker=ticker.upper())
+    nodes = list_kg_nodes(ticker=ticker.upper())   # all sessions for ticker
     node_ids = {n["id"] for n in nodes}
-    all_edges = list_kg_edges(session_id=session_id)
+    all_edges = list_kg_edges()                    # all sessions
     edges = [e for e in all_edges if e["src_id"] in node_ids or e["tgt_id"] in node_ids]
     return {"nodes": nodes, "edges": edges}
 

@@ -7,6 +7,8 @@ payloads live on disk and are retrieved on demand via retrieve_tool_result.
 
 from __future__ import annotations
 
+from typing import Any
+
 import json
 import os
 import subprocess
@@ -26,6 +28,7 @@ from utils import (
     persist_tool_result,
     emit_ui_event,
     set_dcf_hitl_payload,
+    set_deck_hitl_payload,
 )
 from web_search import search_exa
 
@@ -297,6 +300,110 @@ def run_dcf_workflow(
 
 
 @tool
+def run_deck_workflow(
+    brief: dict | str | Any,
+    sources: Any = None,
+    session_id: str = "",
+) -> str:
+    """Generate a slide deck (PPTX) from typed input sources.
+
+    **Prefer passing only ``brief``** after a completed DCF in this thread —
+    ``sources`` are auto-loaded from ``dcf_output.json`` on disk (plus sensitivity
+    chart when present).  Do NOT pass placeholder strings or partial DCF summaries
+    in ``sources``.
+
+    ``brief`` — deck intent (required):
+      - ``title`` (required): deck title used for filename
+      - ``audience``: ``board`` | ``ic`` | ``internal`` | ``client`` | ``generic``
+      - ``hitl_mode``: ``disabled`` | ``partial`` (default) | ``full``
+      - ``slide_count_target``: optional int 1–40
+      - ``must_cover``: optional list of topic strings
+
+    ``sources`` — optional list of typed source objects (usually omit after DCF):
+      - ``{"type": "dcf_output", "payload_path": "..."}`` — completed DCF run
+      - ``{"type": "manual_text", "title": "...", "body": "..."}`` — analyst notes
+      - ``{"type": "document", "doc_ids": [...], "query_hints": [...]}`` — uploaded docs
+      - ``{"type": "chart_artifact", "path": "...", "caption": "..."}`` — chart image
+
+    When ``hitl_mode`` is ``"partial"`` (default), pauses after outline generation for
+    sidebar review. The server resumes slide generation after the user approves — do
+    NOT call this tool a second time for approval.
+    """
+    from graphs.workflows.deck.inputs import resolve_deck_workflow_inputs  # noqa: PLC0415
+    from graphs.workflows.deck import run_deck_workflow_sync  # noqa: PLC0415
+
+    try:
+        sources, brief = resolve_deck_workflow_inputs(sources, brief)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc), "tool_name": "run_deck_workflow"})
+
+    effective_session = session_id or _session_ctx.get() or ""
+    result = run_deck_workflow_sync(
+        sources=sources,
+        brief=brief,
+        session_id=effective_session,
+        parent_step_id="workflow_deck",
+    )
+
+    if result.get("__deck_hitl__"):
+        outline = result.get("outline", {})
+        slides = outline.get("slides", [])
+        blocks_preview = result.get("blocks_preview", [])
+        hitl_mode = result.get("hitl_mode")
+
+        # Persist for cross-thread retrieval (mirrors set_dcf_hitl_payload pattern).
+        review_snapshot = {
+            "workflow": "deck",
+            "hitl_mode": hitl_mode,
+            "deck_title": brief.get("title"),
+            "outline": outline,
+            "blocks_preview": blocks_preview,
+            "slide_count": len(slides),
+        }
+        set_deck_hitl_payload(review_snapshot)
+
+        # Frontend event so the execution sidebar can render the outline review UI.
+        emit_ui_event({
+            "type": "deck_outline_review",
+            **review_snapshot,
+        })
+
+        lines = [
+            "⛔ STOP — DO NOT CALL MORE TOOLS. Present the draft outline for user review.",
+            "",
+            f"## Draft Deck Outline ({len(slides)} slides)",
+            "",
+        ]
+        for i, s in enumerate(slides, 1):
+            lines.append(f"{i}. **{s.get('title', '?')}** `{s.get('layout', '?')}`")
+        lines += [
+            "",
+            "Ask user to approve, edit, or reject the outline.",
+            "Resume with `action: approve` (or include edited `outline`) to generate slides.",
+        ]
+        return "\n".join(lines)
+
+    if result.get("__deck_rejected__"):
+        feedback = result.get("feedback") or "(no feedback provided)"
+        return (
+            "Deck outline was rejected. No slides were generated.\n\n"
+            f"User feedback: {feedback}\n\n"
+            "Acknowledge the rejection to the user and ask whether they want to "
+            "revise the brief or sources and try again."
+        )
+
+    pointer = json.loads(
+        persist_tool_result(
+            "run_deck_workflow",
+            {"sources_count": len(sources), "brief_title": brief.get("title")},
+            json.dumps(result, ensure_ascii=False),
+            f"Deck '{brief.get('title', '?')}': {len(result.get('slides', []))} slides → {result.get('pptx_path', 'n/a')}",
+        )
+    )
+    return json.dumps(pointer, ensure_ascii=False)
+
+
+@tool
 def fetch_sec_filing(ticker: str, filing_type: str = "10-K") -> str:
     """Fetch recent SEC EDGAR filings (10-K or 10-Q) for a company.
 
@@ -348,6 +455,7 @@ ALL_TOOLS = [
     retrieve_tool_result,
     execute_python,
     run_dcf_workflow,
+    run_deck_workflow,
     search_documents,
     fetch_sec_filing,
 ]
@@ -361,6 +469,7 @@ CHAT_CANONICAL = [
     retrieve_tool_result,
     execute_python,
     run_dcf_workflow,
+    run_deck_workflow,
     search_documents,
     fetch_sec_filing,
 ]

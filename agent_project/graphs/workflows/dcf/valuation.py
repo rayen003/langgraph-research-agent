@@ -453,10 +453,26 @@ def _render_sensitivity_heatmap(table: list[dict[str, float]], ticker: str) -> s
                     ax.text(wi, ti, f"${val:.0f}", ha="center", va="center", fontsize=8)
         fig.colorbar(im, ax=ax, label="Implied price ($)")
         fig.tight_layout()
-        out_path = get_artifacts_dir() / f"sensitivity_{ticker.lower()}.png"
+        # Include parent_step_id (run_id) in filename so multiple DCF runs
+        # in the same session/run-dir don't clobber each other's charts.
+        # Falls back to generic name when run_id is the default string.
+        run_dir = get_run_dir()
+        run_suffix = run_dir.name if run_dir else "run"
+        out_path = get_artifacts_dir() / f"sensitivity_{ticker.lower()}_{run_suffix[:16]}.png"
         fig.savefig(out_path, dpi=120, bbox_inches="tight")
         plt.close(fig)
-        return str(out_path.relative_to(get_run_dir()))
+        # `relative_to` would raise ValueError if get_run_dir() doesn't share
+        # a common prefix with out_path (happens when executor workers don't
+        # inherit the run_id ContextVar). Fall back to absolute path so the
+        # chart never silently drops out of dcf_output.json["sensitivity_chart"].
+        try:
+            return str(out_path.relative_to(get_run_dir()))
+        except ValueError:
+            logger.warning(
+                "Sensitivity chart written outside run dir; using absolute path: %s",
+                out_path,
+            )
+            return str(out_path)
     except Exception:
         logger.exception("Failed to render sensitivity heatmap ticker=%s", ticker)
         return None
@@ -524,6 +540,37 @@ def sensitivity_node(state: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Finalize — persist output
 # ---------------------------------------------------------------------------
+
+
+def _resolve_chart_path(raw: str | None, run_dir: Path) -> str | None:
+    """Normalize sensitivity_chart to a usable absolute path or None.
+
+    sensitivity_node returns either a relative path (`artifacts/foo.png`)
+    when get_run_dir() shares a prefix, or an absolute path otherwise.
+    Downstream consumers (deck adapter, report exporter) want a path that
+    .exists() returns True against without knowing the run dir. Also
+    falls back to disk discovery so a chart written via an out-of-context
+    executor still surfaces in dcf_output.json.
+    """
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = run_dir / raw
+        if p.exists():
+            return str(p)
+    # Disk discovery fallback — chart may exist even if state lost the path.
+    # Use most-recently-modified file so a new run's chart isn't shadowed by
+    # an older one with an earlier alphabetical name in the same directory.
+    artifacts_dir = run_dir / "artifacts"
+    if artifacts_dir.exists():
+        candidates = sorted(
+            artifacts_dir.glob("sensitivity_*.png"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return str(candidates[0])
+    return None
 
 
 def finalize_node(state: dict) -> dict:
@@ -665,7 +712,7 @@ def finalize_node(state: dict) -> dict:
         "market_snapshot": state["market_snapshot"],
         "valuation": state["valuation"],
         "sensitivity_table": state["sensitivity_table"],
-        "sensitivity_chart": state.get("sensitivity_chart"),
+        "sensitivity_chart": _resolve_chart_path(state.get("sensitivity_chart"), run_dir),
         "features": state.get("features") or {},
         "wacc_components": state.get("wacc_components") or {},
         # ── Reasoning artifacts (new in target architecture) ──
@@ -1321,9 +1368,37 @@ def compute_market_signals_node(state: dict) -> dict:
         except Exception:
             logger.warning("Implied margin computation failed for %s", ticker, exc_info=True)
 
+    # Consolidated signals — persist everything downstream consumers need in one place.
+    _implied_wacc_val = wacc_sanity.get("implied_wacc") if wacc_sanity.get("solver_status") == "ok" else None
+    _model_wacc_val = float(assumptions.get("wacc", 0))
+    _wacc_gap_bps = (
+        round((_model_wacc_val - float(_implied_wacc_val)) * 10000)
+        if _implied_wacc_val is not None else None
+    )
+    _model_growth = float(assumptions.get("revenue_growth", 0))
+    _growth_gap_pp = (
+        round((float(implied_growth) - _model_growth) * 100, 2)
+        if implied_growth is not None else None
+    )
+    _plausibility = (wacc_sanity.get("implied_plausibility") or {}).get("label")
+    _plausibility_narrative = (wacc_sanity.get("implied_plausibility") or {}).get("narrative")
     market_signals_meta = {
+        # Flags
         "wacc_binding": wacc_binding,
         "growth_margin_suppressed": wacc_binding,
+        # Consolidated WACC signals
+        "model_wacc": _model_wacc_val,
+        "implied_wacc": _implied_wacc_val,
+        "wacc_gap_bps": _wacc_gap_bps,
+        # Consolidated growth signals
+        "modeled_growth": _model_growth,
+        "implied_growth": implied_growth,
+        "growth_gap_pp": _growth_gap_pp,
+        # Plausibility classification
+        "plausibility_label": _plausibility,
+        "plausibility_narrative": _plausibility_narrative,
+        # Solver provenance
+        "solver_status": wacc_sanity.get("solver_status"),
     }
     if wacc_binding:
         wacc_sanity = dict(wacc_sanity)

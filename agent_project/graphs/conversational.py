@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import re
+from pathlib import Path
 
 import dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -15,10 +17,11 @@ from tools import (
     fetch_sec_filing,
     retrieve_tool_result,
     run_dcf_workflow,
+    run_deck_workflow,
     search_web,
 )
 import agent_log
-from utils import console, emit_ui_event, get_run_dir, list_artifact_paths, set_dcf_hitl_payload, track_tool
+from utils import console, emit_ui_event, get_run_dir, list_artifact_paths, list_deck_artifact_paths, relative_run_path, set_dcf_hitl_payload, track_tool
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,7 @@ CHAT_TOOLS = [
     fetch_sec_filing,
     retrieve_tool_result,
     run_dcf_workflow,
+    run_deck_workflow,
 ]
 CHAT_TOOLS_BY_NAME = {t.name: t for t in CHAT_TOOLS}
 chat_agent_llm = llm.bind_tools(CHAT_TOOLS)
@@ -66,7 +70,12 @@ _CHAT_SYSTEM = (
     "After the user reviews and approves (or edits) the assumptions, call again with assumption_review_mode=False "
     "and any assumption_overrides the user specified. "
     "The tool returns a full markdown report — present it **verbatim** to the user (do NOT rewrite as a summary). "
-    "Use only [n] citations from the report's ## References section; never cite 'tool results'.\n\n"
+    "Use only [n] citations from the report's ## References section; never cite 'tool results'.\n"
+    "- run_deck_workflow: generate a real PowerPoint deck (PPTX). "
+    "After a completed DCF, call with **only** ``brief`` (title, audience, must_cover) — "
+    "sources are auto-loaded from dcf_output.json; do NOT pass payload_inline or placeholder strings. "
+    "Never invent slide outlines in chat when this tool is available. "
+    "Set ``hitl_mode`` to ``partial`` (default) for sidebar outline review.\n\n"
     "## Behaviour\n"
     "- Use tools when the question requires current data or computation — don't guess.\n"
     "- For pure conceptual questions (e.g. 'what is DCF?'), answer directly without tools.\n"
@@ -79,6 +88,14 @@ _CHAT_SYSTEM = (
     "assumption_review_mode=False, and assumption_overrides set to the 'all_assumptions' dict from the JSON "
     "(pass ALL fields — this enables the fast valuation path that skips re-running evidence collection). "
     "Do NOT output any text before calling the tool. Do NOT ask for confirmation. Do NOT modify the assumptions.\n"
+    "- For deck/presentation requests (slides, PPTX, pitch deck, IC deck, 'build a deck from this DCF'): "
+    "**always call run_deck_workflow** — never write a fake slide-by-slide outline in chat. "
+    "If a completed DCF exists in this thread, pass it as a `dcf_output` source (see tool doc). "
+    "If no structured sources exist yet, run DCF first or ask which materials to include.\n"
+    "- When user message starts with [DECK_COMPLETE], parse the JSON after the colon. "
+    "Tell the user the deck is ready with slide count and deck title. "
+    "Do NOT include filesystem paths or markdown download links — the UI renders "
+    "Preview and Download controls automatically.\n"
     "- Keep answers focused and well-structured. Use markdown when helpful.\n"
     "- For news/current-events questions, produce an analyst brief: one-sentence bottom line, then 3-5 bullets covering what happened, why it matters, dates/numbers, and source names.\n"
     "- Do NOT answer by listing links or saying 'here are sources'. Links are citations, not the answer.\n"
@@ -90,9 +107,112 @@ _CHAT_SYSTEM = (
     "- If you reference prior conversation context, be explicit about what you're building on."
 )
 
+_DECK_REQUEST_RE = re.compile(
+    r"\b("
+    r"deck|slides?|presentation|powerpoint|pptx|pitch deck|"
+    r"ic deck|slide deck|build a deck|make a deck|turn.*into.*deck"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Deck routing helpers
+# ---------------------------------------------------------------------------
+
+
+def _user_wants_deck(messages: list) -> bool:
+    """True when the latest user message requests a slide deck."""
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return bool(_DECK_REQUEST_RE.search(str(message.content or "")))
+    return False
+
+
+def _extract_dcf_payload_from_history(history: list) -> dict | None:
+    """Return the most recent completed DCF JSON payload from chat history or disk."""
+    from graphs.workflows.dcf.payload import (  # noqa: PLC0415
+        extract_dcf_payload_from_tool_pointer,
+        _load_persisted_dcf_payload,
+    )
+
+    for message in reversed(history):
+        if isinstance(message, ToolMessage):
+            payload = extract_dcf_payload_from_tool_pointer(str(message.content))
+            if payload:
+                return payload
+    return _load_persisted_dcf_payload()
+
+
+def _build_deck_workflow_nudge(history: list) -> str | None:
+    """Inject exact run_deck_workflow args when user wants a deck and DCF exists."""
+    if not _user_wants_deck(history):
+        return None
+
+    payload = _extract_dcf_payload_from_history(history)
+    if not payload:
+        return (
+            "\n\n## Deck build request\n"
+            "The user wants a slide deck. Call `run_deck_workflow` with appropriate "
+            "`sources` and `brief`. If no completed DCF or uploaded documents exist in "
+            "this thread, run DCF first or ask which sources to use. "
+            "Do NOT invent slide outlines in chat."
+        )
+
+    ticker = str(payload.get("ticker") or "?").upper()
+    brief = {
+        "title": f"{ticker} — DCF Investment Case",
+        "audience": "ic",
+        "hitl_mode": "partial",
+        "slide_count_target": 10,
+        "must_cover": [
+            "executive summary",
+            "thesis",
+            "scenarios",
+            "assumptions",
+            "valuation",
+            "sensitivity",
+            "risks",
+        ],
+    }
+    return (
+        "\n\n## Deck build request — call run_deck_workflow now\n"
+        "A completed DCF exists in this thread. Call `run_deck_workflow` with ONLY:\n"
+        f"brief={json.dumps(brief, ensure_ascii=False)}\n"
+        "Do NOT pass `sources` (auto-loaded from dcf_output.json). "
+        "Do NOT pass payload_inline or placeholder strings. "
+        "Do NOT write slide outlines in chat."
+    )
+
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
+
+
+def _extract_deck_artifact_paths(history: list) -> list[str]:
+    """Return run-relative deck PPTX path(s) from tool results or disk."""
+    for message in reversed(history):
+        if not isinstance(message, ToolMessage):
+            continue
+        content = str(message.content)
+        try:
+            pointer = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(pointer, dict) or pointer.get("tool_name") != "run_deck_workflow":
+            continue
+        tool_result_id = pointer.get("tool_result_id")
+        if tool_result_id:
+            file_path = get_run_dir() / "tool_results" / f"{tool_result_id}.json"
+            if file_path.exists():
+                try:
+                    stored = json.loads(file_path.read_text(encoding="utf-8"))
+                    payload = json.loads(stored.get("result") or "{}")
+                    rel = relative_run_path(payload.get("pptx_path"))
+                    if rel:
+                        return [rel]
+                except (json.JSONDecodeError, OSError, TypeError):
+                    pass
+    return list_deck_artifact_paths()
 
 
 def _restore_hitl_from_approval(messages: list) -> None:
@@ -230,15 +350,113 @@ def chat_node(state: dict) -> dict:
         raise
 
 
+def _direct_dcf_approval(messages: list) -> dict | None:
+    """Deterministically run a [DCF_APPROVED] valuation, bypassing the ReAct loop.
+
+    The chat LLM was unreliable on this path — it would re-call run_dcf_workflow
+    with assumption_review_mode=True (re-triggering the HITL "confirm assumptions"
+    card) and fire several redundant/erroring calls, and the final report often
+    never rendered. For an *approved* run the action is fully determined: run the
+    valuation once with the supplied overrides and present the report verbatim.
+
+    Returns the node result dict, or None when the latest human turn is not a
+    DCF approval (so the normal ReAct loop runs instead).
+    """
+    last_human = next(
+        (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
+    )
+    if last_human is None:
+        return None
+    content = str(last_human.content or "")
+    if not content.startswith("[DCF_APPROVED]:"):
+        return None
+    try:
+        payload = json.loads(content.split(":", 1)[1])
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return None
+
+    ticker = str(payload.get("ticker") or "").upper()
+    horizon_years = int(payload.get("horizon_years") or 5)
+    overrides = (
+        payload.get("all_assumptions")
+        or payload.get("assumption_overrides")
+        or {}
+    )
+    if not ticker or not isinstance(overrides, dict) or not overrides:
+        return None
+
+    args = {
+        "ticker": ticker,
+        "horizon_years": horizon_years,
+        "assumption_review_mode": False,
+        "assumption_overrides": {k: v for k, v in overrides.items()},
+    }
+
+    chat_t = agent_log.chat_start()
+    emit_ui_event({"type": "chat_start"})
+
+    tool_fn = CHAT_TOOLS_BY_NAME.get("run_dcf_workflow")
+    history: list = []
+    try:
+        with track_tool(
+            name="run_dcf_workflow",
+            scope="chat",
+            step_id="chat",
+            args_preview=json.dumps(args, ensure_ascii=False)[:120],
+        ) as span:
+            if not tool_fn:
+                raise RuntimeError("run_dcf_workflow tool not registered")
+            result = tool_fn.invoke(args)
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict):
+                    span["summary"] = parsed.get("summary", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Direct DCF approval run failed: %s", exc, exc_info=True)
+        msg = f"DCF rerun failed: {exc}"
+        emit_ui_event({"type": "chat_complete", "content": msg})
+        return {"messages": [AIMessage(content=msg)]}
+
+    history.append(ToolMessage(content=str(result), tool_call_id="dcf_approved_direct"))
+
+    final_text = _extract_dcf_report(history) or ""
+    if not final_text.strip():
+        final_text = "DCF rerun completed but produced no report."
+
+    agent_log.chat_done(final_text, chat_t)
+    complete_event: dict = {"type": "chat_complete", "content": final_text}
+    artifact_paths = list_artifact_paths()
+    if artifact_paths:
+        complete_event["artifact_paths"] = artifact_paths
+    source_metadata = _extract_dcf_source_metadata(history)
+    if source_metadata:
+        complete_event.update(source_metadata)
+    emit_ui_event(complete_event)
+
+    return {"messages": [AIMessage(content=final_text)]}
+
+
 def _chat_node_inner(state: dict) -> dict:
     messages = state.get("messages", [])
     session_memory = state.get("session_memory") or ""
     _session_ctx.set(state.get("session_id") or "")
     _restore_hitl_from_approval(messages)
 
+    # Approved DCF runs are deterministic — run them directly instead of letting
+    # the ReAct loop improvise (it would re-trigger the assumption-review HITL
+    # and fire redundant workflow calls). Returns None for non-approval turns.
+    direct = _direct_dcf_approval(messages)
+    if direct is not None:
+        return direct
+
     system_content = _CHAT_SYSTEM
     if session_memory:
         system_content += f"\n\n## Prior research in this session\n{session_memory}"
+    deck_nudge = _build_deck_workflow_nudge(messages)
+    if deck_nudge:
+        system_content += deck_nudge
 
     history = [SystemMessage(content=system_content)] + messages[-20:]
 
@@ -272,6 +490,26 @@ def _chat_node_inner(state: dict) -> dict:
             used_tools = True
             tool_fn = CHAT_TOOLS_BY_NAME.get(tc["name"])
             args = _normalize_args(tc.get("args", {}))
+
+            if tc["name"] == "run_deck_workflow":
+                from graphs.workflows.deck.inputs import resolve_deck_workflow_inputs  # noqa: PLC0415
+
+                dcf_payload = _extract_dcf_payload_from_history(history)
+                try:
+                    resolved_sources, resolved_brief = resolve_deck_workflow_inputs(
+                        args.get("sources"),
+                        args.get("brief"),
+                        dcf_payload=dcf_payload,
+                    )
+                    args = {
+                        **args,
+                        "sources": resolved_sources,
+                        "brief": resolved_brief,
+                    }
+                except ValueError as exc:
+                    result = json.dumps({"error": str(exc), "tool_name": tc["name"]})
+                    history.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                    continue
 
             args_preview = json.dumps(args, ensure_ascii=False)[:120]
             # Run the tool inside a track_tool span — the only event emitter
@@ -307,9 +545,13 @@ def _chat_node_inner(state: dict) -> dict:
             if _extract_dcf_report(history):
                 break
 
-            # If the tool returned a HITL result (DCF assumptions for review),
-            # break the ReAct loop immediately — the LLM must present to user.
-            if "⛔ STOP" in str(result) or "DCF Assumptions for" in str(result):
+            # HITL: deck outline or DCF assumptions — stop the ReAct loop.
+            result_str = str(result)
+            if "Draft Deck Outline" in result_str:
+                break
+            if "DCF Assumptions for" in result_str or (
+                "⛔ STOP" in result_str and "assumption" in result_str.lower()
+            ):
                 break
         else:
             continue
@@ -324,11 +566,31 @@ def _chat_node_inner(state: dict) -> dict:
     for _m in reversed(history):
         if isinstance(_m, ToolMessage):
             content = str(_m.content)
-            if "DCF Assumptions for" in content or "⛔ STOP" in content:
+            if "Draft Deck Outline" in content:
+                break
+            if "DCF Assumptions for" in content or (
+                "⛔ STOP" in content and "assumption" in content.lower()
+            ):
                 import re as _re
                 _match = _re.search(r"DCF Assumptions for (\w+)", content)
                 _hitl_ticker = _match.group(1) if _match else "?"
                 break
+
+    _deck_outline_hitl = False
+    _deck_outline_text = ""
+    for _m in reversed(history):
+        if isinstance(_m, ToolMessage):
+            content = str(_m.content)
+            if "Draft Deck Outline" in content:
+                _deck_outline_hitl = True
+                _deck_outline_text = content
+                break
+
+    if _deck_outline_hitl:
+        # Server keeps SSE open for deck outline review (deck_hitl_payload).
+        preview = _deck_outline_text.split("## Draft Deck Outline", 1)
+        body = "## Draft Deck Outline" + preview[1] if len(preview) > 1 else _deck_outline_text
+        return {"messages": [AIMessage(content=body.strip())]}
 
     if _hitl_ticker:
         # Do NOT emit chat_complete here — bridge already set status=awaiting_assumptions
@@ -336,6 +598,7 @@ def _chat_node_inner(state: dict) -> dict:
         # so the user's /dcf-decision response can stream valuation events back.
         agent_log.chat_hitl(_hitl_ticker)
         return {"messages": [AIMessage(content="DCF assumptions ready for review.")]}
+
     dcf_report = _extract_dcf_report(history)
     if dcf_report:
         final_text = dcf_report
@@ -359,6 +622,9 @@ def _chat_node_inner(state: dict) -> dict:
 
     agent_log.chat_done(final_text, _chat_t)
     complete_event: dict = {"type": "chat_complete", "content": final_text}
+    deck_artifacts = _extract_deck_artifact_paths(history)
+    if deck_artifacts:
+        complete_event["artifact_paths"] = deck_artifacts
     if dcf_report or final_text.startswith("# DCF Valuation:"):
         artifact_paths = list_artifact_paths()
         if artifact_paths:

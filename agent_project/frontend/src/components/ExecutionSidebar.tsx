@@ -1,7 +1,8 @@
-import type { RunStatus, StepState, DcfReviewState } from '../types'
+import type { RunStatus, StepState, DcfReviewState, DeckReviewState } from '../types'
 import type { ActivityEntry } from '../lib/activity'
 import { StepCard } from './StepCard'
 import { ActivityTrace, DcfHitlSection } from './ActivityTrace'
+import { DeckOutlineReview } from './DeckOutlineReview'
 
 interface Props {
   status: RunStatus
@@ -10,6 +11,7 @@ interface Props {
   error: string | null
   activity?: ActivityEntry[]
   dcfReview?: DcfReviewState
+  deckReview?: DeckReviewState
   onApprove: () => void
   onReject: () => void
   threadId?: string | null
@@ -22,6 +24,7 @@ export function ExecutionSidebar({
   error,
   activity,
   dcfReview,
+  deckReview,
   onApprove,
   onReject,
   threadId,
@@ -44,7 +47,8 @@ export function ExecutionSidebar({
   const progress = totalSteps > 0 ? (completedSteps / totalSteps) * 100 : 0
   const isAwaitingPlan = status === 'awaiting_approval'
   const isAwaitingAssumptions = status === 'awaiting_assumptions'
-  const isAwaiting = isAwaitingPlan || isAwaitingAssumptions
+  const isAwaitingOutlineReview = status === 'awaiting_outline_review'
+  const isAwaiting = isAwaitingPlan || isAwaitingAssumptions || isAwaitingOutlineReview
   const isSynthesizing = status === 'synthesizing'
   const isComplete = status === 'complete'
   const isError = status === 'error'
@@ -171,7 +175,10 @@ export function ExecutionSidebar({
           {isAwaitingAssumptions && dcfReview && threadId && (
             <DcfHitlSection review={dcfReview} threadId={threadId} onApprove={onApprove} onReject={onReject} />
           )}
-          {!isAwaitingAssumptions && (
+          {isAwaitingOutlineReview && deckReview && threadId && (
+            <DeckOutlineReview review={deckReview} threadId={threadId} onApprove={onApprove} onReject={onReject} />
+          )}
+          {!isAwaitingAssumptions && !isAwaitingOutlineReview && (
             <>
               <p className="text-[11px] text-zinc-600 leading-relaxed">
                 {isAwaitingPlan
@@ -213,6 +220,9 @@ function CurrentStepLabel({
   }
   if (status === 'awaiting_assumptions') {
     return <p className="text-[11px] text-amber-500">Awaiting assumption validation</p>
+  }
+  if (status === 'awaiting_outline_review') {
+    return <p className="text-[11px] text-amber-500">Awaiting deck outline review</p>
   }
   if (status === 'awaiting_approval') {
     return <p className="text-[11px] text-zinc-700">Awaiting your approval</p>

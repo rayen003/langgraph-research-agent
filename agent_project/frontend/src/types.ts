@@ -9,6 +9,7 @@ export type RunStatus =
   | 'planning'
   | 'workflow_running'
   | 'awaiting_assumptions'
+  | 'awaiting_outline_review'
   | 'awaiting_approval'
   | 'executing'
   | 'synthesizing'
@@ -68,6 +69,7 @@ export interface AgentRunState {
   dcf_review?: DcfReviewState | null
   dcf_evidence_items?: EvidenceItem[]
   dcf_citation_map?: Record<string, string>
+  deck_review?: DeckReviewState | null
 }
 
 export interface EvidenceItem {
@@ -106,6 +108,29 @@ export interface DcfReviewState {
   provenance: Record<string, { source?: string; confidence?: number; evidence_refs?: string[] }>
   memo_proposals?: Record<string, { rationale: string; confidence: number }>
   evidence_items?: EvidenceItem[]
+}
+
+export interface DeckOutlineSlide {
+  slide_id: string
+  layout: string
+  title: string
+  block_refs: string[]
+  notes?: string
+}
+
+export interface DeckBlockPreview {
+  block_id: string
+  kind: string
+  title: string
+  source_type: string
+}
+
+export interface DeckReviewState {
+  deck_title: string
+  hitl_mode: 'partial' | 'full' | 'disabled' | string
+  slide_count: number
+  outline: { slides: DeckOutlineSlide[]; rationale?: string }
+  blocks_preview: DeckBlockPreview[]
 }
 
 // ── Session / history types ───────────────────────────────────────────────

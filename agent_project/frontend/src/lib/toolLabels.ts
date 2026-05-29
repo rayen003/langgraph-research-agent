@@ -54,6 +54,11 @@ const TOOL_DISPLAY: Record<string, ToolDisplay> = {
     description: 'Deterministic discounted cash flow valuation',
     group: 'tool',
   },
+  run_deck_workflow: {
+    label: 'Building slide deck',
+    description: 'Generate a PPTX from typed source inputs',
+    group: 'tool',
+  },
   fetch_sec_filing: {
     label: 'Reading SEC filing',
     description: 'Fetching 10-K/10-Q from EDGAR',
@@ -63,6 +68,7 @@ const TOOL_DISPLAY: Record<string, ToolDisplay> = {
 
 const WORKFLOW_LABEL: Record<string, string> = {
   dcf: 'DCF',
+  deck: 'Deck',
 }
 
 const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
@@ -94,6 +100,64 @@ const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
     assumption_journey: 'Assumption journey',
     finalize: 'Finalizing result',
   },
+  deck: {
+    validate_sources: 'Validating sources',
+    normalize_all: 'Normalizing blocks',
+    generate_outline: 'Drafting outline',
+    outline_review: 'Reviewing outline',
+    per_slide_generate: 'Generating slides',
+    assemble_pptx: 'Assembling PPTX',
+    finalize_deck: 'Finalizing deck',
+    adapter_failure: 'Adapter failure',
+  },
+}
+
+/**
+ * Past-tense action phrases for the collapsed inline chat summary, e.g.
+ * "Searched web", "Ran Python", "Read filing". Aggregated + counted by
+ * `summarizeToolActions` to produce ChatGPT-style lines like
+ * "Searched web ×2 · Calculated".
+ */
+const TOOL_ACTION_PHRASE: Record<string, string> = {
+  search_web: 'Searched web',
+  search_documents: 'Searched documents',
+  calculator: 'Calculated',
+  execute_python: 'Ran Python',
+  retrieve_context: 'Read prior step',
+  retrieve_tool_result: 'Retrieved result',
+  run_dcf_workflow: 'Ran DCF',
+  run_deck_workflow: 'Built deck',
+  fetch_sec_filing: 'Read filing',
+}
+
+export function getToolActionPhrase(toolName: string | undefined): string {
+  const safe = String(toolName || 'unknown')
+  if (safe.startsWith('workflow:')) {
+    const [, workflow = 'workflow'] = safe.split(':')
+    return `Ran ${WORKFLOW_LABEL[workflow] ?? workflow.toUpperCase()}`
+  }
+  return TOOL_ACTION_PHRASE[safe] ?? prettyId(safe)
+}
+
+/**
+ * Collapse a list of tool names into a counted summary string, preserving
+ * first-seen order: ["search_web","search_web","calculator"] →
+ * "Searched web ×2 · Calculated".
+ */
+export function summarizeToolActions(toolNames: string[]): string {
+  const order: string[] = []
+  const counts = new Map<string, number>()
+  for (const name of toolNames) {
+    const phrase = getToolActionPhrase(name)
+    if (!counts.has(phrase)) order.push(phrase)
+    counts.set(phrase, (counts.get(phrase) ?? 0) + 1)
+  }
+  return order
+    .map(phrase => {
+      const n = counts.get(phrase) ?? 1
+      return n > 1 ? `${phrase} ×${n}` : phrase
+    })
+    .join(' · ')
 }
 
 function prettyId(raw: string | undefined): string {

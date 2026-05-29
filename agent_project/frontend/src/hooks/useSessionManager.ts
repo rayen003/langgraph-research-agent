@@ -102,5 +102,25 @@ export function useSessionManager() {
     }))
   }, [])
 
-  return { sessions: state.sessions, activeSession, newSession, selectSession, deleteSession, addMessage, updateChatThreadId }
+  /** Drop all messages with index >= fromIndex. Used when amending a prior user message. */
+  const truncateMessagesFrom = useCallback((sessionId: string, fromIndex: number) => {
+    setState(prev => ({
+      ...prev,
+      sessions: prev.sessions.map(s => {
+        if (s.id !== sessionId) return s
+        return { ...s, messages: s.messages.slice(0, Math.max(0, fromIndex)) }
+      }),
+    }))
+  }, [])
+
+  return {
+    sessions: state.sessions,
+    activeSession,
+    newSession,
+    selectSession,
+    deleteSession,
+    addMessage,
+    truncateMessagesFrom,
+    updateChatThreadId,
+  }
 }

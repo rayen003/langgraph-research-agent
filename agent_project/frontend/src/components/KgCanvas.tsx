@@ -3,16 +3,18 @@ import {
   forceSimulation,
   forceLink,
   forceManyBody,
-  forceCenter,
   forceCollide,
   forceRadial,
+  forceX,
+  forceY,
   type Simulation,
   type SimulationNodeDatum,
   type SimulationLinkDatum,
 } from 'd3-force'
-import { zoom, zoomIdentity, zoomTransform, type ZoomBehavior } from 'd3-zoom'
+import { zoom, zoomIdentity, type ZoomBehavior } from 'd3-zoom'
+
 import { select } from 'd3-selection'
-import type { KgNode, KgEdge } from '../hooks/useKnowledgeGraph'
+import { edgeKey, type KgNode, type KgEdge } from '../hooks/useKnowledgeGraph'
 
 // ── Node colour scheme ───────────────────────────────────────────────────────
 
@@ -30,6 +32,11 @@ const NODE_COLORS: Record<string, string> = {
   risk: '#f43f5e',
   theme: '#f43f5e',
   user_belief: '#22c55e',
+  deck_run: '#0891b2',
+  deck_slide: '#164e63',
+  company_lifecycle: '#7c3aed',
+  filing: '#78350f',
+  news_item: '#1c1917',
 }
 
 export function colorForNode(node: KgNode): string {
@@ -43,6 +50,7 @@ const EDGE_COLORS: Record<string, string> = {
   HAS_SYNTHESIS: '#6366f1',
   HAS_THESIS: '#6366f1',
   HAS_DRIVER: '#f43f5e',
+  HAS_DECK: '#0891b2',
   PRODUCES: '#8b5cf6',
   LOCKED_ASSUMPTION: '#10b981',
   RELATES_TO: '#52525b',
@@ -99,6 +107,8 @@ interface Props {
   nodes: KgNode[]
   edges: KgEdge[]
   highlightSet: Set<string>
+  /** Directed traversal edges ("srcId->tgtId") to draw as the answer route. */
+  highlightEdgeSet?: Set<string>
   onNodeClick: (n: KgNode) => void
   onNodeHover?: (n: KgNode | null) => void
   /** map ticker → { implied, spot } for tooltip enrichment on company nodes */
@@ -115,12 +125,13 @@ function linkParamsFor(edge: KgEdge): { distance: number; strength: number } {
     case 'HAS_SYNTHESIS':
     case 'HAS_THESIS':
     case 'HAS_DRIVER':
-      // Shared knowledge orbits closer to the company anchor than runs do
       return { distance: 110, strength: 0.7 }
     case 'PRODUCES':
       return { distance: 45, strength: 0.9 }
     case 'LOCKED_ASSUMPTION':
       return { distance: 55, strength: 0.85 }
+    case 'HAS_DECK':
+      return { distance: 150, strength: 0.5 }
     case 'RELATES_TO':
       return { distance: 70, strength: 0.4 }
     default:
@@ -130,19 +141,24 @@ function linkParamsFor(edge: KgEdge): { distance: number; strength: number } {
 
 // ── Canvas ───────────────────────────────────────────────────────────────────
 
-export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover, companySummary }: Props) {
-  const svgRef = useRef<SVGSVGElement | null>(null)
-  const gRef = useRef<SVGGElement | null>(null)
+export function KgCanvas({ nodes, edges, highlightSet, highlightEdgeSet, onNodeClick, onNodeHover, companySummary }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const simRef = useRef<Simulation<SimNode, SimLink> | null>(null)
-  const zoomRef = useRef<ZoomBehavior<SVGSVGElement, unknown> | null>(null)
+  const zoomRef = useRef<ZoomBehavior<HTMLCanvasElement, unknown> | null>(null)
   const nodePositionsRef = useRef<Map<string, { x: number; y: number; fx?: number | null; fy?: number | null }>>(new Map())
+  const transformRef = useRef<{ k: number; x: number; y: number }>({ k: 1, x: 0, y: 0 })
+  const rafRef = useRef<number | null>(null)
+  const simHotRef = useRef(true)
 
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 800, h: 600 })
   const [hoveredNode, setHoveredNode] = useState<string | null>(null)
-  const [renderTick, setRenderTick] = useState(0)
+  const hoveredNodeRef = useRef<string | null>(null)
+  const [zoomScale, setZoomScale] = useState(1)
+  const zoomScaleRef = useRef(1)
 
   const simNodesRef = useRef<SimNode[]>([])
   const simLinksRef = useRef<SimLink[]>([])
+  const simInitializedRef = useRef(false)
 
   // ── Build sim nodes / links ────────────────────────────────────────────────
   useMemo(() => {
@@ -152,13 +168,11 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
       degree.set(e.tgt_id, (degree.get(e.tgt_id) || 0) + 1)
     }
 
-    // ── Company anchors: pin at canvas center (or grid if multiple) ─────────
     const companies = nodes.filter(n => n.node_type === 'company')
     const companyPin = new Map<string, { x: number; y: number }>()
     if (companies.length === 1) {
       companyPin.set(companies[0].id, { x: size.w / 2, y: size.h / 2 })
     } else if (companies.length > 1) {
-      // Arrange companies in a horizontal row, evenly spaced
       const spacing = Math.min(size.w / (companies.length + 1), 300)
       const startX = (size.w - spacing * (companies.length - 1)) / 2
       companies.forEach((c, i) => {
@@ -166,8 +180,6 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
       })
     }
 
-    // ── Concentric initial layout: company center, shared inner ring, runs middle ring,
-    //    leaves outer ring. Prevents the "all clumped at center" first-render mess.
     const cx = size.w / 2
     const cy = size.h / 2
     function initialPosFor(n: KgNode, role: NodeRole, ringIdx: Map<NodeRole, number>): { x: number; y: number } {
@@ -182,8 +194,7 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
         160
       const idx = ringIdx.get(role) ?? 0
       ringIdx.set(role, idx + 1)
-      // Use golden angle for even angular spread regardless of count
-      const angle = idx * 2.39996  // golden angle in radians
+      const angle = idx * 2.39996
       return {
         x: cx + ringRadius * Math.cos(angle),
         y: cy + ringRadius * Math.sin(angle),
@@ -202,8 +213,9 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
         role === 'run_leaf' ? 6 : 7
       const radius = Math.min(20, baseRadius + Math.min(4, deg * 0.4))
 
-      const pin = companyPin.get(n.id)
       const init = prev ? { x: prev.x, y: prev.y } : initialPosFor(n, role, ringIdx)
+      const fx = prev?.fx ?? null
+      const fy = prev?.fy ?? null
       return {
         id: n.id,
         raw: n,
@@ -212,9 +224,8 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
         radius,
         x: init.x,
         y: init.y,
-        // Pin companies in place; preserve user-pinned positions for others
-        fx: pin ? pin.x : (prev?.fx ?? null),
-        fy: pin ? pin.y : (prev?.fy ?? null),
+        fx,
+        fy,
       }
     })
 
@@ -237,14 +248,230 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
     simLinksRef.current = newSimLinks
   }, [nodes, edges, size.w, size.h])
 
+  // ── Draw frame ───────────────────────────────────────────────────────────────
+  const drawFrame = useCallback(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const dpr = window.devicePixelRatio || 1
+    const { k, x, y } = transformRef.current
+    const currentZoom = zoomScaleRef.current
+    const simNodes = simNodesRef.current
+    const simLinks = simLinksRef.current
+    const hiNodes = highlightSet
+    const hovId = hoveredNodeRef.current
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+    ctx.save()
+    ctx.setTransform(k * dpr, 0, 0, k * dpr, x * dpr, y * dpr)
+
+    // ── Draw edges ──────────────────────────────────────────────────────────
+    const hasHighlight = hiNodes.size > 0 || (highlightEdgeSet?.size ?? 0) > 0
+
+    for (const l of simLinks) {
+      const src = l.source as SimNode
+      const tgt = l.target as SimNode
+      const isPath = !!highlightEdgeSet?.has(edgeKey(src.id, tgt.id))
+      const isHi = isPath || (hiNodes.has(src.id) && hiNodes.has(tgt.id))
+      const opacity = hasHighlight && !isHi ? 0.12 : 0.55
+      const stroke = isHi ? '#2dd4bf' : edgeColor(l.raw.relation)
+
+      const x1 = src.x || 0, y1 = src.y || 0
+      const x2 = tgt.x || 0, y2 = tgt.y || 0
+      const dx = x2 - x1, dy = y2 - y1
+      const dr = Math.sqrt(dx * dx + dy * dy)
+      const curvature = 0.18
+      const mx = (x1 + x2) / 2 - dy * curvature
+      const my = (y1 + y2) / 2 + dx * curvature
+      const shorten = (tgt.radius || 8) + 2
+      const ex = x2 - (dx / (dr || 1)) * shorten
+      const ey = y2 - (dy / (dr || 1)) * shorten
+
+      ctx.save()
+      ctx.globalAlpha = opacity
+      ctx.strokeStyle = stroke
+      ctx.lineWidth = isPath ? 3 : isHi ? 2 : 1
+
+      if (isPath) {
+        ctx.setLineDash([6, 4])
+      } else {
+        ctx.setLineDash([])
+      }
+
+      ctx.beginPath()
+      ctx.moveTo(x1, y1)
+      ctx.quadraticCurveTo(mx, my, ex, ey)
+      ctx.stroke()
+
+      // Arrowhead at endpoint
+      const arrowSize = 6
+      // Tangent at end of quadratic: from control point to end point
+      const atx = ex - mx, aty = ey - my
+      const alen = Math.sqrt(atx * atx + aty * aty) || 1
+      const unx = atx / alen, uny = aty / alen
+      ctx.setLineDash([])
+      ctx.fillStyle = stroke
+      ctx.beginPath()
+      ctx.moveTo(ex, ey)
+      ctx.lineTo(
+        ex - arrowSize * unx + (arrowSize * 0.5) * (-uny),
+        ey - arrowSize * uny + (arrowSize * 0.5) * unx,
+      )
+      ctx.lineTo(
+        ex - arrowSize * unx - (arrowSize * 0.5) * (-uny),
+        ey - arrowSize * uny - (arrowSize * 0.5) * unx,
+      )
+      ctx.closePath()
+      ctx.fill()
+      ctx.restore()
+    }
+
+    // ── Draw nodes ──────────────────────────────────────────────────────────
+    for (const n of simNodes) {
+      const isHi = hiNodes.has(n.id)
+      const isHover = hovId === n.id
+      const dim = hiNodes.size > 0 && !isHi
+      const color = colorForNode(n.raw)
+      const r = n.radius
+      const nx = n.x || 0, ny = n.y || 0
+
+      ctx.save()
+      ctx.globalAlpha = dim ? 0.3 : 1
+
+      // Outer ring for highlighted / hovered / company nodes
+      if (isHi || isHover || n.role === 'company') {
+        const ringR = r + (n.role === 'company' ? 7 : 5)
+        ctx.beginPath()
+        ctx.arc(nx, ny, ringR, 0, Math.PI * 2)
+        ctx.strokeStyle = isHi ? '#2dd4bf' : color
+        ctx.lineWidth = n.role === 'company' ? 2 : 1.5
+        ctx.globalAlpha = dim ? 0.3 : (n.role === 'company' ? 0.4 : 0.7)
+        ctx.stroke()
+        ctx.globalAlpha = dim ? 0.3 : 1
+      }
+
+      // Filled circle
+      ctx.beginPath()
+      ctx.arc(nx, ny, r, 0, Math.PI * 2)
+      ctx.fillStyle = color
+      ctx.globalAlpha = dim ? 0.3 : (n.role === 'company' ? 0.95 : 0.85)
+      ctx.fill()
+      ctx.globalAlpha = dim ? 0.3 : 1
+      ctx.strokeStyle = isHi ? '#2dd4bf' : '#0a0a0a'
+      ctx.lineWidth = isHi ? 2 : 1.5
+      ctx.stroke()
+
+      // Label
+      const isAnchor = n.role === 'company' || n.role === 'run'
+      const labelOpacity =
+        isHi || isHover || isAnchor ? 1 :
+        currentZoom > 1.2 ? 0.85 : 0.5
+
+      // Skip leaf labels when zoomed out and not highlighted
+      if (!isAnchor && !isHi && !isHover && currentZoom < 0.6) {
+        ctx.restore()
+        continue
+      }
+
+      const label = labelFor(n.raw)
+      const fontSize = n.role === 'company' ? 13 : isAnchor ? 11 : 10
+      ctx.font = `${n.role === 'company' ? 600 : 400} ${fontSize}px sans-serif`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'top'
+
+      // Stroke for legibility
+      ctx.globalAlpha = dim ? 0.3 * labelOpacity * 0.85 : labelOpacity * 0.85
+      ctx.strokeStyle = '#0a0a0a'
+      ctx.lineWidth = 2.5
+      ctx.lineJoin = 'round'
+      ctx.strokeText(label, nx, ny + r + 3)
+
+      ctx.globalAlpha = dim ? 0.3 * labelOpacity : labelOpacity
+      ctx.fillStyle = isHi ? '#5eead4' : (n.role === 'company' ? '#e4e4e7' : '#a1a1aa')
+      ctx.fillText(label, nx, ny + r + 3)
+
+      ctx.restore()
+    }
+
+    ctx.restore() // end world-space transform
+
+    // ── Tooltip in screen space ─────────────────────────────────────────────
+    if (hovId) {
+      const n = simNodes.find(s => s.id === hovId)
+      if (n) {
+        const isCompany = n.role === 'company'
+        const summary = isCompany ? companySummary?.get(n.raw.ticker) : undefined
+        const lines = buildTooltipLines(n.raw, summary)
+
+        // Project node center to screen
+        const sx = (n.x || 0) * k + x
+        const sy = (n.y || 0) * k + y
+
+        const lineH = 14
+        const padX = 8, padY = 8
+        const maxLen = Math.max(...lines.map(l => l.length))
+        const w = Math.min(280, Math.max(120, maxLen * 7 + padX * 2))
+        const h = lines.length * lineH + padY * 2
+        const bx = sx + n.radius * k + 14
+        const by = sy - h / 2
+
+        ctx.save()
+        ctx.globalAlpha = 0.96
+        ctx.fillStyle = '#11111a'
+        ctx.strokeStyle = '#2a2a36'
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.roundRect(bx, by, w, h, 4)
+        ctx.fill()
+        ctx.stroke()
+
+        lines.forEach((line, i) => {
+          ctx.globalAlpha = 1
+          ctx.font = `${i === 0 ? 600 : 400} ${i === 0 ? 11 : 10}px sans-serif`
+          ctx.fillStyle = i === 0 ? '#e4e4e7' : '#a1a1aa'
+          ctx.textAlign = 'left'
+          ctx.textBaseline = 'top'
+          ctx.fillText(line, bx + padX, by + padY + i * lineH)
+        })
+        ctx.restore()
+      }
+    }
+  }, [highlightSet, highlightEdgeSet, companySummary])
+
+  // ── rAF loop ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    let running = true
+    function loop() {
+      if (!running) return
+      if (simHotRef.current) {
+        drawFrame()
+      }
+      rafRef.current = requestAnimationFrame(loop)
+    }
+    rafRef.current = requestAnimationFrame(loop)
+    return () => {
+      running = false
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+    }
+  }, [drawFrame])
+
   // ── Resize observer ────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!svgRef.current) return
-    const el = svgRef.current
+    if (!canvasRef.current) return
+    const el = canvasRef.current
     const ro = new ResizeObserver(entries => {
       for (const e of entries) {
         const { width, height } = e.contentRect
-        setSize({ w: Math.max(200, width), h: Math.max(200, height) })
+        const w = Math.max(200, width)
+        const h = Math.max(200, height)
+        setSize({ w, h })
+        // Resize canvas backing store
+        const dpr = window.devicePixelRatio || 1
+        el.width = w * dpr
+        el.height = h * dpr
       }
     })
     ro.observe(el)
@@ -257,31 +484,38 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
     const simNodes = simNodesRef.current
     const simLinks = simLinksRef.current
 
+    simHotRef.current = true
+
     const sim = forceSimulation<SimNode, SimLink>(simNodes)
       .force('link', forceLink<SimNode, SimLink>(simLinks)
         .id(d => d.id)
         .distance(d => d.distance)
         .strength(d => d.strength),
       )
-      // Stronger repulsion for companies, weaker for leaves
       .force('charge', forceManyBody<SimNode>().strength(d => {
-        if (d.role === 'company') return -600
-        if (d.role === 'run') return -250
-        if (d.role === 'shared') return -180
-        if (d.role === 'run_leaf') return -90
+        if (d.degree === 0) return -20
+        if (d.role === 'company') return -900
+        if (d.role === 'run') return -350
+        if (d.role === 'shared') return -200
+        if (d.role === 'run_leaf') return -100
         return -150
       }))
-      .force('center', forceCenter(size.w / 2, size.h / 2).strength(0.02))
       .force('collide', forceCollide<SimNode>().radius(d => d.radius + 4))
-      // Push run-leaves slightly outward from center so they cluster around their parent run
       .force('radial-leaves', forceRadial<SimNode>(
         d => d.role === 'run_leaf' ? 220 : d.role === 'run' ? 160 : 0,
         size.w / 2,
         size.h / 2,
       ).strength(d => d.role === 'run_leaf' ? 0.08 : d.role === 'run' ? 0.05 : 0))
-      .alpha(1.2)
-      .alphaDecay(0.018)
-      .velocityDecay(0.45)
+      .force('gravity-x', forceX<SimNode>(d =>
+        d.degree === 0 ? size.w * 0.08 : size.w / 2,
+      ).strength(d =>
+        d.role === 'company' ? 0.09 : d.degree === 0 ? 0.12 : 0.04))
+      .force('gravity-y', forceY<SimNode>(size.h / 2).strength(d =>
+        d.role === 'company' ? 0.09 : d.degree === 0 ? 0.03 : 0.04))
+      .alpha(simInitializedRef.current ? 0.4 : 1.2)
+      .alphaTarget(0.03)
+      .alphaDecay(0.008)
+      .velocityDecay(0.25)
       .on('tick', () => {
         for (const n of simNodes) {
           nodePositionsRef.current.set(n.id, {
@@ -291,255 +525,171 @@ export function KgCanvas({ nodes, edges, highlightSet, onNodeClick, onNodeHover,
             fy: n.fy,
           })
         }
-        setRenderTick(t => t + 1)
+        drawFrame()
       })
 
     simRef.current = sim
+    simInitializedRef.current = true
     return () => { sim.stop() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes.length, edges.length, nodes.map(n => n.id).join(','), edges.map(e => e.id).join(',')])
+  }, [nodes.length, edges.length, nodes.map(n => n.id).join(','), edges.map(e => e.id).join(','), size.w, size.h])
 
   // ── Zoom / pan ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!svgRef.current || !gRef.current) return
-    const svgSel = select(svgRef.current)
-    const gSel = select(gRef.current)
+    if (!canvasRef.current) return
+    const canvasSel = select(canvasRef.current)
 
-    const z = zoom<SVGSVGElement, unknown>()
+    const z = zoom<HTMLCanvasElement, unknown>()
       .scaleExtent([0.1, 4])
       .on('zoom', ev => {
-        gSel.attr('transform', ev.transform.toString())
+        const { k, x, y } = ev.transform
+        transformRef.current = { k, x, y }
+        zoomScaleRef.current = k
+        setZoomScale(k)
+        simHotRef.current = true
+        drawFrame()
       })
 
-    svgSel.call(z)
+    canvasSel.call(z)
     zoomRef.current = z
-    svgSel.call(z.transform, zoomIdentity)
-    return () => { svgSel.on('.zoom', null) }
-  }, [])
+    canvasSel.call(z.transform, zoomIdentity)
+    return () => { canvasSel.on('.zoom', null) }
+  }, [drawFrame])
 
-  // ── React-managed drag (avoids d3-drag data-binding issues) ───────────────
-  // Returns a screen→graph coord mapper that accounts for current zoom transform.
+  // ── Unproject screen → graph coords ─────────────────────────────────────
   const screenToGraph = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
-    const svg = svgRef.current
-    if (!svg) return null
-    const ctm = svg.getScreenCTM()
-    if (!ctm) return null
-    const pt = svg.createSVGPoint()
-    pt.x = clientX
-    pt.y = clientY
-    const sp = pt.matrixTransform(ctm.inverse())
-    const t = zoomTransform(svg)
-    return { x: (sp.x - t.x) / t.k, y: (sp.y - t.y) / t.k }
+    const canvas = canvasRef.current
+    if (!canvas) return null
+    const rect = canvas.getBoundingClientRect()
+    const { k, x, y } = transformRef.current
+    return {
+      x: (clientX - rect.left - x) / k,
+      y: (clientY - rect.top - y) / k,
+    }
   }, [])
 
-  const handleNodeMouseDown = useCallback((e: React.MouseEvent, simNodeId: string) => {
-    e.stopPropagation()
-    e.preventDefault()
-    const n = simNodesRef.current.find(s => s.id === simNodeId)
-    if (!n) return
-    if (n.role === 'company') return  // companies stay pinned by design
+  // ── Hit test: find node near graph coords ───────────────────────────────
+  const hitTest = useCallback((gx: number, gy: number): SimNode | null => {
+    let closest: SimNode | null = null
+    let minDist = Infinity
+    for (const n of simNodesRef.current) {
+      const dx = (n.x || 0) - gx
+      const dy = (n.y || 0) - gy
+      const d = Math.sqrt(dx * dx + dy * dy)
+      if (d < n.radius + 4 && d < minDist) {
+        minDist = d
+        closest = n
+      }
+    }
+    return closest
+  }, [])
 
-    // Record starting state
-    const startGraph = screenToGraph(e.clientX, e.clientY)
-    if (!startGraph) return
-    const nodeStartX = n.x ?? 0
-    const nodeStartY = n.y ?? 0
+  // ── Mouse move for hover ─────────────────────────────────────────────────
+  const handleCanvasMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Skip during d3-zoom drag (buttons held = panning)
+    if (e.buttons > 0 && !e.shiftKey) return
+    const g = screenToGraph(e.clientX, e.clientY)
+    if (!g) return
+    const hit = hitTest(g.x, g.y)
+    const newId = hit ? hit.id : null
+    if (newId !== hoveredNodeRef.current) {
+      hoveredNodeRef.current = newId
+      setHoveredNode(newId)
+      onNodeHover?.(hit ? hit.raw : null)
+      simHotRef.current = true
+      drawFrame()
+    }
+  }, [screenToGraph, hitTest, onNodeHover, drawFrame])
+
+  // ── Click ────────────────────────────────────────────────────────────────
+  const clickStartRef = useRef<{ x: number; y: number } | null>(null)
+
+  const handleCanvasMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    clickStartRef.current = { x: e.clientX, y: e.clientY }
+    const g = screenToGraph(e.clientX, e.clientY)
+    if (!g) return
+    const hit = hitTest(g.x, g.y)
+    if (!hit) return
+
+    e.stopPropagation()
+
+    const pinOnDrop = e.shiftKey
+    const nodeStartX = hit.x ?? 0
+    const nodeStartY = hit.y ?? 0
     let didMove = false
 
-    simRef.current?.alphaTarget(0.3).restart()
+    simRef.current?.alphaTarget(0.5).restart()
+    simHotRef.current = true
 
     function onMove(ev: MouseEvent) {
-      const g = screenToGraph(ev.clientX, ev.clientY)
-      if (!g) return
+      const g2 = screenToGraph(ev.clientX, ev.clientY)
+      if (!g2) return
+      const startG = screenToGraph(e.clientX, e.clientY)
+      if (!startG) return
       didMove = true
-      n!.fx = nodeStartX + (g.x - startGraph!.x)
-      n!.fy = nodeStartY + (g.y - startGraph!.y)
+      hit!.fx = nodeStartX + (g2.x - startG.x)
+      hit!.fy = nodeStartY + (g2.y - startG.y)
     }
     function onUp() {
       document.removeEventListener('mousemove', onMove)
       document.removeEventListener('mouseup', onUp)
-      simRef.current?.alphaTarget(0)
-      if (didMove && n) {
-        // Pin where dropped
-        nodePositionsRef.current.set(n.id, {
-          x: n.fx ?? n.x ?? 0,
-          y: n.fy ?? n.y ?? 0,
-          fx: n.fx,
-          fy: n.fy,
+      simRef.current?.alphaTarget(0.03)
+      if (hit) {
+        if (!didMove || !pinOnDrop) {
+          hit.fx = null
+          hit.fy = null
+        }
+        nodePositionsRef.current.set(hit.id, {
+          x: hit.x ?? 0, y: hit.y ?? 0, fx: hit.fx, fy: hit.fy,
         })
       }
     }
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
-  }, [screenToGraph])
+  }, [screenToGraph, hitTest])
 
-  // Unpin: double-click a node to release it back to the simulation
-  const handleNodeDoubleClick = useCallback((e: React.MouseEvent, simNodeId: string) => {
-    e.stopPropagation()
-    const n = simNodesRef.current.find(s => s.id === simNodeId)
-    if (!n || n.role === 'company') return
-    n.fx = null
-    n.fy = null
-    nodePositionsRef.current.set(n.id, { x: n.x ?? 0, y: n.y ?? 0, fx: null, fy: null })
+  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const start = clickStartRef.current
+    if (!start) return
+    const dist = Math.sqrt((e.clientX - start.x) ** 2 + (e.clientY - start.y) ** 2)
+    if (dist > 4) return // was a drag
+    const g = screenToGraph(e.clientX, e.clientY)
+    if (!g) return
+    const hit = hitTest(g.x, g.y)
+    if (hit) onNodeClick(hit.raw)
+  }, [screenToGraph, hitTest, onNodeClick])
+
+  const handleCanvasDblClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const g = screenToGraph(e.clientX, e.clientY)
+    if (!g) return
+    const hit = hitTest(g.x, g.y)
+    if (!hit) return
+    hit.fx = null
+    hit.fy = null
+    nodePositionsRef.current.set(hit.id, { x: hit.x ?? 0, y: hit.y ?? 0, fx: null, fy: null })
     simRef.current?.alpha(0.3).restart()
-  }, [])
+  }, [screenToGraph, hitTest])
 
-  // ── Render ─────────────────────────────────────────────────────────────────
-  const simNodes = simNodesRef.current
-  const simLinks = simLinksRef.current
-  const hiNodes = highlightSet
-
-  function handleNodeMouseEnter(n: SimNode) {
-    setHoveredNode(n.id)
-    onNodeHover?.(n.raw)
-  }
-  function handleNodeMouseLeave() {
-    setHoveredNode(null)
-    onNodeHover?.(null)
-  }
+  const handleCanvasMouseLeave = useCallback(() => {
+    if (hoveredNodeRef.current !== null) {
+      hoveredNodeRef.current = null
+      setHoveredNode(null)
+      onNodeHover?.(null)
+      drawFrame()
+    }
+  }, [onNodeHover, drawFrame])
 
   return (
-    <svg ref={svgRef} className="w-full h-full bg-[#0a0a0a]">
-      <defs>
-        <marker id="arrow-default" viewBox="0 -5 10 10" refX="14" refY="0" markerWidth="5" markerHeight="5" orient="auto">
-          <path d="M0,-5L10,0L0,5" fill="#52525b" />
-        </marker>
-        <marker id="arrow-highlight" viewBox="0 -5 10 10" refX="14" refY="0" markerWidth="6" markerHeight="6" orient="auto">
-          <path d="M0,-5L10,0L0,5" fill="#2dd4bf" />
-        </marker>
-      </defs>
-
-      <g ref={gRef}>
-        {/* Edges — curved bezier paths for less overlap */}
-        <g className="kg-edges" fill="none">
-          {simLinks.map(l => {
-            const src = l.source as SimNode
-            const tgt = l.target as SimNode
-            const isHi = hiNodes.has(src.id) && hiNodes.has(tgt.id)
-            const stroke = isHi ? '#2dd4bf' : edgeColor(l.raw.relation)
-            const opacity = hiNodes.size > 0 && !isHi ? 0.15 : 0.55
-            const x1 = src.x || 0, y1 = src.y || 0
-            const x2 = tgt.x || 0, y2 = tgt.y || 0
-            // Quadratic curve with control point perpendicular to midpoint
-            const dx = x2 - x1, dy = y2 - y1
-            const dr = Math.sqrt(dx * dx + dy * dy)
-            const curvature = 0.18
-            const mx = (x1 + x2) / 2 - dy * curvature
-            const my = (y1 + y2) / 2 + dx * curvature
-            // Shorten end of path so arrow doesn't overlap target node circle
-            const shorten = (tgt.radius || 8) + 2
-            const ex = x2 - (dx / (dr || 1)) * shorten
-            const ey = y2 - (dy / (dr || 1)) * shorten
-            const d = `M ${x1},${y1} Q ${mx},${my} ${ex},${ey}`
-            return (
-              <path
-                key={l.id}
-                d={d}
-                stroke={stroke}
-                strokeWidth={isHi ? 2 : 1}
-                opacity={opacity}
-                markerEnd={isHi ? 'url(#arrow-highlight)' : 'url(#arrow-default)'}
-              />
-            )
-          })}
-        </g>
-
-        {/* Nodes */}
-        <g className="kg-nodes">
-          {simNodes.map(n => {
-            const isHi = hiNodes.has(n.id)
-            const isHover = hoveredNode === n.id
-            const dim = hiNodes.size > 0 && !isHi
-            const color = colorForNode(n.raw)
-            const radius = n.radius
-            return (
-              <g
-                key={n.id}
-                className="kg-node"
-                data-id={n.id}
-                transform={`translate(${n.x || 0},${n.y || 0})`}
-                style={{ cursor: n.role === 'company' ? 'pointer' : 'grab', opacity: dim ? 0.3 : 1 }}
-                onMouseEnter={() => handleNodeMouseEnter(n)}
-                onMouseLeave={handleNodeMouseLeave}
-                onMouseDown={(e) => handleNodeMouseDown(e, n.id)}
-                onDoubleClick={(e) => handleNodeDoubleClick(e, n.id)}
-                onClick={(e) => { e.stopPropagation(); onNodeClick(n.raw) }}
-              >
-                {(isHi || isHover || n.role === 'company') && (
-                  <circle
-                    r={radius + (n.role === 'company' ? 7 : 5)}
-                    fill="none"
-                    stroke={isHi ? '#2dd4bf' : color}
-                    strokeWidth={n.role === 'company' ? 2 : 1.5}
-                    opacity={n.role === 'company' ? 0.4 : 0.7}
-                  />
-                )}
-                <circle
-                  r={radius}
-                  fill={color}
-                  fillOpacity={n.role === 'company' ? 0.95 : 0.85}
-                  stroke={isHi ? '#2dd4bf' : '#0a0a0a'}
-                  strokeWidth={isHi ? 2 : 1.5}
-                />
-                <text
-                  y={radius + 12}
-                  textAnchor="middle"
-                  fontSize={n.role === 'company' ? 13 : 11}
-                  fontWeight={n.role === 'company' ? 600 : 400}
-                  fill={isHi ? '#5eead4' : (n.role === 'company' ? '#e4e4e7' : '#a1a1aa')}
-                  pointerEvents="none"
-                  style={{ userSelect: 'none' }}
-                >
-                  {labelFor(n.raw)}
-                </text>
-              </g>
-            )
-          })}
-        </g>
-      </g>
-
-      {/* Hover tooltip — company gets enriched with implied/spot/delta */}
-      {hoveredNode && (() => {
-        const n = simNodes.find(s => s.id === hoveredNode)
-        if (!n) return null
-        const isCompany = n.role === 'company'
-        const summary = isCompany ? companySummary?.get(n.raw.ticker) : undefined
-        const lines = buildTooltipLines(n.raw, summary)
-        const lineH = 14
-        const padX = 8, padY = 8
-        const w = Math.min(280, Math.max(120, Math.max(...lines.map(l => l.length)) * 7 + padX * 2))
-        const h = lines.length * lineH + padY * 2
-
-        // Position to right; clamp if near right edge
-        const baseX = (n.x || 0) + n.radius + 14
-        const baseY = (n.y || 0) - h / 2
-        return (
-          <g transform={`translate(${baseX}, ${baseY})`} pointerEvents="none">
-            <rect
-              x={0} y={0}
-              width={w}
-              height={h}
-              rx={4}
-              fill="#11111a"
-              stroke="#2a2a36"
-              opacity={0.96}
-            />
-            {lines.map((line, i) => (
-              <text
-                key={i}
-                x={padX}
-                y={padY + (i + 1) * lineH - 4}
-                fontSize={i === 0 ? 11 : 10}
-                fontWeight={i === 0 ? 600 : 400}
-                fill={i === 0 ? '#e4e4e7' : '#a1a1aa'}
-              >
-                {line}
-              </text>
-            ))}
-          </g>
-        )
-      })()}
-    </svg>
+    <canvas
+      ref={canvasRef}
+      className="w-full h-full bg-[#0a0a0a]"
+      style={{ display: 'block' }}
+      onMouseMove={handleCanvasMouseMove}
+      onMouseDown={handleCanvasMouseDown}
+      onClick={handleCanvasClick}
+      onDoubleClick={handleCanvasDblClick}
+      onMouseLeave={handleCanvasMouseLeave}
+    />
   )
 }
 

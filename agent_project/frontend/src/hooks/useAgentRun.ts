@@ -27,6 +27,7 @@ const INITIAL_STATE: AgentRunState = {
   dcf_review: null,
   dcf_evidence_items: [],
   dcf_citation_map: {},
+  deck_review: null,
 }
 
 /**
@@ -186,6 +187,25 @@ export function useAgentRun() {
         case 'assumptions_rejected':
           return { ...prev, status: 'rejected' }
 
+        case 'deck_outline_review':
+          return {
+            ...prev,
+            status: 'awaiting_outline_review',
+            deck_review: {
+              deck_title: (data.deck_title as string) ?? '',
+              hitl_mode: (data.hitl_mode as string) ?? 'partial',
+              slide_count: (data.slide_count as number) ?? 0,
+              outline: (data.outline as import('../types').DeckReviewState['outline']) ?? { slides: [] },
+              blocks_preview: (data.blocks_preview as import('../types').DeckBlockPreview[]) ?? [],
+            },
+          }
+
+        case 'deck_outline_submitted':
+          return { ...prev, status: 'workflow_running', deck_review: null }
+
+        case 'deck_outline_rejected':
+          return { ...prev, status: 'chat_responding', deck_review: null }
+
         case 'step_start': {
           const steps = prev.steps.map(s =>
             s.id === data.step_id ? { ...s, status: 'running' as const } : s,
@@ -271,10 +291,14 @@ export function useAgentRun() {
             ...msgs,
             { id: nextId(), role: 'assistant' as const, content, streaming: false },
           ]
-          // If a DCF HITL card is pending, stay in awaiting_assumptions so
-          // the 150ms reset in App.tsx doesn't wipe dcf_review before the user
+          // If a DCF or deck HITL card is pending, stay in the awaiting state so
+          // the 150ms reset in App.tsx doesn't wipe review state before the user
           // sees the card. The next startRun call resets everything cleanly.
-          const nextStatus = prev.dcf_review ? 'awaiting_assumptions' : 'complete'
+          const nextStatus = prev.dcf_review
+            ? 'awaiting_assumptions'
+            : prev.deck_review
+              ? 'awaiting_outline_review'
+              : 'complete'
           return {
             ...prev,
             status: nextStatus,
@@ -285,13 +309,16 @@ export function useAgentRun() {
           }
         }
         // ── Shared terminal states ─────────────────────────────────────────
-        case 'run_complete':
+        case 'run_complete': {
+          const runArtifacts = (data.artifact_paths as string[]) ?? []
           return {
             ...prev,
-            status: prev.dcf_review
-              ? prev.status  // HITL pending — don't complete, card must stay visible
+            status: prev.dcf_review || prev.deck_review
+              ? prev.status
               : prev.report || prev.chat_messages.length || data.workflow ? 'complete' : prev.status,
+            artifact_paths: runArtifacts.length ? runArtifacts : prev.artifact_paths,
           }
+        }
 
         case 'rejected':
           return { ...prev, status: 'rejected' }
@@ -383,11 +410,80 @@ export function useAgentRun() {
     [handleEvent],
   )
 
+  const amendMessage = useCallback(
+    async (
+      threadId: string,
+      originalContent: string,
+      newContent: string,
+      mode: Mode,
+      sessionId?: string,
+    ): Promise<boolean> => {
+      esRef.current?.close()
+
+      const userMsg: ChatMessage = { id: nextId(), role: 'user', content: newContent }
+
+      setState(() => ({
+        ...INITIAL_STATE,
+        status: 'classifying',
+        query: newContent,
+        mode,
+        thread_id: threadId,
+        chat_messages: [userMsg],
+      }))
+
+      const res = await fetch(`/runs/${threadId}/amend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          original_content: originalContent,
+          new_content: newContent,
+          mode,
+          session_id: sessionId,
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.text()
+        setState(prev => ({ ...prev, status: 'error', error: err }))
+        return false
+      }
+      const { start_event_id } = (await res.json()) as { thread_id: string; start_event_id?: number }
+      const afterId = typeof start_event_id === 'number' ? start_event_id : 0
+      const es = new EventSource(`/runs/${threadId}/events?after_id=${afterId}`)
+
+      es.onmessage = (e: MessageEvent) => {
+        let data: Record<string, unknown>
+        try { data = JSON.parse(e.data as string) } catch { return }
+        if (data.type === 'done') {
+          es.close()
+          esRef.current = null
+          return
+        }
+        handleEvent(e)
+      }
+      es.onerror = () => {
+        setState(prev => {
+          const terminal = ['complete', 'rejected', 'error']
+          if (terminal.includes(prev.status)) return prev
+          return { ...prev, status: 'error', error: 'Connection lost' }
+        })
+        es.close()
+        esRef.current = null
+      }
+      esRef.current = es
+      return true
+    },
+    [handleEvent],
+  )
+
   const approve = useCallback(async () => {
     const tid = state.thread_id
     if (!tid) return
     if (state.status === 'awaiting_assumptions') {
       setState(prev => ({ ...prev, status: 'chat_responding', dcf_review: null }))
+      return
+    }
+    if (state.status === 'awaiting_outline_review') {
+      setState(prev => ({ ...prev, status: 'chat_responding', deck_review: null }))
       return
     }
     await fetch(`/runs/${tid}/decision`, {
@@ -400,6 +496,10 @@ export function useAgentRun() {
   const reject = useCallback(async () => {
     if (state.status === 'awaiting_assumptions') {
       setState(prev => ({ ...prev, status: 'idle', dcf_review: null }))
+      return
+    }
+    if (state.status === 'awaiting_outline_review') {
+      setState(prev => ({ ...prev, status: 'idle', deck_review: null }))
       return
     }
     const tid = state.thread_id
@@ -417,5 +517,5 @@ export function useAgentRun() {
     setState(INITIAL_STATE)
   }, [])
 
-  return { state, startRun, approve, reject, reset }
+  return { state, startRun, amendMessage, approve, reject, reset }
 }

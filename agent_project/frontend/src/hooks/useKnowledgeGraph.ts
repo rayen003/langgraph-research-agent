@@ -28,11 +28,23 @@ export interface KgEdge {
   created_at: number
 }
 
+export interface KgTraversalEdge {
+  src_id: string
+  tgt_id: string
+  relation: string | null
+}
+
 export interface KgQueryResult {
   query: unknown
   answer: string
   matched_nodes: KgNode[]
   traversal_path: string[]
+  traversal_edges: KgTraversalEdge[]
+}
+
+/** Stable key for a directed traversal edge. */
+export function edgeKey(srcId: string, tgtId: string): string {
+  return `${srcId}->${tgtId}`
 }
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
@@ -43,6 +55,7 @@ export function useKnowledgeGraph(sessionId: string | null) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [highlightPath, setHighlightPath] = useState<string[]>([])
+  const [highlightEdges, setHighlightEdges] = useState<KgTraversalEdge[]>([])
 
   const refresh = useCallback(async () => {
     if (!sessionId) return
@@ -102,14 +115,18 @@ export function useKnowledgeGraph(sessionId: string | null) {
     if (!res.ok) return null
     const result = (await res.json()) as KgQueryResult
     setHighlightPath(result.traversal_path ?? [])
+    setHighlightEdges(result.traversal_edges ?? [])
     return result
   }, [sessionId])
 
-  const clearHighlight = useCallback(() => setHighlightPath([]), [])
+  const clearHighlight = useCallback(() => {
+    setHighlightPath([])
+    setHighlightEdges([])
+  }, [])
 
   return {
     nodes, edges, loading, error,
-    highlightPath, clearHighlight,
+    highlightPath, highlightEdges, clearHighlight,
     refresh, patchNode, deleteNode, createNode, queryNL,
   }
 }

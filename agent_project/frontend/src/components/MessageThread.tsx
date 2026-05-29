@@ -46,6 +46,86 @@ function formatEvidenceValue(item: EvidenceItem): string | null {
   return value.toLocaleString(undefined, { maximumFractionDigits: 4 })
 }
 
+function deckArtifactFilename(artifactPaths?: string[]): string | null {
+  const pptx = artifactPaths?.find(p => /\.pptx$/i.test(p))
+  if (!pptx) return null
+  return pptx.split('/').pop() ?? pptx
+}
+
+function DeckArtifactCard({
+  threadId,
+  artifactPaths,
+  title,
+  onPreview,
+}: {
+  threadId: string
+  artifactPaths?: string[]
+  title?: string
+  // threadId is forwarded so historical / cross-session decks resolve against
+  // the run that produced them (not the currently active live thread).
+  onPreview?: (filename: string, deckTitle: string | undefined, threadId: string) => void
+}) {
+  const filename = deckArtifactFilename(artifactPaths)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  if (!filename) return null
+
+  const deckTitle = title || filename.replace(/\.pptx$/i, '')
+
+  const handleDownload = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await fetch(`/runs/${threadId}/decks/${encodeURIComponent(filename)}`)
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { detail?: string }
+        throw new Error(body.detail || `Download failed (${res.status})`)
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      anchor.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Download failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-[#1e1e2a] bg-[#07070f] px-4 py-3 space-y-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-zinc-200 truncate">{deckTitle}</p>
+          <p className="text-[11px] text-zinc-600">PowerPoint deck · {filename}</p>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <button
+            type="button"
+            onClick={() => onPreview?.(filename, deckTitle, threadId)}
+            className="px-2.5 py-1 rounded-md border border-indigo-500/40 text-[11px] text-indigo-300 hover:bg-indigo-500/10 transition-colors"
+          >
+            Preview
+          </button>
+          <button
+            type="button"
+            onClick={handleDownload}
+            disabled={busy}
+            className="px-2.5 py-1 rounded-md border border-[#252535] text-[11px] text-zinc-300 hover:text-zinc-100 hover:border-[#33334a] transition-colors disabled:opacity-50"
+          >
+            {busy ? '…' : 'Download'}
+          </button>
+        </div>
+      </div>
+      {error && <p className="text-[10px] text-red-300/90">{error}</p>}
+    </div>
+  )
+}
+
 function DcfReportDownloadMenu({ threadId }: { threadId: string }) {
   const [format, setFormat] = useState<'pdf' | 'md'>('pdf')
   const [busy, setBusy] = useState(false)
@@ -256,7 +336,16 @@ function EvidenceSourceDrawer({
 
 // ── Individual message renderers ─────────────────────────────────────────────
 
-function UserBubble({ content }: { content: string }) {
+function UserBubble({
+  content,
+  onEdit,
+}: {
+  content: string
+  onEdit?: (newContent: string) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(content)
+
   // Rerun diff messages are pre-formatted in monospace columns; render with
   // a mono font + indigo accent so they look like a system event card rather
   // than a typed user message.
@@ -270,8 +359,77 @@ function UserBubble({ content }: { content: string }) {
       </div>
     )
   }
+
+  if (editing && onEdit) {
+    const trimmed = draft.trim()
+    const unchanged = trimmed === content.trim()
+    const submit = () => {
+      if (!trimmed || unchanged) return
+      onEdit(trimmed)
+      setEditing(false)
+    }
+    return (
+      <div className="flex justify-end animate-fade-up">
+        <div className="max-w-[72%] w-[72%] flex flex-col gap-2">
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault()
+                submit()
+              } else if (e.key === 'Escape') {
+                e.preventDefault()
+                setDraft(content)
+                setEditing(false)
+              }
+            }}
+            rows={Math.min(8, Math.max(2, draft.split('\n').length))}
+            className="w-full px-4 py-2.5 rounded-2xl bg-[#1a1a24] border border-indigo-500/40 text-sm text-zinc-100 leading-relaxed resize-none focus:outline-none focus:border-indigo-400"
+          />
+          <div className="flex items-center justify-end gap-2 text-[11px]">
+            <span className="text-zinc-600 mr-auto">⌘/Ctrl + Enter to send · Esc to cancel</span>
+            <button
+              type="button"
+              onClick={() => { setDraft(content); setEditing(false) }}
+              className="px-2.5 py-1 rounded-md border border-[#252535] text-zinc-400 hover:text-zinc-200 hover:border-[#33334a]"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={!trimmed || unchanged}
+              onClick={submit}
+              className="px-2.5 py-1 rounded-md bg-indigo-500/80 text-white disabled:opacity-40 disabled:cursor-not-allowed hover:bg-indigo-500"
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className="flex justify-end animate-fade-up">
+    <div className="group flex justify-end items-start gap-1.5 animate-fade-up">
+      {onEdit && (
+        <button
+          type="button"
+          onClick={() => { setDraft(content); setEditing(true) }}
+          title="Edit message"
+          className="mt-1 opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 flex items-center justify-center rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-[#1a1a22]"
+        >
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+            <path
+              d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61Z"
+              stroke="currentColor"
+              strokeWidth="1.4"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+      )}
       <div className="max-w-[72%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-[#1a1a24] border border-[#252535]">
         <p className="text-sm text-zinc-200 leading-relaxed whitespace-pre-wrap">{content}</p>
       </div>
@@ -325,6 +483,7 @@ function ChatBubble({
   hideLabel,
   validity,
   invalidationReason,
+  onOpenDeckPreview,
 }: {
   content: string
   streaming?: boolean
@@ -344,6 +503,7 @@ function ChatBubble({
   hideLabel?: boolean
   validity?: 'valid' | 'invalid' | 'adjusting'
   invalidationReason?: string
+  onOpenDeckPreview?: (filename: string, deckTitle: string | undefined, threadId: string) => void
 }) {
   const useUnified = !!(activities && activities.length)
   const calls = toolCalls ?? []
@@ -352,6 +512,7 @@ function ChatBubble({
     ? activities!.some(a => a.status === 'started' || a.status === 'running')
     : calls.some(t => t.status === 'running')
   const hasAnyActivity = useUnified ? activities!.length > 0 : calls.length > 0
+  const deckFilename = deckArtifactFilename(artifactPaths)
 
   // Activity defaults: open while we're still working (no content yet),
   // collapsed once the assistant message is present so the response stays
@@ -371,6 +532,7 @@ function ChatBubble({
               toolCalls={useUnified ? undefined : calls}
               activities={useUnified ? activities : undefined}
               scope={useUnified ? 'chat' : undefined}
+              variant="inline"
               defaultOpen={defaultOpen || !!dcfReview}
               dcfReview={dcfReview}
               onDcfApprove={onDcfApprove}
@@ -389,7 +551,16 @@ function ChatBubble({
                 citationMap={dcfCitationMap}
               />
             ) : (
-              <MarkdownRenderer content={content} streaming={streaming} />
+              <>
+                <MarkdownRenderer content={content} streaming={streaming} />
+                {!streaming && deckFilename && threadId && (
+                  <DeckArtifactCard
+                    threadId={threadId}
+                    artifactPaths={artifactPaths}
+                    onPreview={onOpenDeckPreview}
+                  />
+                )}
+              </>
             )
           ) : !persisted ? (
             <ThinkingDots />
@@ -562,6 +733,7 @@ function ResearchStatusCard({ run }: { run: AgentRunState }) {
   else if (status === 'awaiting_approval') label = 'Plan ready — review in the sidebar'
   else if (status === 'workflow_running') label = 'Running deterministic workflow…'
   else if (status === 'awaiting_assumptions') label = 'Assumptions ready — review in the sidebar'
+  else if (status === 'awaiting_outline_review') label = 'Deck outline ready — review in the sidebar'
   else if (status === 'executing') {
     label = running
       ? `Step ${completed_steps + 1}/${total} — ${running.description.length > 55 ? running.description.slice(0, 55) + '…' : running.description}`
@@ -602,10 +774,19 @@ function ThinkingDots() {
 
 // ── Committed message renderer ────────────────────────────────────────────────
 
-function CommittedMessage({ msg }: { msg: SessionMessage }) {
+function CommittedMessage({
+  msg,
+  onOpenDeckPreview,
+  onEdit,
+}: {
+  msg: SessionMessage
+  onOpenDeckPreview?: (filename: string, deckTitle: string | undefined, threadId: string) => void
+  onEdit?: (newContent: string) => void
+}) {
   if (msg.type === 'user') {
     if (msg.content.startsWith('[DCF_APPROVED]')) return null
-    return <UserBubble content={msg.content} />
+    if (msg.content.startsWith('[DECK_COMPLETE]')) return null
+    return <UserBubble content={msg.content} onEdit={onEdit} />
   }
   if (msg.type === 'chat_response') {
     return (
@@ -620,6 +801,7 @@ function CommittedMessage({ msg }: { msg: SessionMessage }) {
         persisted
         validity={msg.validity}
         invalidationReason={msg.invalidationReason}
+        onOpenDeckPreview={onOpenDeckPreview}
       />
     )
   }
@@ -742,9 +924,30 @@ interface Props {
   onSelectDoc?: (docId: string) => void
   onRemoveDoc?: (docId: string) => void
   disabled?: boolean
+  onOpenDeckPreview?: (filename: string, deckTitle: string | undefined, threadId: string) => void
+  /**
+   * Optional handler for amending a previously-sent user message. When omitted,
+   * the edit affordance on user bubbles is hidden. Receives the index of the
+   * message in `session.messages` and the new content typed by the user.
+   */
+  onAmendMessage?: (messageIndex: number, originalContent: string, newContent: string) => void
 }
 
-export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit, onUpload, docs = [], selectedDocId, onSelectDoc, onRemoveDoc, disabled }: Props) {
+export function MessageThread({
+  session,
+  activeRun,
+  mode,
+  onModeChange,
+  onSubmit,
+  onUpload,
+  docs = [],
+  selectedDocId,
+  onSelectDoc,
+  onRemoveDoc,
+  disabled,
+  onOpenDeckPreview,
+  onAmendMessage,
+}: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
   const messages = session?.messages ?? []
 
@@ -795,8 +998,17 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
         ) : (
           <div className="max-w-3xl mx-auto px-6 py-8 space-y-6">
             {/* Committed session messages */}
-            {messages.map(msg => (
-              <CommittedMessage key={msg.id} msg={msg} />
+            {messages.map((msg, idx) => (
+              <CommittedMessage
+                key={msg.id}
+                msg={msg}
+                onOpenDeckPreview={onOpenDeckPreview}
+                onEdit={
+                  onAmendMessage && !runActive && msg.type === 'user'
+                    ? (newContent) => onAmendMessage(idx, msg.content, newContent)
+                    : undefined
+                }
+              />
             ))}
 
             {/* Live: user message before session commit is visible.
@@ -857,6 +1069,7 @@ export function MessageThread({ session, activeRun, mode, onModeChange, onSubmit
                   hideLabel={hideLabel}
                   validity={liveValidity}
                   invalidationReason={liveInvalidationReason}
+                  onOpenDeckPreview={onOpenDeckPreview}
                 />
               )
             })}

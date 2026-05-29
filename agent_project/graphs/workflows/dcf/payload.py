@@ -425,6 +425,34 @@ def extract_dcf_report_from_tool_pointer(content: str) -> str | None:
     return None
 
 
+def extract_dcf_payload_from_tool_pointer(content: str) -> dict[str, Any] | None:
+    """Return the full dcf_output JSON dict from a run_dcf_workflow tool pointer."""
+    try:
+        pointer = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(pointer, dict):
+        return None
+    if pointer.get("tool_name") != "run_dcf_workflow" or pointer.get("dcf_hitl"):
+        return None
+
+    tool_result_id = pointer.get("tool_result_id")
+    if not tool_result_id:
+        return _load_persisted_dcf_payload()
+
+    from utils import get_run_dir  # noqa: PLC0415
+
+    file_path = get_run_dir() / "tool_results" / f"{tool_result_id}.json"
+    if not file_path.exists():
+        return _load_persisted_dcf_payload()
+    try:
+        stored = json.loads(file_path.read_text(encoding="utf-8"))
+        payload = json.loads(stored.get("result") or "{}")
+    except (json.JSONDecodeError, OSError, TypeError):
+        return _load_persisted_dcf_payload()
+    return payload if isinstance(payload, dict) and payload.get("ticker") else _load_persisted_dcf_payload()
+
+
 def dcf_source_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     """Evidence payload needed by the report citation drawer."""
     registry = SourceRegistry.from_payload(payload)

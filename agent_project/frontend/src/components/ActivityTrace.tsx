@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useRef } from 'react'
 import type { ConfidenceBreakdown, DcfReviewState, EvidenceItem, StepState, ToolCall } from '../types'
 import type { ActivityEntry, ActivityScope } from '../lib/activity'
 import { activityStatusToToolStatus } from '../lib/activity'
-import { cleanToolSummary, getToolDisplay } from '../lib/toolLabels'
+import { cleanToolSummary, getToolDisplay, summarizeToolActions } from '../lib/toolLabels'
 
 // Re-export for backward compat
 export { activityStatusToToolStatus }
@@ -85,13 +85,21 @@ function groupActivities(entries: ActivityEntry[], scope?: ActivityScope): RowIt
     }
   }
 
-  // Check if a workflow:dcf group exists — suppress flat run_dcf_workflow row
-  const hasDcfGroup = filtered.some(e => e.kind === 'workflow' && e.name === 'workflow:dcf')
+  // For every workflow group present, suppress the flat tool row that spawned it
+  // (e.g. workflow:dcf group → hide run_dcf_workflow row; workflow:deck → hide
+  // run_deck_workflow).  Convention: tool name is `run_<workflow>_workflow`.
+  const suppressedToolNames = new Set<string>()
+  for (const e of filtered) {
+    if (e.kind === 'workflow' && e.name.startsWith('workflow:')) {
+      const wfId = e.name.split(':')[1]
+      if (wfId) suppressedToolNames.add(`run_${wfId}_workflow`)
+    }
+  }
 
   const result: RowItem[] = []
   for (const e of filtered) {
     if (childIds.has(e.activity_id)) continue
-    if (hasDcfGroup && e.kind === 'tool' && e.name === 'run_dcf_workflow') continue
+    if (e.kind === 'tool' && suppressedToolNames.has(e.name)) continue
     if (e.kind === 'workflow' || childrenByParent.has(e.activity_id)) {
       // Attach subChildren to any child that is itself a subgroup container
       const rawChildren = childrenByParent.get(e.activity_id) ?? []
@@ -1947,6 +1955,7 @@ export function ActivityTrace({
   defaultOpen,
   label = 'Activity',
   emptyHint,
+  variant = 'panel',
   dcfReview,
   onDcfApprove,
   onDcfReject,
@@ -1959,11 +1968,15 @@ export function ActivityTrace({
   defaultOpen?: boolean
   label?: string
   emptyHint?: string
+  /** `panel` = bordered box (right-bar / report card). `inline` = borderless
+   *  conversational summary line rendered in the chat flow. */
+  variant?: 'panel' | 'inline'
   dcfReview?: DcfReviewState
   onDcfApprove?: (overrides?: Record<string, number>) => void
   onDcfReject?: () => void
   threadId?: string
 }) {
+  const inline = variant === 'inline'
   const [open, setOpen] = useState<boolean>(defaultOpen ?? !!dcfReview)
 
   const grouped = useMemo<RowItem[] | null>(() => {
@@ -2011,21 +2024,31 @@ export function ActivityTrace({
     summaryText = `${done}/${total} done · ${running} running${errors ? ` · ${errors} error${errors === 1 ? '' : 's'}` : ''}`
   } else if (errors > 0) {
     summaryText = `${done}/${total} done · ${errors} error${errors === 1 ? '' : 's'}`
+  } else if (inline) {
+    // Settled inline strip: ChatGPT-style aggregated phrasing, e.g.
+    // "Searched web ×2 · Calculated". Falls back to step count if empty.
+    const names =
+      grouped !== null
+        ? grouped.map(item => (item.kind === 'group' ? item.parent.name : item.entry.name))
+        : flatRows.map(tc => tc.tool_name)
+    summaryText = summarizeToolActions(names) || `${total} step${total === 1 ? '' : 's'}`
   } else {
     summaryText = `${total} step${total === 1 ? '' : 's'}`
   }
 
   return (
-    <div className="rounded-lg border border-[#1c1c1c] bg-[#0c0c0c] overflow-hidden">
+    <div className={inline ? 'overflow-hidden' : 'rounded-lg border border-[#1c1c1c] bg-[#0c0c0c] overflow-hidden'}>
       <button
         onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[11px] hover:bg-[#101010] transition-colors"
+        className={inline
+          ? 'w-full flex items-center gap-2 py-1 text-left text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors'
+          : 'w-full flex items-center gap-2 px-3 py-1.5 text-left text-[11px] hover:bg-[#101010] transition-colors'}
       >
         <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
           running > 0 ? 'bg-indigo-400 animate-pulse' : errors > 0 ? 'bg-red-500' : 'bg-emerald-500'
         }`} />
-        <span className="text-zinc-400 font-medium tracking-wide">{label}</span>
-        <span className="text-zinc-700">·</span>
+        {!inline && <span className="text-zinc-400 font-medium tracking-wide">{label}</span>}
+        {!inline && <span className="text-zinc-700">·</span>}
         <span className="text-zinc-600">{summaryText}</span>
         <span className="ml-auto text-zinc-700">
           <svg width="9" height="9" viewBox="0 0 8 8" fill="none"
@@ -2037,7 +2060,7 @@ export function ActivityTrace({
 
       <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
         <div className="overflow-hidden">
-          <div className="border-t border-[#161616] px-3 py-2 space-y-1.5">
+          <div className={inline ? 'pl-3.5 py-1.5 space-y-1.5' : 'border-t border-[#161616] px-3 py-2 space-y-1.5'}>
             {grouped !== null
               ? grouped.map((item, i) =>
                   item.kind === 'group'

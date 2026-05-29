@@ -3,6 +3,7 @@
 import contextlib
 import contextvars
 import json
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,11 @@ _dcf_hitl_payload_ctx: contextvars.ContextVar[dict | None] = contextvars.Context
     default=None,
 )
 
+_deck_hitl_payload_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "deck_hitl_payload",
+    default=None,
+)
+
 
 def set_ui_event_handler(handler: Any) -> None:
     """Register a callback that receives fine-grained execution events."""
@@ -63,6 +69,16 @@ def set_dcf_hitl_payload(payload: dict | None) -> None:
 def get_dcf_hitl_payload() -> dict | None:
     """Retrieve stored DCF HITL payload."""
     return _dcf_hitl_payload_ctx.get()
+
+
+def set_deck_hitl_payload(payload: dict | None) -> None:
+    """Store deck-workflow HITL payload (outline review) for inter-thread access."""
+    _deck_hitl_payload_ctx.set(payload)
+
+
+def get_deck_hitl_payload() -> dict | None:
+    """Retrieve stored deck HITL payload."""
+    return _deck_hitl_payload_ctx.get()
 
 
 def emit_ui_event(event: dict) -> None:
@@ -314,6 +330,108 @@ def list_artifact_paths() -> list[str]:
     run_dir = get_run_dir()
     artifacts_dir = get_artifacts_dir()
     return sorted(str(path.relative_to(run_dir)) for path in artifacts_dir.iterdir() if path.is_file())
+
+
+def relative_run_path(path: str | Path | None) -> str | None:
+    """Return a run-relative path (e.g. ``decks/foo.pptx``) for API linking."""
+    if not path:
+        return None
+    p = Path(path)
+    run_dir = get_run_dir()
+    try:
+        return str(p.resolve().relative_to(run_dir.resolve()))
+    except ValueError:
+        parts = p.parts
+        if "decks" in parts:
+            idx = parts.index("decks")
+            return str(Path(*parts[idx:]))
+        return None
+
+
+def find_latest_deck_pptx(run_dir: Path | None = None) -> Path | None:
+    """Return the newest PPTX under ``runs/<thread>/decks/``."""
+    base = run_dir or get_run_dir()
+    decks_dir = base / "decks"
+    if not decks_dir.is_dir():
+        return None
+    candidates = list(decks_dir.glob("*.pptx"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def list_deck_artifact_paths(run_dir: Path | None = None) -> list[str]:
+    """Deck PPTX paths relative to the run directory."""
+    base = run_dir or get_run_dir()
+    latest = find_latest_deck_pptx(base)
+    if latest is None:
+        return []
+    try:
+        return [str(latest.relative_to(base))]
+    except ValueError:
+        return [f"decks/{latest.name}"]
+
+
+def run_dir_for_thread(thread_id: str) -> Path:
+    """Absolute run directory for a chat/workflow thread id."""
+    return RUNS_DIR / thread_id
+
+
+def _adopt_deck_dir_from_fallback(run_dir: Path) -> Path:
+    """Copy deck artifacts from ``runs/_default/decks`` into ``run_dir/decks``."""
+    fallback = RUNS_DIR / "_default" / "decks"
+    if not fallback.is_dir():
+        return run_dir / "decks"
+    dest = run_dir / "decks"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in ("deck_output.json",):
+        src = fallback / name
+        if src.is_file() and not (dest / name).exists():
+            shutil.copy2(src, dest / name)
+    for src in fallback.glob("*.pptx"):
+        dest_file = dest / src.name
+        if not dest_file.exists():
+            shutil.copy2(src, dest_file)
+    return dest
+
+
+def resolve_deck_pptx_path(thread_id: str, filename: str) -> Path | None:
+    """Locate a deck PPTX for API download; adopts from ``_default`` when needed."""
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        return None
+    run_dir = run_dir_for_thread(thread_id)
+    primary = run_dir / "decks" / safe_name
+    if primary.exists():
+        return primary
+
+    fallback = RUNS_DIR / "_default" / "decks" / safe_name
+    if fallback.exists():
+        adopted = _adopt_deck_dir_from_fallback(run_dir) / safe_name
+        if adopted.exists():
+            return adopted
+        return fallback
+
+    latest = find_latest_deck_pptx(run_dir)
+    if latest is not None and latest.name == safe_name:
+        return latest
+    return None
+
+
+def resolve_deck_output_path(thread_id: str) -> Path | None:
+    """Locate ``deck_output.json`` for slide preview."""
+    run_dir = run_dir_for_thread(thread_id)
+    primary = run_dir / "decks" / "deck_output.json"
+    if primary.exists():
+        return primary
+
+    fallback = RUNS_DIR / "_default" / "decks" / "deck_output.json"
+    if fallback.exists():
+        adopted = _adopt_deck_dir_from_fallback(run_dir) / "deck_output.json"
+        if adopted.exists():
+            return adopted
+        return fallback
+    return None
 
 
 def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -> str:

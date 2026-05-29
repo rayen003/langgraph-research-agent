@@ -188,17 +188,32 @@ class KGCache:
         node_id = make_node_id(ticker, node_type, field, run_id)
         node = self._nodes.get(node_id)
         if not node:
+            logger.info("KG GET miss ticker=%s type=%s field=%s reason=not_present",
+                        ticker, node_type, field)
             return None
 
         # TTL check
         age = time.time() - float(node.get("updated_at", 0))
         if age > _ttl_for(node_type):
+            logger.info(
+                "KG GET miss ticker=%s type=%s field=%s reason=stale age=%.0fs ttl=%.0fs",
+                ticker, node_type, field, age, _ttl_for(node_type),
+            )
             return None
 
         # Confidence floor
         if float(node.get("confidence", 0)) < CONFIDENCE_FLOOR:
+            logger.info(
+                "KG GET miss ticker=%s type=%s field=%s reason=low_confidence conf=%.2f floor=%.2f",
+                ticker, node_type, field, float(node.get("confidence", 0)), CONFIDENCE_FLOOR,
+            )
             return None
 
+        logger.info(
+            "KG GET hit ticker=%s type=%s field=%s age=%.0fs conf=%.2f source=%s",
+            ticker, node_type, field, age, float(node.get("confidence", 0)),
+            node.get("source", "?"),
+        )
         # Compound staleness — caller checks externally via evidence_hash
         # (we expose age + input_hash for that)
 
@@ -283,11 +298,17 @@ class KGCache:
         with self._lock:
             self._nodes[node_id] = node
 
+        value_preview = repr(value)[:80]
+        logger.info(
+            "KG PUT ticker=%s type=%s field=%s source=%s conf=%.2f run=%s value=%s",
+            ticker, node_type, field, source, confidence, run_id or "-", value_preview,
+        )
         return node
 
     def invalidate(self, node_id: str) -> None:
         with self._lock:
-            self._nodes.pop(node_id, None)
+            removed = self._nodes.pop(node_id, None)
+        logger.info("KG INVALIDATE id=%s removed=%s", node_id, removed is not None)
 
     def add_edge(
         self,
@@ -324,6 +345,10 @@ class KGCache:
             # dedup by id
             bucket[:] = [e for e in bucket if e.get("id") != edge_id]
             bucket.append(edge)
+        logger.info(
+            "KG EDGE add src=%s relation=%s tgt=%s source=%s conf=%.2f",
+            src_id, relation, tgt_id, source, confidence,
+        )
         return edge
 
     def remove_edge(self, edge_id: str) -> None:
@@ -331,6 +356,7 @@ class KGCache:
         with self._lock:
             for bucket in self._edges_by_src.values():
                 bucket[:] = [e for e in bucket if e.get("id") != edge_id]
+        logger.info("KG EDGE remove id=%s", edge_id)
 
     # ── Subgraph queries (for UI panel + injection) ─────────────────────────
 
@@ -345,6 +371,14 @@ class KGCache:
                     e for e in self._edges_by_src[src_id]
                     if e.get("tgt_id") in node_ids
                 )
+        type_counts: dict[str, int] = {}
+        for n in nodes:
+            t = str(n.get("node_type", "?"))
+            type_counts[t] = type_counts.get(t, 0) + 1
+        logger.info(
+            "KG SUBGRAPH ticker=%s nodes=%d edges=%d types=%s",
+            ticker, len(nodes), len(edges), type_counts,
+        )
         return nodes, edges
 
     def get_drivers(self, ticker: str) -> list[KGNode]:
@@ -387,6 +421,10 @@ class KGCache:
         if since_ts is not None:
             items = [n for n in items if float(n.get("created_at", 0)) >= since_ts]
         items.sort(key=lambda n: float(n.get("created_at", 0)), reverse=True)
+        logger.info(
+            "KG ANCHORED ticker=%s types=%s since_ts=%s returned=%d",
+            ticker, sorted(types), since_ts, len(items),
+        )
         return items
 
     def get_recent_run_assumptions(
@@ -405,6 +443,10 @@ class KGCache:
             if field and field not in seen_fields:
                 out[field] = n.get("value")
                 seen_fields.add(field)
+        logger.info(
+            "KG RECENT_ASSUMPTIONS ticker=%s limit=%d fields=%s",
+            ticker, limit, sorted(out.keys()),
+        )
         return out
 
     # ── Hashing for compound staleness ───────────────────────────────────────
