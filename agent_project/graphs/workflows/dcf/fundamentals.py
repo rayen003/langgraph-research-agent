@@ -156,6 +156,32 @@ def _compute_fcff_components(
     return {"fcff": fcff, "tax_rate": tax_rate, "fcf": float(fcf_raw)}
 
 
+def fetch_latest_reported_period(ticker: str) -> str | None:
+    """Cheap single-call probe for the latest reported annual fiscal period.
+
+    Returns the ``date`` (period end, ``YYYY-MM-DD``) of the most recent annual
+    income statement, or None when unavailable. One small request — ~1/5 the
+    cost of a full fundamentals hydrate — used to detect fiscal-period rotation
+    (a fresh earnings report) so cached fundamentals can be invalidated even
+    within their TTL window. Result is cached in the KG (``market_period``,
+    24h TTL) so this only fires on a cold period cache.
+    """
+    api_key = (
+        os.getenv("FMP_API_KEY")
+        or os.getenv("FINANCIAL_MODELING_PREP_API_KEY")
+    )
+    if not api_key:
+        return None
+    rows = _fmp_get_json(
+        f"income-statement?symbol={ticker}&period=annual&limit=1", api_key
+    )
+    if rows and isinstance(rows[0], dict):
+        date = rows[0].get("date")
+        if isinstance(date, str) and date:
+            return date
+    return None
+
+
 def _fetch_fundamentals_fmp(ticker: str) -> dict[str, dict[str, Any]]:
     """Pull canonical fundamentals from FMP, normalized to millions."""
     api_key = (

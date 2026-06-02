@@ -58,6 +58,43 @@ _TICKER_ALIASES: dict[str, str] = {
 }
 
 
+# Schema description injected into the LLM prompt so retrieval is structure-aware
+# (3-layer KG: durable knowledge / run artifacts / evidence). Keep in sync with
+# the node types written by the DCF + deck workflows and the evidence layer.
+_KG_SCHEMA = """\
+KNOWLEDGE GRAPH SCHEMA (3 layers):
+
+Layer 1 — Durable company knowledge (slow-changing, hash-checked):
+  • company            : the ticker anchor.
+  • company_synthesis  : LLM synthesis of the business — lifecycle stage, margin
+                         trajectory, capital-return policy, growth outlook,
+                         growth_drivers. THIS IS THE PRIMARY JUSTIFICATION for
+                         the assumptions chosen in a DCF run.
+  • thesis             : bull/bear thesis + key_drivers (direction, conviction).
+  • driver / risk / theme : individual qualitative factors moving the stock.
+  • user_belief        : analyst-stated override / conviction.
+
+Layer 2 — DCF run artifacts (immutable per run, keyed by run_id):
+  • dcf_run            : a single valuation run (horizon, timestamp).
+  • run_assumption     : ONE assumption used by the run (revenue_growth, wacc,
+                         fcff_margin, tax_rate, terminal_growth, base_revenue,
+                         net_debt, shares_outstanding, …). A run_assumption's
+                         VALUE is a number; its JUSTIFICATION lives in Layer 1
+                         (company_synthesis growth_outlook + drivers/thesis).
+  • run_output         : a computed result (implied_share_price, equity_value,
+                         enterprise_value, terminal_pv, pv_cash_flows).
+  • run_scenario       : bull/base/bear scenario output.
+
+Layer 3 — Evidence (provenance for Layer 1):
+  • news_item, filing, market_metric_fund, market_metric_price, company_lifecycle.
+
+RELATIONS: company -HAS_RUN-> dcf_run; dcf_run -PRODUCES-> run_output;
+dcf_run -LOCKED_ASSUMPTION-> run_assumption; company -HAS_SYNTHESIS-> synthesis;
+company -HAS_THESIS-> thesis; company -HAS_DRIVER-> driver; dcf_run -HAS_DECK->
+deck_run. NOTE: there is NO direct edge from a run_assumption to the synthesis
+or drivers that justify it — you must connect them by shared ticker."""
+
+
 class KGQuery(BaseModel):
     """Structured query extracted from natural language (DETERMINISTIC FALLBACK).
 
@@ -440,6 +477,38 @@ def _serialize_subgraph(nodes: list[KGNode], cache) -> str:
     return "\n".join(lines)
 
 
+_WHY_TRIGGERS = ("why", "justif", "reason", "rationale", "because", "based on", "support")
+
+
+def _augment_with_evidence(
+    question: str, matched: list[KGNode], cache
+) -> list[KGNode]:
+    """For causal questions about an assumption, fold in the company's synthesis
+    + drivers as supporting evidence (no direct edge links them in the KG)."""
+    q = (question or "").lower()
+    if not any(t in q for t in _WHY_TRIGGERS):
+        return matched
+    tickers = {
+        n.get("ticker") for n in matched
+        if n.get("node_type") == "run_assumption" and n.get("ticker")
+    }
+    if not tickers:
+        return matched
+
+    seen = {m["id"] for m in matched}
+    augmented = list(matched)
+    for tk in tickers:
+        for n in cache._nodes.values():  # noqa: SLF001
+            if n.get("ticker") != tk or n.get("node_type") != "company_synthesis":
+                continue
+            if n["id"] not in seen:
+                seen.add(n["id"]); augmented.append(n)
+        for d in cache.get_drivers(str(tk)):
+            if d["id"] not in seen:
+                seen.add(d["id"]); augmented.append(d)
+    return augmented
+
+
 async def _llm_answer_subgraph(
     question: str, ticker: str, cache, rev: dict[str, list[dict[str, Any]]]
 ) -> dict[str, Any]:
@@ -456,19 +525,38 @@ async def _llm_answer_subgraph(
     serialized = _serialize_subgraph(nodes, cache)
     prompt = (
         "You answer analyst questions using ONLY the knowledge-graph subgraph below.\n"
-        "Never invent facts. If the answer isn't present, say so.\n"
-        "Match intent loosely: e.g. 'revenue' may map to base_revenue, "
-        "revenue_growth, or revenue_growth_terminal — include all relevant nodes.\n\n"
+        "Never invent facts. If the answer isn't present, say so.\n\n"
+        f"{_KG_SCHEMA}\n\n"
+        "RETRIEVAL RULES:\n"
+        "- Match loosely: 'revenue' may map to base_revenue, revenue_growth, or "
+        "revenue_growth_terminal — include ALL relevant nodes.\n"
+        "- For CAUSAL questions ('why did we pick X', 'what justifies X', "
+        "'rationale for X'): the answer is NOT just the assumption node. Also "
+        "cite the supporting context that explains it — company_synthesis, "
+        "driver/risk/theme, thesis, and user_belief nodes for the same ticker. "
+        "Return ALL of their ids in node_ids.\n"
+        "- If the subgraph lacks supporting context (no synthesis/drivers), say "
+        "so explicitly rather than implying provenance that isn't recorded.\n"
+        "- node_ids must list EVERY node that informs the answer, not only the "
+        "single most literal match.\n\n"
         f"Question: {question}\n"
         f"Ticker: {ticker or '(any)'}\n\n"
         f"{serialized}\n\n"
-        "Return: a concise answer, plus node_ids = the exact ids you used."
+        "Return: a concise answer, plus node_ids = every id you used."
     )
     structured = _get_query_llm().with_structured_output(KGAnswer)
     result: KGAnswer = structured.invoke(prompt)  # type: ignore[assignment]
 
     by_id = {n.get("id"): n for n in cache._nodes.values()}  # noqa: SLF001
     matched = [by_id[nid] for nid in result.node_ids if nid in by_id]
+
+    # ── Evidence augmentation for "why / justify" questions ───────────────────
+    # An assumption is justified by the company's synthesis + drivers, but no
+    # direct KG edge connects them. When the question is causal ("why did we
+    # pick…", "what justifies…") and an assumption matched, fold in that
+    # company's synthesis + drivers so their hubs light up alongside the row.
+    matched = _augment_with_evidence(question, matched, cache)
+
     traversal_path, traversal_edges = _build_traversal(matched, cache, rev)
 
     logger.info(

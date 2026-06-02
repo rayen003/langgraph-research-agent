@@ -69,6 +69,7 @@ const TOOL_DISPLAY: Record<string, ToolDisplay> = {
 const WORKFLOW_LABEL: Record<string, string> = {
   dcf: 'DCF',
   deck: 'Deck',
+  rag: 'Documents',
 }
 
 const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
@@ -109,6 +110,12 @@ const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
     assemble_pptx: 'Assembling PPTX',
     finalize_deck: 'Finalizing deck',
     adapter_failure: 'Adapter failure',
+  },
+  rag: {
+    retrieve: 'Searching documents',
+    embed_query: 'Matching by meaning',
+    keyword_rank: 'Matching by keywords',
+    fuse: 'Ranking best passages',
   },
 }
 

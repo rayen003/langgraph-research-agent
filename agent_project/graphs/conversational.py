@@ -55,9 +55,20 @@ chat_agent_llm = llm.bind_tools(CHAT_TOOLS)
 _CHAT_SYSTEM = (
     "You are a knowledgeable financial research assistant with tool access.\n\n"
     "## Tools available\n"
-    "- search_documents: search the user's uploaded files (PDFs, spreadsheets, reports). "
-    "ALWAYS call this BEFORE search_web for any factual query — documents already uploaded may contain exactly what you need. "
-    "Only fall back to search_web if search_documents returns no relevant results.\n"
+    "- search_documents returns a relevance verdict with the relevant passages INLINE: "
+    "{status: relevant|partial|mismatch|none, covered: [...], missing: [...], chunks: [{text, source, page, ticker}, ...]}. "
+    "ALWAYS call this BEFORE search_web for any factual query. The `chunks` array already holds the full passage text — "
+    "answer directly from it; there is NO separate fetch step. "
+    "Pass a CONTENT query (key topics/metrics like 'revenue growth margins guidance'), "
+    "NOT a meta word like 'analysis' or 'summary' — vague queries retrieve poorly.\n"
+    "* status='relevant': all needed content is in `chunks` → answer from them.\n"
+    "* status='partial': `chunks` cover some of what's asked, missing topics listed → answer from chunks + search_web for missing.\n"
+    "* status='mismatch': docs are about DIFFERENT entities than what the user asked → "
+    "TELL the user: 'The uploaded document appears to be about [company from docs], but you asked about [user's topic]. Which should I analyze?' "
+    "Do NOT silently fall back to search_web on mismatch. Ask the user.\n"
+    "* status='gate_skipped': passed skip_gate=True — `chunks` array has full text + metadata, evaluate relevance yourself.\n"
+    "* status='none': no docs or no matches → proceed with search_web.\n"
+    "Pass skip_gate=True when you already know the docs from prior turns — saves ~1-2s latency.\n"
     "- fetch_sec_filing: fetch 10-K/10-Q filings from SEC EDGAR. Use for company risks, MD&A, or business overview — prefer over search_web for company fundamentals.\n"
     "- search_web: look up current news, prices, filings, or factual information NOT found in uploaded documents. "
     "Returns a tool_result_id pointer + one-line summary — you MUST call retrieve_tool_result to read the full content.\n"
@@ -391,6 +402,11 @@ def _direct_dcf_approval(messages: list) -> dict | None:
         "assumption_review_mode": False,
         "assumption_overrides": {k: v for k, v in overrides.items()},
     }
+    # Lineage: when the approval came from rerunning an existing KG run, link
+    # the new run to its parent so the KG records the derivation chain.
+    parent_run_id = payload.get("parent_run_id")
+    if parent_run_id:
+        args["parent_run_id"] = parent_run_id
 
     chat_t = agent_log.chat_start()
     emit_ui_event({"type": "chat_start"})
@@ -438,6 +454,49 @@ def _direct_dcf_approval(messages: list) -> dict | None:
     return {"messages": [AIMessage(content=final_text)]}
 
 
+def _build_doc_inventory(session_id: str) -> str:
+    """List uploaded documents (+ extracted entities) for the system prompt.
+
+    Without this the agent is blind to uploads — it asks the user to "please
+    upload" even when a doc is already indexed. Surfacing the inventory makes
+    the agent call search_documents instead of stalling.
+    """
+    if not session_id:
+        return ""
+    try:
+        from documents import list_docs  # noqa: PLC0415
+
+        docs = list_docs(session_id)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    ready = [d for d in docs if d.get("status") == "ready"]
+    pending = [d for d in docs if d.get("status") == "processing"]
+    if not ready and not pending:
+        return ""
+
+    lines = ["\n\n## Uploaded documents (this session)"]
+    for d in ready:
+        ent = []
+        if d.get("company"):
+            ent.append(str(d["company"]))
+        if d.get("ticker"):
+            ent.append(str(d["ticker"]))
+        if d.get("doc_type"):
+            ent.append(str(d["doc_type"]).replace("_", " "))
+        if d.get("fiscal_period"):
+            ent.append(str(d["fiscal_period"]))
+        meta = f" — {', '.join(ent)}" if ent else ""
+        lines.append(f"- {d.get('filename', 'document')}{meta} [ready]")
+    for d in pending:
+        lines.append(f"- {d.get('filename', 'document')} [still indexing]")
+    lines.append(
+        "These are already indexed. When the user asks about their content, "
+        "call search_documents — do NOT ask the user to upload again."
+    )
+    return "\n".join(lines)
+
+
 def _chat_node_inner(state: dict) -> dict:
     messages = state.get("messages", [])
     session_memory = state.get("session_memory") or ""
@@ -452,6 +511,9 @@ def _chat_node_inner(state: dict) -> dict:
         return direct
 
     system_content = _CHAT_SYSTEM
+    doc_inventory = _build_doc_inventory(state.get("session_id") or "")
+    if doc_inventory:
+        system_content += doc_inventory
     if session_memory:
         system_content += f"\n\n## Prior research in this session\n{session_memory}"
     deck_nudge = _build_deck_workflow_nudge(messages)

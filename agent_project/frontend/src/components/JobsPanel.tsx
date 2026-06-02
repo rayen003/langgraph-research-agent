@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { JobSummary } from '../types'
+import { useResizable } from '../hooks/useResizable'
 
 const STATUS_COLOR: Record<string, string> = {
   classifying: 'bg-zinc-500',
@@ -42,6 +43,13 @@ interface Props {
 
 export function JobsPanel({ jobs, runningCount, onSelectJob }: Props) {
   const [open, setOpen] = useState(false)
+  const { width, handleProps } = useResizable({
+    defaultWidth: 320,
+    minWidth: 260,
+    maxWidth: 520,
+    side: 'left',
+    storageKey: 'ui.jobsPanelWidth',
+  })
 
   if (jobs.length === 0) return null
 
@@ -52,24 +60,24 @@ export function JobsPanel({ jobs, runningCount, onSelectJob }: Props) {
         onClick={() => setOpen(v => !v)}
         className="
           flex items-center gap-2 px-3 py-2 rounded-xl
-          bg-[#111114] border border-[#2a2a2a]
-          hover:border-[#3a3a3a] transition-colors duration-150
+          bg-bg-overlay border border-border-hover
+          hover:border-border-hover transition-colors duration-150
           shadow-lg shadow-black/40
         "
       >
         <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-          <rect x="1" y="1" width="5" height="5" rx="1.2" stroke="#6366f1" strokeWidth="1.2" />
-          <rect x="7" y="1" width="5" height="5" rx="1.2" stroke="#6366f1" strokeWidth="1.2" />
-          <rect x="1" y="7" width="5" height="5" rx="1.2" stroke="#6366f1" strokeWidth="1.2" />
-          <rect x="7" y="7" width="5" height="5" rx="1.2" stroke="#6366f1" strokeWidth="1.2" />
+          <rect x="1" y="1" width="5" height="5" rx="1.2" stroke="var(--color-accent-muted)" strokeWidth="1.2" />
+          <rect x="7" y="1" width="5" height="5" rx="1.2" stroke="var(--color-accent-muted)" strokeWidth="1.2" />
+          <rect x="1" y="7" width="5" height="5" rx="1.2" stroke="var(--color-accent-muted)" strokeWidth="1.2" />
+          <rect x="7" y="7" width="5" height="5" rx="1.2" stroke="var(--color-accent-muted)" strokeWidth="1.2" />
         </svg>
-        <span className="text-xs text-zinc-400 font-medium">Research</span>
+        <span className="text-xs text-ink-muted font-medium">Research</span>
         {runningCount > 0 ? (
           <span className="flex h-4 w-4 items-center justify-center rounded-full bg-indigo-600 text-[10px] text-white font-medium">
             {runningCount}
           </span>
         ) : (
-          <span className="flex h-4 w-4 items-center justify-center rounded-full bg-[#1e1e1e] border border-[#2a2a2a] text-[10px] text-zinc-600 font-medium">
+          <span className="flex h-4 w-4 items-center justify-center rounded-full bg-surface-3 border border-border-hover text-[10px] text-ink-dim font-medium">
             {jobs.length}
           </span>
         )}
@@ -78,32 +86,45 @@ export function JobsPanel({ jobs, runningCount, onSelectJob }: Props) {
       {/* Panel */}
       {open && (
         <div
+          data-resizable
+          style={{ width }}
           className="
-            absolute bottom-12 right-0 w-80
-            bg-[#0d0d0d] border border-[#1e1e1e] rounded-xl shadow-2xl shadow-black/60
-            overflow-hidden animate-fade-up
+            absolute bottom-12 right-0 relative
+            bg-bg border border-border rounded-xl shadow-2xl shadow-black/60
+            animate-fade-up
           "
         >
-          <div className="px-4 py-3 border-b border-[#1a1a1a] flex items-center justify-between">
-            <span className="text-[11px] font-medium text-zinc-500 tracking-widest uppercase">Research Jobs</span>
-            <button onClick={() => setOpen(false)} className="text-zinc-700 hover:text-zinc-400">
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize panel"
+            title="Drag to resize · double-click to reset"
+            {...handleProps}
+            className="absolute top-0 bottom-0 left-0 w-3 -translate-x-1/2 z-50 cursor-col-resize touch-none select-none group"
+          >
+            <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-surface-3/60 group-hover:bg-indigo-400/70 group-active:bg-indigo-400 transition-colors" />
+          </div>
+          <div className="overflow-hidden rounded-xl">
+          <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+            <span className="text-[11px] font-medium text-ink-dim tracking-widest uppercase">Research Jobs</span>
+            <button onClick={() => setOpen(false)} className="text-zinc-700 hover:text-ink-muted">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <path d="M2 2L10 10M10 2L2 10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
               </svg>
             </button>
           </div>
 
-          <div className="max-h-72 overflow-y-auto divide-y divide-[#141414]">
+          <div className="max-h-72 overflow-y-auto divide-y divide-border-subtle">
             {jobs.map(job => (
               <button
                 key={job.thread_id}
                 onClick={() => { onSelectJob(job); setOpen(false) }}
-                className="w-full px-4 py-3 text-left hover:bg-[#111116] transition-colors duration-100"
+                className="w-full px-4 py-3 text-left hover:bg-bg-overlay transition-colors duration-100"
               >
                 <div className="flex items-start gap-2.5">
                   <div className={`mt-1.5 w-1.5 h-1.5 rounded-full flex-shrink-0 ${STATUS_COLOR[job.status] ?? 'bg-zinc-600'}`} />
                   <div className="flex-1 min-w-0 space-y-0.5">
-                    <p className="text-xs text-zinc-300 leading-snug truncate">{job.query}</p>
+                    <p className="text-xs text-ink-muted leading-snug truncate">{job.query}</p>
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] text-zinc-700">
                         {STATUS_LABEL[job.status] ?? job.status}
@@ -123,6 +144,7 @@ export function JobsPanel({ jobs, runningCount, onSelectJob }: Props) {
                 </div>
               </button>
             ))}
+          </div>
           </div>
         </div>
       )}

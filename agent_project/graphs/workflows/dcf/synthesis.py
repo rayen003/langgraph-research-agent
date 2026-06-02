@@ -417,7 +417,7 @@ def semantic_synthesis_node(state: dict) -> dict:
     # from full synthesis (7d TTL). Future runs can short-circuit synthesis
     # if lifecycle + structured data hasn't changed.
     try:
-        from kg import get_cache  # noqa: PLC0415
+        from kg import get_cache, kg_write  # noqa: PLC0415
         cache = get_cache()
         session_id = state.get("session_id") or ""
         lifecycle_value = {
@@ -432,7 +432,7 @@ def semantic_synthesis_node(state: dict) -> dict:
             confidence_score = {"high": 0.9, "medium": 0.7, "low": 0.5}.get(
                 confidence_label, 0.7,
             )
-            cache.put(
+            kg_write(
                 ticker=ticker,
                 node_type="company_lifecycle",
                 field="signals",

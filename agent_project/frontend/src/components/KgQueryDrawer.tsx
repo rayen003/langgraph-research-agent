@@ -30,23 +30,23 @@ export function KgQueryDrawer({ onClose, onQuery }: Props) {
   return (
     <div className="absolute inset-0 z-30 bg-black/40" onClick={onClose}>
       <div
-        className="absolute right-0 top-0 h-full w-[420px] bg-[#11111a] border-l border-[#2a2a36] shadow-2xl flex flex-col"
+        className="absolute right-0 top-0 h-full w-[420px] bg-bg-overlay border-l border-border-accent shadow-2xl flex flex-col"
         onClick={e => e.stopPropagation()}
       >
-        <div className="px-4 py-3 border-b border-[#2a2a36] flex items-center justify-between">
-          <div className="text-zinc-300 font-medium text-sm">Query Knowledge Graph</div>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300">✕</button>
+        <div className="px-4 py-3 border-b border-border-accent flex items-center justify-between">
+          <div className="text-ink-muted font-medium text-sm">Query Knowledge Graph</div>
+          <button onClick={onClose} className="text-ink-dim hover:text-ink-muted">✕</button>
         </div>
 
         <div className="p-4 space-y-3">
           <div>
-            <label className="text-[10px] uppercase text-zinc-600 tracking-wider">Question</label>
+            <label className="text-[10px] uppercase text-ink-dim tracking-wider">Question</label>
             <textarea
               value={question}
               onChange={e => setQuestion(e.target.value)}
               rows={3}
               placeholder="Ask anything about what the agent knows..."
-              className="w-full mt-1 bg-[#0a0a0a] border border-[#2a2a36] rounded px-2 py-1.5 text-zinc-200 text-[12px] placeholder:text-zinc-700"
+              className="w-full mt-1 bg-bg border border-border-accent rounded px-2 py-1.5 text-ink text-[12px] placeholder:text-ink-dim"
               onKeyDown={e => {
                 if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAsk()
               }}
@@ -54,12 +54,12 @@ export function KgQueryDrawer({ onClose, onQuery }: Props) {
           </div>
 
           <div>
-            <label className="text-[10px] uppercase text-zinc-600 tracking-wider">Ticker (optional)</label>
+            <label className="text-[10px] uppercase text-ink-dim tracking-wider">Ticker (optional)</label>
             <input
               value={ticker}
               onChange={e => setTicker(e.target.value.toUpperCase())}
               placeholder="META"
-              className="w-full mt-1 bg-[#0a0a0a] border border-[#2a2a36] rounded px-2 py-1.5 text-zinc-200 text-[12px] font-mono placeholder:text-zinc-700"
+              className="w-full mt-1 bg-bg border border-border-accent rounded px-2 py-1.5 text-ink text-[12px] font-mono placeholder:text-ink-dim"
             />
           </div>
 
@@ -73,13 +73,13 @@ export function KgQueryDrawer({ onClose, onQuery }: Props) {
 
           {!result && (
             <div>
-              <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-1">Examples</div>
+              <div className="text-[10px] uppercase text-ink-dim tracking-wider mb-1">Examples</div>
               <div className="space-y-1">
                 {EXAMPLES.map(ex => (
                   <button
                     key={ex}
                     onClick={() => setQuestion(ex)}
-                    className="block w-full text-left text-[11px] px-2 py-1 rounded bg-zinc-800/40 text-zinc-400 hover:bg-zinc-800/80 hover:text-zinc-200"
+                    className="block w-full text-left text-[11px] px-2 py-1 rounded bg-zinc-800/40 text-ink-muted hover:bg-zinc-800/80 hover:text-ink"
                   >
                     {ex}
                   </button>
@@ -90,27 +90,27 @@ export function KgQueryDrawer({ onClose, onQuery }: Props) {
         </div>
 
         {result && (
-          <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-3 border-t border-[#2a2a36] pt-3">
+          <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-3 border-t border-border-accent pt-3">
             <div>
-              <div className="text-[10px] uppercase text-zinc-600 tracking-wider">Answer</div>
-              <pre className="text-zinc-200 text-[11px] whitespace-pre-wrap mt-1 leading-relaxed">
+              <div className="text-[10px] uppercase text-ink-dim tracking-wider">Answer</div>
+              <pre className="text-ink text-[11px] whitespace-pre-wrap mt-1 leading-relaxed">
                 {result.answer}
               </pre>
             </div>
 
             {result.traversal_path.length > 0 && (
               <div>
-                <div className="text-[10px] uppercase text-zinc-600 tracking-wider">
+                <div className="text-[10px] uppercase text-ink-dim tracking-wider">
                   Traversal path ({result.traversal_path.length} nodes)
                 </div>
                 <div className="mt-1 space-y-1">
                   {result.traversal_path.slice(0, 30).map(nid => (
-                    <div key={nid} className="text-[10px] font-mono text-zinc-500 truncate">
+                    <div key={nid} className="text-[10px] font-mono text-ink-dim truncate">
                       {nid}
                     </div>
                   ))}
                   {result.traversal_path.length > 30 && (
-                    <div className="text-[10px] text-zinc-600">
+                    <div className="text-[10px] text-ink-dim">
                       … {result.traversal_path.length - 30} more
                     </div>
                   )}

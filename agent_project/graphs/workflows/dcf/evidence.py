@@ -10,6 +10,7 @@ Source tiering (highest first):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -45,6 +46,50 @@ _EVIDENCE_BATCH_ID = f"evb_{int(time.time() * 1000)}"
 # ---------------------------------------------------------------------------
 # Evidence item builders
 # ---------------------------------------------------------------------------
+
+
+def _try_kg_fundamentals(
+    ticker: str,
+) -> dict[str, Any] | None:
+    """Try to load fundamentals from the KG cache.
+
+    If the KG has a ``financials_hub`` node for this ticker with a
+    recent ``as_of`` date, populate fundamentals directly from cached
+    data and skip the FMP/yfinance API calls entirely.
+
+    Returns None if no warm cache exists (APIs must be called).
+    """
+    try:
+        from kg import get_cache  # noqa: PLC0415
+        cache = get_cache()
+        hub = cache.get_nearest(
+            ticker=ticker,
+            node_type="financials_hub",
+            field="recent",
+        )
+        if not hub or not isinstance(hub, dict):
+            return None
+        hub_value = hub.get("value") if isinstance(hub, dict) else None
+        if not isinstance(hub_value, dict):
+            return None
+        # Check freshness: skip if data is too old or missing
+        as_of = hub_value.get("as_of")
+        if not as_of:
+            return None
+        # Reconstruct fundamentals from cached fields
+        fundamentals = hub_value.get("fundamentals", {})
+        profile_meta = hub_value.get("profile_meta", {})
+        dcf_extras = hub_value.get("dcf_extras", {})
+        if not fundamentals:
+            return None
+        return {
+            "fundamentals": fundamentals,
+            "profile_meta": profile_meta,
+            "dcf_extras": dcf_extras,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Evidence: KG fundamentals check failed ticker=%s err=%s", ticker, exc)
+        return None
 
 
 def _make_evidence_item(
@@ -280,25 +325,38 @@ def assemble_evidence(
             logger.warning("Evidence: SEC filings failed ticker=%s error=%s", ticker, exc)
 
     # ── Tier 2: Structured fundamentals (FMP + yfinance) ────────────────────
-    fmp_raw = _fetch_fundamentals_fmp(ticker)
-    yf_raw = _fetch_fundamentals_yfinance(ticker)
+    # Check if KG already has fresh fundamentals (from a prior DCF run or
+    # document ingestion). If the cache is warm, skip the API calls entirely.
+    kg_fundamentals = _try_kg_fundamentals(ticker)
+    if kg_fundamentals is not None:
+        fundamentals = kg_fundamentals["fundamentals"]
+        profile_meta = kg_fundamentals["profile_meta"]
+        dcf_extras = kg_fundamentals["dcf_extras"]
+        provider = "kg_cached"
+        logger.info(
+            "Evidence: Using KG-cached fundamentals ticker=%s fields=%d",
+            ticker, len(fundamentals),
+        )
+    else:
+        fmp_raw = _fetch_fundamentals_fmp(ticker)
+        yf_raw = _fetch_fundamentals_yfinance(ticker)
 
-    extras_fmp = dict(fmp_raw.pop("__dcf_extras__", {}))
-    extras_yf = dict(yf_raw.pop("__dcf_extras__", {}))
-    dcf_extras = _merge_dcf_extras(extras_fmp, extras_yf)
-    profile_meta = dict(fmp_raw.pop("__profile_meta__", {}))
+        extras_fmp = dict(fmp_raw.pop("__dcf_extras__", {}))
+        extras_yf = dict(yf_raw.pop("__dcf_extras__", {}))
+        dcf_extras = _merge_dcf_extras(extras_fmp, extras_yf)
+        profile_meta = dict(fmp_raw.pop("__profile_meta__", {}))
 
-    fundamentals = dict(fmp_raw)
-    for field, meta in yf_raw.items():
-        fundamentals.setdefault(field, meta)
+        fundamentals = dict(fmp_raw)
+        for field, meta in yf_raw.items():
+            fundamentals.setdefault(field, meta)
 
-    provider = "fmp"
-    if not fmp_raw and yf_raw:
-        provider = "yfinance"
-    elif fmp_raw and yf_raw:
-        provider = "fmp+fallback:yfinance"
-    elif not fundamentals:
-        provider = "none"
+        provider = "fmp"
+        if not fmp_raw and yf_raw:
+            provider = "yfinance"
+        elif fmp_raw and yf_raw:
+            provider = "fmp+fallback:yfinance"
+        elif not fundamentals:
+            provider = "none"
 
     if fundamentals:
         items.extend(_fundamentals_to_evidence(fundamentals, provider))
@@ -403,15 +461,12 @@ def assemble_evidence_node(state: dict) -> dict:
 
     status = "complete" if pack["total_items"] > 0 else "fallback"
 
-    # ── KG write-back: persist filing + news items as Layer 1 anchored facts ──
-    # Anchored types use infinite TTL — once written, never overwritten.
-    # Re-runs are ADDITIVE: new items grow the corpus; existing items stay.
+    # ── KG write-back: persist evidence via ingest gate ─────────────────
     try:
-        import hashlib
-        from kg import get_cache  # noqa: PLC0415
+        from kg import get_cache, kg_write  # noqa: PLC0415
         cache = get_cache()
         # Ensure company anchor exists (cheap, idempotent)
-        cache.put(
+        kg_write(
             ticker=ticker, node_type="company", field="anchor",
             value={"ticker": ticker},
             source="agent_inferred", confidence=1.0, session_id=session_id,
@@ -428,9 +483,8 @@ def assemble_evidence_node(state: dict) -> dict:
                 filing_type = meta_.get("filing_type") or "filing"
                 section = meta_.get("section") or "body"
                 as_of = item.get("as_of") or meta_.get("as_of") or "unknown"
-                # Deterministic field: filing_type::as_of::section
                 field_key = f"{filing_type}::{as_of}::{section}"
-                cache.put(
+                kg_write(
                     ticker=ticker,
                     node_type="filing",
                     field=field_key,
@@ -451,10 +505,9 @@ def assemble_evidence_node(state: dict) -> dict:
                 url = item.get("url", "")
                 title = item.get("title") or ""
                 published = item.get("as_of") or ""
-                # Deterministic field: hash of URL (unique per article)
                 url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12] if url else hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]
                 field_key = f"{published or 'undated'}::{url_hash}"
-                cache.put(
+                kg_write(
                     ticker=ticker,
                     node_type="news_item",
                     field=field_key,
@@ -472,7 +525,7 @@ def assemble_evidence_node(state: dict) -> dict:
                 )
                 written_news += 1
         logger.info(
-            "DCF evidence KG write-back ticker=%s filings=%d news=%d",
+            "DCF evidence KG write-back ticker=%s filings=%d news=%d (via ingest)",
             ticker, written_filing, written_news,
         )
     except Exception as exc:  # noqa: BLE001

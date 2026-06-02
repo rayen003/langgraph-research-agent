@@ -42,6 +42,12 @@ class DCFState(TypedDict):
     sensitivity_table: list[dict[str, float]]
     result_path: str | None
     parent_step_id: str
+    # Unique KG run identity (distinct from parent_step_id). Generated once in
+    # normalize_input_node so reruns ACCUMULATE instead of overwriting. Lineage
+    # to a source run (clone/rerun) is encoded in the id + parent_run_id.
+    kg_run_id: str
+    parent_run_id: str | None
+    run_trigger: str  # "initial" | "rerun" | "clone"
     # Numeric/categorical inputs from fundamentals/market APIs (CAPM inputs).
     features: dict[str, Any]
     # Decomposition of estimated WACC (audit trail).

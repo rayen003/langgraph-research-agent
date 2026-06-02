@@ -1,12 +1,21 @@
 import { useMemo, useState, useCallback, useEffect } from 'react'
+import { Search, GitCompare, RefreshCw, X, ShieldAlert } from 'lucide-react'
 import { useKnowledgeGraph, type KgNode } from '../hooks/useKnowledgeGraph'
 import { KgCanvas } from './KgCanvas'
 import { KgFilterSidebar } from './KgFilterSidebar'
 import { KgQueryPanel } from './KgQueryPanel'
-import { KgNodeCard } from './KgNodeCard'
 import { KgRunInspector } from './KgRunInspector'
 import { KgRerunPicker } from './KgRerunPicker'
+import { KgHubPanel } from './KgHubPanel'
+import { KgFinancialsPanel } from './KgFinancialsPanel'
+import { KgCompareRuns } from './KgCompareRuns'
+import { KgTimeline } from './KgTimeline'
+import { KgAuditPanel } from './KgAuditPanel'
 import { buildDcfDiffMessage } from '../lib/dcfDiff'
+import { buildKgViewModel } from '../lib/kgViewModel'
+import { ResizablePanel } from './ResizablePanel'
+import { PanelHideButton } from './PanelHideButton'
+import { usePanelHidden } from '../hooks/usePanelHidden'
 
 interface Props {
   sessionId: string | null
@@ -36,11 +45,6 @@ interface Props {
   refreshTrigger?: number
 }
 
-// Show assumption/output leaf nodes only for the most recent run per ticker by
-// default — older runs stay collapsed to prevent graph saturation. User can
-// toggle "show all run details" to expand all.
-const MAX_EXPANDED_RUNS_PER_TICKER = 1
-
 interface PendingRerun {
   ticker: string
   horizonYears: number
@@ -60,6 +64,8 @@ export function KnowledgePanel({
   refreshTrigger,
 }: Props) {
   const kg = useKnowledgeGraph(sessionId)
+  const filterPanel = usePanelHidden('ui.panel.kg.filter.hidden')
+  const dockPanel = usePanelHidden('ui.panel.kg.dock.hidden')
 
   // Refresh the KG whenever App signals a rerun has completed — picks up the
   // new dcf_run / run_assumption / run_output nodes written by the workflow.
@@ -71,48 +77,38 @@ export function KnowledgePanel({
 
   const [selectedNode, setSelectedNode] = useState<KgNode | null>(null)
   const [queryOpen, setQueryOpen] = useState(false)
-  // Default-hide high-volume detail nodes that make the graph unreadable.
-  // User can toggle them back via the filter sidebar.
-  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(
-    new Set(['driver', 'news_item', 'filing', 'run_scenario', 'deck_slide']),
-  )
   const [hiddenTickers, setHiddenTickers] = useState<Set<string>>(new Set())
-  const [hiddenSources, setHiddenSources] = useState<Set<string>>(new Set())
-  const [hideOrphans, setHideOrphans] = useState(false)
-  const [showAllRuns, setShowAllRuns] = useState(false)
   const [pendingRerun, setPendingRerun] = useState<PendingRerun | null>(null)
+  const [compareOpen, setCompareOpen] = useState(false)
+  const [auditOpen, setAuditOpen] = useState(false)
+  // Assembled comparison set — composite `ticker::run_id` keys.
+  const [selectedRunKeys, setSelectedRunKeys] = useState<string[]>([])
 
-  const handleNodeClick = useCallback((n: KgNode) => setSelectedNode(n), [])
+  const toggleRunKey = useCallback((key: string) => {
+    setSelectedRunKeys(prev =>
+      prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key])
+  }, [])
+  const compareKeySet = useMemo(() => new Set(selectedRunKeys), [selectedRunKeys])
 
-  // ── Edge count for orphan filter ──────────────────────────────────────────
-  const edgeCountByNodeId = useMemo(() => {
-    const m = new Map<string, number>()
-    for (const e of kg.edges) {
-      m.set(e.src_id, (m.get(e.src_id) || 0) + 1)
-      m.set(e.tgt_id, (m.get(e.tgt_id) || 0) + 1)
-    }
-    return m
-  }, [kg.edges])
+  // ── Analyst view model: collapse raw graph into hubs ──────────────────────
+  const viewModel = useMemo(
+    () => buildKgViewModel(kg.nodes, kg.edges),
+    [kg.nodes, kg.edges],
+  )
 
-  // ── Auto-collapse old runs ────────────────────────────────────────────────
-  const expandedRunIds = useMemo(() => {
-    if (showAllRuns) return null
-    const byTicker = new Map<string, KgNode[]>()
-    for (const n of kg.nodes) {
-      if (n.node_type !== 'dcf_run') continue
-      const list = byTicker.get(n.ticker) || []
-      list.push(n)
-      byTicker.set(n.ticker, list)
+  const handleNodeClick = useCallback((n: KgNode) => {
+    // When the comparison artifact is open, clicking a DCF run ADDS it to the
+    // assembled set instead of opening the inspector (assemble-by-click).
+    if (compareOpen && n.node_type === 'dcf_run' && n.run_id) {
+      toggleRunKey(`${n.ticker}::${n.run_id}`)
+      return
     }
-    const expanded = new Set<string>()
-    for (const [, runs] of byTicker) {
-      runs.sort((a, b) => b.updated_at - a.updated_at)
-      for (const r of runs.slice(0, MAX_EXPANDED_RUNS_PER_TICKER)) {
-        if (r.run_id) expanded.add(r.run_id)
-      }
-    }
-    return expanded
-  }, [kg.nodes, showAllRuns])
+    // Company hub has no detail panel — clicking it just deselects.
+    if (n.node_type === 'company') { setSelectedNode(null); return }
+    // Financials hub (and any hub with categories) opens the tabbed dock panel
+    // instead of spawning category sub-hubs on the canvas.
+    setSelectedNode(n)
+  }, [compareOpen, toggleRunKey])
 
   // ── Company summary for tooltip enrichment ────────────────────────────────
   const companySummary = useMemo(() => {
@@ -141,48 +137,52 @@ export function KnowledgePanel({
     return out
   }, [kg.nodes])
 
-  // ── Apply filters + auto-collapse ─────────────────────────────────────────
+  // ── Render hub graph (filter by hidden ticker) ────────────────────────────
+  // Category sub-hubs are no longer canvas nodes — they live in the Financials
+  // dock panel — so the only filter is the ticker visibility toggle.
   const { visibleNodes, visibleEdges } = useMemo(() => {
-    const visIds = new Set<string>()
-    const vNodes = kg.nodes.filter(n => {
-      if (hiddenTypes.has(n.node_type)) return false
-      if (hiddenTickers.has(n.ticker)) return false
-      if (hiddenSources.has(n.source)) return false
-      if (expandedRunIds !== null && n.run_id) {
-        const isRunScopedLeaf =
-          n.node_type === 'run_assumption' ||
-          n.node_type === 'run_output' ||
-          n.node_type === 'run_scenario'
-        if (isRunScopedLeaf && !expandedRunIds.has(n.run_id)) return false
-      }
-      if (hideOrphans && (edgeCountByNodeId.get(n.id) || 0) === 0) return false
-      visIds.add(n.id)
-      return true
-    })
-    const vEdges = kg.edges.filter(e => visIds.has(e.src_id) && visIds.has(e.tgt_id))
+    const vNodes = viewModel.hubNodes.filter(n => !hiddenTickers.has(n.ticker))
+    const visIds = new Set(vNodes.map(n => n.id))
+    const vEdges = viewModel.hubEdges.filter(e => visIds.has(e.src_id) && visIds.has(e.tgt_id))
     return { visibleNodes: vNodes, visibleEdges: vEdges }
-  }, [kg.nodes, kg.edges, hiddenTypes, hiddenTickers, hiddenSources, hideOrphans, edgeCountByNodeId, expandedRunIds])
+  }, [viewModel, hiddenTickers])
 
-  const highlightSet = useMemo(() => new Set(kg.highlightPath), [kg.highlightPath])
-  const highlightEdgeSet = useMemo(
-    () => new Set(kg.highlightEdges.map(e => `${e.src_id}->${e.tgt_id}`)),
-    [kg.highlightEdges],
+  // ── Query highlight → roll matched raw nodes up to their hubs ─────────────
+  // Graph lights the owning hub; if that hub's panel is open, the matched rows
+  // glow (see matchedMemberIds passed to KgHubPanel).
+  const matchedMemberIds = useMemo(
+    () => new Set(kg.highlightPath),
+    [kg.highlightPath],
   )
+  const highlightSet = useMemo(() => {
+    const hubs = new Set<string>()
+    for (const rawId of kg.highlightPath) {
+      const hub = viewModel.hubForRaw.get(rawId)
+      if (hub) hubs.add(hub)
+    }
+    return hubs
+  }, [kg.highlightPath, viewModel])
+  const highlightEdgeSet = useMemo(() => new Set<string>(), [])
 
-  // ── Filter toggles ─────────────────────────────────────────────────────────
-  const toggleType = useCallback((t: string) => {
-    setHiddenTypes(prev => { const n = new Set(prev); n.has(t) ? n.delete(t) : n.add(t); return n })
-  }, [])
+  // After a query, auto-open the PRIMARY match's hub panel (first cited raw
+  // node → its owning hub) so the lit row is immediately visible. Category
+  // members roll up to the Financials hub → opens the tabbed panel.
+  useEffect(() => {
+    if (highlightSet.size === 0) return
+    const primaryRaw = kg.highlightPath[0]
+    if (primaryRaw) {
+      const hubId = viewModel.hubForRaw.get(primaryRaw)
+      const hub = hubId ? viewModel.hubNodes.find(n => n.id === hubId) : undefined
+      if (hub && hub.node_type !== 'company') setSelectedNode(hub)
+    }
+  }, [highlightSet, kg.highlightPath, viewModel])
+
+  // ── Ticker filter toggle ───────────────────────────────────────────────────
   const toggleTicker = useCallback((t: string) => {
     setHiddenTickers(prev => { const n = new Set(prev); n.has(t) ? n.delete(t) : n.add(t); return n })
   }, [])
-  const toggleSource = useCallback((s: string) => {
-    setHiddenSources(prev => { const n = new Set(prev); n.has(s) ? n.delete(s) : n.add(s); return n })
-  }, [])
   const resetFilters = useCallback(() => {
-    setHiddenTypes(new Set(['driver', 'news_item', 'filing', 'run_scenario', 'deck_slide']))
-    setHiddenTickers(new Set()); setHiddenSources(new Set())
-    setHideOrphans(false); setShowAllRuns(false)
+    setHiddenTickers(new Set())
   }, [])
 
   // ── Rerun handlers ────────────────────────────────────────────────────────
@@ -232,6 +232,8 @@ export function KnowledgePanel({
       ticker,
       horizon_years: horizonYears,
       all_assumptions: overrides,
+      // Lineage: this rerun derives from the run the user opened in the KG.
+      parent_run_id: originalRunNode.run_id || undefined,
     }
     const query = `[DCF_APPROVED]:${JSON.stringify(approvalPayload)}`
 
@@ -261,144 +263,239 @@ export function KnowledgePanel({
     return Array.from(s)
   }, [kg.nodes])
 
+  // Any ticker with ≥2 DCF runs → enable cross-run comparison.
+  const hasMultiRun = useMemo(() => {
+    const byTicker = new Map<string, Set<string>>()
+    for (const n of kg.nodes) {
+      if (n.node_type !== 'dcf_run') continue
+      const set = byTicker.get(n.ticker) || new Set()
+      set.add(n.run_id || n.id)
+      byTicker.set(n.ticker, set)
+    }
+    return Array.from(byTicker.values()).some(s => s.size >= 2)
+  }, [kg.nodes])
+
+  // Create a user_belief node (analyst-stated conviction).
+  const handleCreateBelief = useCallback(async (ticker: string, field: string, value: unknown) => {
+    await kg.createNode({ ticker, node_type: 'user_belief', field, value, source: 'user_stated' })
+  }, [kg])
+
   if (!sessionId) {
     return (
-      <div className="fixed inset-0 z-50 bg-[#0a0a0a] flex items-center justify-center text-zinc-600 text-sm">
+      <div className="fixed inset-0 z-50 bg-bg flex items-center justify-center text-ink-muted text-sm">
         No active session
-        <button onClick={onClose} className="ml-3 text-zinc-400 hover:text-zinc-200">close</button>
+        <button onClick={onClose} className="ml-3 text-ink-muted hover:text-ink">close</button>
       </div>
     )
   }
 
   const isRunNode = selectedNode?.node_type === 'dcf_run'
+  const isNewsHub = selectedNode?.node_type === 'news_hub'
+  const isFinancialsHub = selectedNode?.node_type === 'financials_hub'
+  const hubMembers = selectedNode && isNewsHub
+    ? (viewModel.membersByHub.get(selectedNode.id) || [])
+    : []
+  // Financials hub → tabbed category panel (replaces on-canvas sub-hubs).
+  const financialsCategories = isFinancialsHub && selectedNode
+    ? (viewModel.childHubs.get(selectedNode.id) || []).map(sub => ({
+        key: String(sub.field).replace(/^fin_/, ''),
+        label: String((sub.value as Record<string, unknown>)?.label ?? sub.field),
+        members: viewModel.membersByHub.get(sub.id) || [],
+      }))
+    : []
+
+  // ── Single dock occupant (mutually exclusive) ─────────────────────────────
+  // Priority: query > compare > audit > selected node panel. Opening one closes others
+  // via the handlers below, so at most one is ever truthy.
+  const dockOpen = queryOpen || compareOpen || auditOpen || !!selectedNode
+
+  const openQuery = () => { setQueryOpen(true); setCompareOpen(false); setAuditOpen(false); setSelectedNode(null) }
+  const openCompare = () => { setCompareOpen(true); setQueryOpen(false); setAuditOpen(false); setSelectedNode(null) }
+  const openAudit = () => { setAuditOpen(true); setQueryOpen(false); setCompareOpen(false); setSelectedNode(null) }
+  const closeDock = () => { setQueryOpen(false); setCompareOpen(false); setAuditOpen(false); setSelectedNode(null) }
 
   return (
-    <div className="fixed inset-0 z-50 bg-[#0a0a0a] flex flex-col">
-      {/* Top bar */}
-      <div className="px-4 py-2.5 border-b border-[#1c1c24] flex items-center gap-3 flex-shrink-0">
-        <div className="text-zinc-200 text-sm font-medium">Knowledge Graph</div>
-        <div className="text-zinc-600 text-[11px]">
-          {visibleNodes.length}/{kg.nodes.length} nodes · {visibleEdges.length}/{kg.edges.length} edges
-          {tickers.length > 0 && ` · ${tickers.join(', ')}`}
-        </div>
+    <div className="fixed inset-0 z-50 bg-bg flex flex-col text-ink">
+      {/* ── Top bar ────────────────────────────────────────────────────── */}
+      <header className="flex items-center gap-3 px-4 h-11 border-b border-edge flex-shrink-0 bg-surface">
+        <span className="text-[11px] font-medium tracking-[0.07em] uppercase text-ink-muted">
+          Knowledge Graph
+        </span>
+        <span className="hidden sm:inline text-edge-2">·</span>
+        <span className="hidden sm:inline text-[11px] text-ink-dim tabular-nums truncate">
+          {visibleNodes.length} hubs · {kg.nodes.length} facts
+          {tickers.length > 0 && ` · ${tickers.join(' · ')}`}
+        </span>
 
         {isRunActive && (
-          <div className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 flex items-center gap-1.5">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
-            Run in progress
-          </div>
+          <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-ink-dim">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+            running
+          </span>
         )}
 
-        <div className="ml-auto flex items-center gap-2">
-          <label className="text-[10px] text-zinc-500 flex items-center gap-1.5 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={showAllRuns}
-              onChange={() => setShowAllRuns(v => !v)}
-              className="accent-indigo-500"
-            />
-            show all run details
-          </label>
-          <button
-            onClick={() => setQueryOpen(o => !o)}
-            className={`text-[11px] px-3 py-1.5 rounded border transition ${
-              queryOpen
-                ? 'bg-indigo-500/25 text-indigo-200 border-indigo-500/50'
-                : 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30 hover:bg-indigo-500/20'
-            }`}
-          >
-            🔎 Ask
-          </button>
-          <button
-            onClick={kg.refresh}
-            disabled={kg.loading}
-            className="text-[11px] px-3 py-1.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 hover:bg-zinc-700 disabled:opacity-50"
-          >
-            {kg.loading ? '…' : '↻ Refresh'}
-          </button>
+        <div className="ml-auto flex items-center gap-1.5">
+          {dockOpen && (
+            <ToolbarButton onClick={dockPanel.hide}>
+              Hide panel
+            </ToolbarButton>
+          )}
+          {hasMultiRun && (
+            <ToolbarButton active={compareOpen} onClick={() => (compareOpen ? closeDock() : openCompare())}>
+              <GitCompare size={14} /> Compare
+            </ToolbarButton>
+          )}
+          <ToolbarButton active={queryOpen} onClick={() => (queryOpen ? closeDock() : openQuery())}>
+            <Search size={14} /> Ask
+          </ToolbarButton>
+          <ToolbarButton active={auditOpen} onClick={() => (auditOpen ? closeDock() : openAudit())}>
+            <ShieldAlert size={14} /> Audit
+          </ToolbarButton>
+          <ToolbarButton onClick={kg.refresh} disabled={kg.loading}>
+            <RefreshCw size={14} className={kg.loading ? 'animate-spin' : ''} /> Refresh
+          </ToolbarButton>
           <button
             onClick={onClose}
-            className="text-zinc-400 hover:text-zinc-200 text-[16px] ml-2 px-2"
-            title="Close"
+            aria-label="Close knowledge graph"
+            className="ml-1 p-1.5 rounded text-ink-dim hover:text-ink hover:bg-surface-2 transition"
           >
-            ✕
+            <X size={16} />
           </button>
         </div>
-      </div>
+      </header>
 
-      {/* Body */}
-      <div className="flex-1 flex overflow-hidden relative">
-        <KgFilterSidebar
-          nodes={kg.nodes}
-          hiddenTypes={hiddenTypes}
-          hiddenTickers={hiddenTickers}
-          hiddenSources={hiddenSources}
-          hideOrphans={hideOrphans}
-          edgeCountByNodeId={edgeCountByNodeId}
-          onToggleType={toggleType}
-          onToggleTicker={toggleTicker}
-          onToggleSource={toggleSource}
-          onToggleHideOrphans={() => setHideOrphans(o => !o)}
-          onResetFilters={resetFilters}
-        />
+      {/* ── Body: filters | canvas+timeline | dock ───────────────────────── */}
+      <div className="flex-1 flex overflow-hidden">
+        <ResizablePanel
+          defaultWidth={200}
+          minWidth={140}
+          maxWidth={360}
+          side="right"
+          storageKey="ui.kgFilterSidebarWidth"
+          className="border-r border-edge bg-surface"
+          hidden={filterPanel.hidden}
+          onReveal={filterPanel.show}
+          revealLabel="Filters"
+        >
+          <KgFilterSidebar
+            nodes={kg.nodes}
+            hiddenTickers={hiddenTickers}
+            onToggleTicker={toggleTicker}
+            onResetFilters={resetFilters}
+            onHide={filterPanel.hide}
+          />
+        </ResizablePanel>
 
-        <div className="flex-1 relative">
-          {kg.error && (
-            <div className="absolute top-2 left-2 z-10 px-2 py-1 rounded bg-red-500/10 text-red-400 text-[11px]">
-              {kg.error}
-            </div>
-          )}
-          {kg.nodes.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-zinc-600 text-[12px] px-4 text-center">
-              No knowledge yet for this session.
-              <br />
-              Run a DCF or chat about a ticker to populate the graph.
-            </div>
-          ) : visibleNodes.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-zinc-600 text-[12px]">
-              All nodes filtered out.
-            </div>
-          ) : (
-            <KgCanvas
-              nodes={visibleNodes}
-              edges={visibleEdges}
-              highlightSet={highlightSet}
-              highlightEdgeSet={highlightEdgeSet}
-              onNodeClick={handleNodeClick}
-              companySummary={companySummary}
-            />
-          )}
+        {/* Canvas column — flexes; never squeezed below usable timeline width */}
+        <div className="flex-1 min-w-[280px] min-h-0 relative flex flex-col">
+          <div className="flex-1 min-h-0 relative overflow-hidden">
+            {/* KG write toasts are now rendered app-level in App.tsx so they
+                show even when this panel is closed. */}
+            {kg.error && (
+              <div className="absolute top-3 left-3 z-10 px-2.5 py-1.5 rounded-md bg-down/10 text-down text-[11px] border border-down/30">
+                {kg.error}
+              </div>
+            )}
+            {kg.nodes.length === 0 ? (
+              <EmptyCanvas
+                title="No knowledge yet"
+                body="Run a DCF or chat about a ticker to populate the graph."
+              />
+            ) : visibleNodes.length === 0 ? (
+              <EmptyCanvas title="All nodes filtered out" body="Adjust ticker filters on the left." />
+            ) : (
+              <KgCanvas
+                nodes={visibleNodes}
+                edges={visibleEdges}
+                highlightSet={highlightSet}
+                highlightEdgeSet={highlightEdgeSet}
+                onNodeClick={handleNodeClick}
+                companySummary={companySummary}
+                compareKeys={compareKeySet}
+                dragRunsToCompare={compareOpen}
+              />
+            )}
+          </div>
 
-          {selectedNode && isRunNode && (
-            <KgRunInspector
-              runNode={selectedNode}
-              allNodes={kg.nodes}
-              onClose={() => setSelectedNode(null)}
-              onRerun={handleRerunRequested}
-              rerunBusy={rerunBusy || isRunActive || pendingRerun !== null}
-            />
-          )}
-          {selectedNode && !isRunNode && (
-            <KgNodeCard
-              node={selectedNode}
-              onClose={() => setSelectedNode(null)}
-              onPatch={kg.patchNode}
-              onDelete={kg.deleteNode}
-            />
-          )}
+          {/* Timeline — bottom bar, spans canvas width only */}
+          <KgTimeline
+            nodes={kg.nodes}
+            highlightRunIds={highlightSet}
+            onSelectRun={n => { setCompareOpen(false); setQueryOpen(false); setSelectedNode(n) }}
+          />
         </div>
 
-        {queryOpen && (
-          <KgQueryPanel
-            onClose={() => setQueryOpen(false)}
-            onQuery={kg.queryNL}
-            onClearHighlight={kg.clearHighlight}
-            highlightCount={kg.highlightPath.length}
-          />
+        {/* ── Right dock — one panel at a time ──────────────────────────── */}
+        {dockOpen && (
+          <ResizablePanel
+            defaultWidth={420}
+            minWidth={300}
+            maxWidth={720}
+            side="left"
+            storageKey="ui.kgDockWidth"
+            className="border-l border-edge bg-surface"
+            hidden={dockPanel.hidden}
+            onReveal={dockPanel.show}
+            revealLabel="Inspect"
+          >
+            {queryOpen && (
+              <KgQueryPanel
+                onClose={closeDock}
+                onQuery={kg.queryNL}
+                onClearHighlight={kg.clearHighlight}
+                highlightCount={kg.highlightPath.length}
+              />
+            )}
+            {compareOpen && (
+              <KgCompareRuns
+                nodes={kg.nodes}
+                selectedRunKeys={selectedRunKeys}
+                onToggleRun={toggleRunKey}
+                onClear={() => setSelectedRunKeys([])}
+                onChat={kg.compareChat}
+                onClose={closeDock}
+              />
+            )}
+            {selectedNode && isRunNode && (
+              <KgRunInspector
+                runNode={selectedNode}
+                allNodes={kg.nodes}
+                onClose={closeDock}
+                onRerun={handleRerunRequested}
+                rerunBusy={rerunBusy || isRunActive || pendingRerun !== null}
+                highlightIds={matchedMemberIds}
+              />
+            )}
+            {auditOpen && (
+              <KgAuditPanel
+                ticker={tickers.length === 1 ? tickers[0] : undefined}
+                availableTickers={tickers}
+                onClose={closeDock}
+              />
+            )}
+            {selectedNode && isNewsHub && (
+              <KgHubPanel
+                title={`${selectedNode.ticker} · News`}
+                subtitle={`${hubMembers.length} item${hubMembers.length === 1 ? '' : 's'}`}
+                members={hubMembers}
+                highlightIds={matchedMemberIds}
+                onClose={closeDock}
+              />
+            )}
+            {selectedNode && isFinancialsHub && (
+              <KgFinancialsPanel
+                ticker={selectedNode.ticker}
+                categories={financialsCategories}
+                highlightIds={matchedMemberIds}
+                onClose={closeDock}
+                onCreateBelief={handleCreateBelief}
+                onDeleteNode={kg.deleteNode}
+              />
+            )}
+          </ResizablePanel>
         )}
       </div>
 
-      {/* Rerun target picker */}
       {pendingRerun && (
         <KgRerunPicker
           ticker={pendingRerun.ticker}
@@ -408,6 +505,36 @@ export function KnowledgePanel({
           onCancel={() => setPendingRerun(null)}
         />
       )}
+    </div>
+  )
+}
+
+// ── Top-bar button (single accent language) ──────────────────────────────────
+function ToolbarButton({
+  children, active, onClick, disabled,
+}: {
+  children: React.ReactNode; active?: boolean; onClick: () => void; disabled?: boolean
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex items-center gap-1.5 text-[12px] px-2.5 py-1.5 rounded-md border transition disabled:opacity-50 ${
+        active
+          ? 'bg-accent-soft text-accent border-accent/40'
+          : 'text-ink-muted border-edge hover:text-ink hover:bg-surface-2'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
+function EmptyCanvas({ title, body }: { title: string; body: string }) {
+  return (
+    <div role="status" className="h-full flex flex-col items-center justify-center text-center px-6">
+      <div className="text-[11px] font-medium tracking-wide uppercase text-ink-dim">{title}</div>
+      <div className="text-[12px] text-ink-dim mt-1.5 max-w-[240px] leading-relaxed">{body}</div>
     </div>
   )
 }

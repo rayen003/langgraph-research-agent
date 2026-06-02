@@ -124,9 +124,29 @@ export function useKnowledgeGraph(sessionId: string | null) {
     setHighlightEdges([])
   }, [])
 
+  const compareChat = useCallback(async (
+    diff: unknown,
+    question: string,
+    history?: { role: string; content: string }[],
+  ): Promise<string | null> => {
+    if (!sessionId) return null
+    try {
+      const res = await fetch(`/kg/${sessionId}/compare-chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, diff, history: history ?? null }),
+      })
+      if (!res.ok) return null
+      const data = (await res.json()) as { answer?: string }
+      return data.answer ?? null
+    } catch {
+      return null
+    }
+  }, [sessionId])
+
   return {
     nodes, edges, loading, error,
     highlightPath, highlightEdges, clearHighlight,
-    refresh, patchNode, deleteNode, createNode, queryNL,
+    refresh, patchNode, deleteNode, createNode, queryNL, compareChat,
   }
 }

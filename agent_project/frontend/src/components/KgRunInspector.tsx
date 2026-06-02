@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react'
+import { Calculator, RotateCw, RotateCcw, Copy, Lock, FileText } from 'lucide-react'
 import type { KgNode } from '../hooks/useKnowledgeGraph'
+import { Panel, Caption } from './kg/Panel'
 
 // Tier A: locked (canonical fundamentals). Tier B: editable assumptions.
 const TIER_B_EDITABLE = new Set([
@@ -25,6 +27,10 @@ const ASSUMPTION_LABELS: Record<string, string> = {
   base_revenue: 'Base revenue',
   shares_outstanding: 'Shares out',
   net_debt: 'Net debt',
+  fcff_margin_terminal: 'FCFF margin (term)',
+  revenue_growth_terminal: 'Rev growth (term)',
+  sbc_pct_revenue: 'SBC % revenue',
+  buyback_yield: 'Buyback yield',
 }
 
 const OUTPUT_LABELS: Record<string, string> = {
@@ -42,6 +48,8 @@ interface Props {
   onClose: () => void
   onRerun: (overrides: Record<string, number>, horizonYears: number) => Promise<void>
   rerunBusy: boolean
+  /** raw node ids matched by a query → glow those assumption/output rows. */
+  highlightIds?: Set<string>
 }
 
 function fmtNum(v: unknown): string {
@@ -68,7 +76,7 @@ function ageStr(ts: number): string {
   return `${Math.round(age / 86400)}d ago`
 }
 
-export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy }: Props) {
+export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy, highlightIds }: Props) {
   // ── Extract this run's assumptions + outputs ────────────────────────────
   const runId = runNode.run_id || ''
   const ticker = runNode.ticker
@@ -112,6 +120,15 @@ export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy 
   const [draft, setDraft] = useState<Record<string, string>>(initialDraft)
   const [dirty, setDirty] = useState(false)
 
+  // The persisted DCF report lives at /runs/{thread_id}/dcf-report.pdf. The
+  // dcf_run node stores its thread_id; open the PDF inline in a new tab.
+  const threadId = runNode.value && typeof runNode.value === 'object'
+    ? String((runNode.value as Record<string, unknown>).thread_id ?? '')
+    : ''
+  const reportUrl = threadId
+    ? `/runs/${encodeURIComponent(threadId)}/dcf-report.pdf?inline=1`
+    : ''
+
   function updateField(field: string, value: string) {
     setDraft(prev => ({ ...prev, [field]: value }))
     setDirty(true)
@@ -140,126 +157,128 @@ export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy 
   }
 
   return (
-    <div className="absolute top-3 right-3 z-20 w-[420px] max-h-[calc(100vh-100px)] bg-[#11111a] border border-[#2a2a36] rounded-md shadow-2xl flex flex-col text-[11px]">
-      {/* Header */}
-      <div className="px-3 py-2 border-b border-[#2a2a36] flex items-center justify-between flex-shrink-0">
-        <div>
-          <div className="text-zinc-200 font-medium text-[12px]">
-            {ticker} · DCF Run · {horizonYears}y
-          </div>
-          <div className="text-zinc-600 text-[10px] mt-0.5">
-            {runId.slice(0, 24)}… · {ageStr(runNode.updated_at)}
-          </div>
+    <Panel
+      icon={<Calculator size={16} />}
+      title={`${ticker} · DCF Run · ${horizonYears}y`}
+      subtitle={`${runId.slice(0, 24)}… · ${ageStr(runNode.updated_at)}`}
+      onClose={onClose}
+      actions={reportUrl ? (
+        <a
+          href={reportUrl}
+          target="_blank"
+          rel="noreferrer"
+          title="Open the full DCF report (PDF) in a new tab"
+          className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-accent border border-accent/40 bg-accent-soft hover:bg-accent/20 transition"
+        >
+          <FileText size={12} /> Report ↗
+        </a>
+      ) : undefined}
+      footer={
+        <div className="flex gap-2">
+          <button
+            onClick={() => handleRerun(true)}
+            disabled={rerunBusy || !dirty}
+            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-2 rounded-md bg-accent-soft text-accent border border-accent/40 hover:bg-accent/20 disabled:opacity-40 text-[12px] font-medium transition"
+            title={!dirty ? 'Edit a Tier B assumption first' : 'Run DCF with edited assumptions'}
+          >
+            <RotateCw size={13} className={rerunBusy ? 'animate-spin' : ''} />
+            {rerunBusy ? 'Running…' : 'Rerun with edits'}
+          </button>
+          <button
+            onClick={() => handleRerun(false)}
+            disabled={rerunBusy}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-md text-ink-muted border border-edge hover:bg-surface-2 disabled:opacity-40 text-[12px] transition"
+            title="Clone this run with the same assumptions"
+          >
+            <Copy size={13} /> Clone
+          </button>
         </div>
-        <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 text-[13px]">✕</button>
-      </div>
-
-      <div className="overflow-y-auto flex-1">
-        {/* Assumptions */}
-        <div className="px-3 py-2 border-b border-[#2a2a36]">
-          <div className="text-[9px] uppercase text-zinc-600 tracking-wider mb-1.5">
-            Assumptions
-          </div>
-          <div className="space-y-1">
-            {assumptions.map(a => {
-              const editable = TIER_B_EDITABLE.has(a.field)
-              const locked = TIER_A_LOCKED.has(a.field)
-              return (
-                <div key={a.id} className="flex items-center gap-2">
-                  <div className="w-32 flex-shrink-0 text-zinc-400">
-                    {ASSUMPTION_LABELS[a.field] || a.field}
-                  </div>
-                  {editable ? (
-                    <input
-                      value={draft[a.field] ?? ''}
-                      onChange={e => updateField(a.field, e.target.value)}
-                      className="flex-1 bg-[#0a0a0a] border border-[#2a2a36] rounded px-1.5 py-0.5 text-zinc-200 font-mono text-[10px] focus:outline-none focus:border-indigo-500/50"
-                      placeholder="—"
-                    />
-                  ) : (
-                    <div className="flex-1 text-zinc-500 font-mono text-[10px] truncate">
-                      {fmtNum(a.value)}
-                    </div>
-                  )}
-                  <div className="w-12 text-right text-zinc-600 text-[9px]">
-                    {locked ? 'LOCKED' : editable ? (isRatio(a.field) ? '%' : '') : ''}
-                  </div>
+      }
+    >
+      {/* Assumptions */}
+      <div className="px-4 py-3 border-b border-edge">
+        <Caption>Assumptions</Caption>
+        <div className="space-y-1">
+          {assumptions.map(a => {
+            const editable = TIER_B_EDITABLE.has(a.field)
+            const locked = TIER_A_LOCKED.has(a.field)
+            const hot = highlightIds?.has(a.id)
+            return (
+              <div key={a.id} className={`flex items-center gap-2 rounded-md px-1.5 py-1 -mx-1.5 transition ${
+                hot ? 'ring-1 ring-accent/50 bg-accent-soft' : ''
+              }`}>
+                <div
+                  className="w-36 flex-shrink-0 text-[12px] text-ink-muted truncate"
+                  title={ASSUMPTION_LABELS[a.field] || a.field}
+                >
+                  {ASSUMPTION_LABELS[a.field] || a.field}
                 </div>
-              )
-            })}
-            {assumptions.length === 0 && (
-              <div className="text-zinc-600 text-[10px]">No assumptions persisted for this run.</div>
-            )}
-          </div>
-
-          {dirty && (
-            <button
-              onClick={resetDraft}
-              className="mt-2 text-[10px] text-zinc-500 hover:text-zinc-300"
-            >
-              ↶ reset edits
-            </button>
+                {editable ? (
+                  <input
+                    value={draft[a.field] ?? ''}
+                    onChange={e => updateField(a.field, e.target.value)}
+                    className="flex-1 bg-surface-2 border border-edge rounded px-2 py-1 text-ink font-mono text-[12px] focus:outline-none focus:border-accent/50"
+                    placeholder="—"
+                  />
+                ) : (
+                  <div className="flex-1 text-ink-muted font-mono text-[12px] tabular-nums truncate">
+                    {fmtNum(a.value)}
+                  </div>
+                )}
+                <div className="w-12 flex justify-end text-ink-dim text-[10px]">
+                  {locked ? <Lock size={11} /> : editable ? (isRatio(a.field) ? '%' : '') : ''}
+                </div>
+              </div>
+            )
+          })}
+          {assumptions.length === 0 && (
+            <div className="text-ink-dim text-[12px]">No assumptions persisted for this run.</div>
           )}
         </div>
+        {dirty && (
+          <button onClick={resetDraft} className="mt-2 flex items-center gap-1 text-[11px] text-ink-dim hover:text-ink transition">
+            <RotateCcw size={11} /> reset edits
+          </button>
+        )}
+      </div>
 
-        {/* Outputs */}
-        <div className="px-3 py-2 border-b border-[#2a2a36]">
-          <div className="text-[9px] uppercase text-zinc-600 tracking-wider mb-1.5">
-            Outputs
-          </div>
-          <div className="space-y-1">
-            {outputs.map(o => {
-              const isPrice = o.field === 'implied_share_price' || o.field === 'current_price'
-              return (
-                <div key={o.id} className="flex items-center gap-2">
-                  <div className="w-36 flex-shrink-0 text-zinc-400">
-                    {OUTPUT_LABELS[o.field] || o.field}
-                  </div>
-                  <div className={`flex-1 font-mono text-[10px] truncate ${
-                    o.field === 'implied_share_price' ? 'text-emerald-300' : 'text-zinc-300'
-                  }`}>
-                    {isPrice ? `$${fmtNum(o.value)}` : fmtNum(o.value)}
-                  </div>
+      {/* Outputs */}
+      <div className="px-4 py-3 border-b border-edge">
+        <Caption>Outputs</Caption>
+        <div className="space-y-1">
+          {outputs.map(o => {
+            const isPrice = o.field === 'implied_share_price' || o.field === 'current_price'
+            const hot = highlightIds?.has(o.id)
+            return (
+              <div key={o.id} className={`flex items-center gap-2 rounded-md px-1.5 py-1 -mx-1.5 transition ${
+                hot ? 'ring-1 ring-accent/50 bg-accent-soft' : ''
+              }`}>
+                <div
+                  className="w-36 flex-shrink-0 text-[12px] text-ink-muted truncate"
+                  title={OUTPUT_LABELS[o.field] || o.field}
+                >
+                  {OUTPUT_LABELS[o.field] || o.field}
                 </div>
-              )
-            })}
-            {outputs.length === 0 && (
-              <div className="text-zinc-600 text-[10px]">No outputs persisted.</div>
-            )}
-          </div>
-        </div>
-
-        {/* Confidence */}
-        <div className="px-3 py-2 border-b border-[#2a2a36] flex items-center gap-2">
-          <div className="text-zinc-400">Confidence:</div>
-          <div className="text-zinc-300 font-mono">
-            {(runNode.confidence * 100).toFixed(0)}%
-          </div>
-          <div className="ml-auto text-[10px] text-zinc-500">
-            source: {runNode.source}
-          </div>
+                <div className={`flex-1 font-mono text-[12px] tabular-nums truncate ${
+                  o.field === 'implied_share_price' ? 'text-accent font-medium' : 'text-ink'
+                }`}>
+                  {isPrice ? `$${fmtNum(o.value)}` : fmtNum(o.value)}
+                </div>
+              </div>
+            )
+          })}
+          {outputs.length === 0 && (
+            <div className="text-ink-dim text-[12px]">No outputs persisted.</div>
+          )}
         </div>
       </div>
 
-      {/* Footer actions */}
-      <div className="px-3 py-2 border-t border-[#2a2a36] flex gap-2 flex-shrink-0">
-        <button
-          onClick={() => handleRerun(true)}
-          disabled={rerunBusy || !dirty}
-          className="flex-1 px-2 py-1.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 hover:bg-indigo-500/30 disabled:opacity-40 text-[11px]"
-          title={!dirty ? 'Edit a Tier B assumption first' : 'Run DCF with edited assumptions'}
-        >
-          {rerunBusy ? 'Running…' : '↻ Rerun with edits'}
-        </button>
-        <button
-          onClick={() => handleRerun(false)}
-          disabled={rerunBusy}
-          className="px-2 py-1.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 hover:bg-zinc-700 disabled:opacity-40 text-[11px]"
-          title="Clone this run with the same assumptions"
-        >
-          Clone
-        </button>
+      {/* Confidence */}
+      <div className="px-4 py-3 flex items-center gap-2 text-[12px]">
+        <span className="text-ink-muted">Confidence</span>
+        <span className="text-ink font-mono tabular-nums">{(runNode.confidence * 100).toFixed(0)}%</span>
+        <span className="ml-auto text-[11px] text-ink-dim">{runNode.source}</span>
       </div>
-    </div>
+    </Panel>
   )
 }

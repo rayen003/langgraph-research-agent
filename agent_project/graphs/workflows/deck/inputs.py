@@ -43,6 +43,35 @@ def default_dcf_source(*, run_dir: Path | None = None) -> dict[str, str] | None:
     return {"type": "dcf_output", "payload_path": str(path)}
 
 
+def latest_dcf_run_node_id(ticker: str) -> str | None:
+    """Resolve the most-recent ``dcf_run`` KG node id for a ticker.
+
+    Used to populate ``DcfOutputSource.run_id`` so finalize.py can draw the
+    ``HAS_DECK`` edge (dcf_run → deck_run). Best-effort: returns None on any
+    failure rather than blocking deck generation.
+    """
+    ticker = (ticker or "").upper()
+    if not ticker or ticker == "?":
+        return None
+    try:
+        from kg.cache import get_cache  # noqa: PLC0415
+
+        cache = get_cache()
+        try:
+            cache.load_ticker(ticker)
+        except Exception:  # noqa: BLE001
+            pass
+        nodes, _ = cache.get_subgraph(ticker)
+        runs = [n for n in nodes if n.get("node_type") == "dcf_run"]
+        if not runs:
+            return None
+        runs.sort(key=lambda n: n.get("updated_at", 0.0), reverse=True)
+        return runs[0].get("id")
+    except Exception:  # noqa: BLE001
+        logger.debug("latest_dcf_run_node_id lookup failed for %s", ticker, exc_info=True)
+        return None
+
+
 def default_sensitivity_source(
     dcf_payload: dict[str, Any] | None,
     *,
@@ -173,6 +202,15 @@ def resolve_deck_workflow_inputs(
             "No deck sources available. Run a DCF first or pass valid source dicts "
             "(dcf_output, document, manual_text, chart_artifact, etc.)."
         )
+
+    # Enrich dcf_output sources with the dcf_run KG node id so finalize.py can
+    # draw the HAS_DECK edge linking the deck back to its source DCF run.
+    run_node_id = latest_dcf_run_node_id(ticker)
+    if run_node_id:
+        for s in sources:
+            if s.get("type") == "dcf_output" and not s.get("run_id"):
+                s["run_id"] = run_node_id
+                logger.info("Deck inputs: linked dcf_output source to dcf_run node %s", run_node_id)
 
     brief = _normalize_brief(raw_brief, ticker=ticker)
     return sources, brief

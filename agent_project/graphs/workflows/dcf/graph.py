@@ -93,6 +93,8 @@ def _build_initial_state(
     assumption_overrides: dict[str, float],
     parent_step_id: str,
     session_id: str,
+    parent_run_id: str | None = None,
+    run_trigger: str = "initial",
 ) -> DCFState:
     """Build the initial DCFState dict."""
     return {
@@ -118,6 +120,9 @@ def _build_initial_state(
         "sensitivity_table": [],
         "result_path": None,
         "parent_step_id": parent_step_id,
+        "kg_run_id": "",  # minted in normalize_input_node
+        "parent_run_id": parent_run_id,
+        "run_trigger": run_trigger,
         "features": {},
         "wacc_components": {},
         "evidence_pack": {},
@@ -309,6 +314,8 @@ def run_dcf_workflow_sync(
     assumption_overrides: dict[str, float] | None = None,
     parent_step_id: str = "workflow_dcf",
     session_id: str = "",
+    parent_run_id: str | None = None,
+    run_trigger: str = "initial",
 ) -> dict:
     """Run the DCF workflow synchronously and return the result payload.
 
@@ -348,6 +355,8 @@ def run_dcf_workflow_sync(
         assumption_overrides=overrides,
         parent_step_id=parent_step_id,
         session_id=session_id,
+        parent_run_id=parent_run_id,
+        run_trigger=run_trigger,
     )
 
     # 50-step limit: full workflow = ~18 steps/pass × up to 2 convergence

@@ -82,6 +82,12 @@ def init_db() -> None:
                 page_count INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 upload_path TEXT,
+                company TEXT,
+                ticker TEXT,
+                doc_type TEXT,
+                fiscal_period TEXT,
+                subjects TEXT,
+                stage TEXT,
                 created_at REAL NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -167,8 +173,69 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_kg_traversals_run
             ON kg_traversals(run_id);
+
+            CREATE TABLE IF NOT EXISTS session_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                color TEXT NOT NULL,
+                collapsed INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_layout (
+                session_id TEXT PRIMARY KEY,
+                title_override TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                group_id TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES session_groups(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_layout_group
+            ON session_layout(group_id);
+
+            -- KG audit log: records findings from periodic quality checks
+            CREATE TABLE IF NOT EXISTS kg_audit_log (
+                audit_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                check_type TEXT NOT NULL,   -- cross_source, staleness, orphan, hallucination, entity_coherence
+                ticker TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                field TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info',  -- info, warning, error
+                finding TEXT NOT NULL,     -- Human-readable description
+                recommendation TEXT NOT NULL DEFAULT '', -- What to do about it
+                source_tier TEXT,           -- Which source provided the data
+                existing_value TEXT,        -- Value currently in KG
+                conflicting_value TEXT,     -- Conflicting value (if applicable)
+                auto_fixed INTEGER NOT NULL DEFAULT 0  -- Whether audit auto-corrected
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_ticker ON kg_audit_log(ticker);
+            CREATE INDEX IF NOT EXISTS idx_audit_severity ON kg_audit_log(severity);
+            CREATE INDEX IF NOT EXISTS idx_audit_type ON kg_audit_log(check_type);
             """
         )
+        # ── Migrations: add entity metadata columns to older databases ──────
+        _migrate_documents_entity_columns(conn)
+
+
+def _migrate_documents_entity_columns(conn: sqlite3.Connection) -> None:
+    """Add entity metadata columns if missing from older documents table."""
+    new_cols = [
+        ("company", "TEXT"),
+        ("ticker", "TEXT"),
+        ("doc_type", "TEXT"),
+        ("fiscal_period", "TEXT"),
+        ("subjects", "TEXT"),
+        ("stage", "TEXT"),
+    ]
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
 
 
 def mark_stale_running_jobs() -> None:
@@ -493,9 +560,9 @@ def upsert_document(doc: dict[str, Any]) -> None:
             """
             INSERT INTO documents (
                 doc_id, filename, session_id, status, chunk_count, page_count,
-                error, upload_path, created_at, updated_at
+                error, upload_path, company, ticker, doc_type, fiscal_period, subjects, stage, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(doc_id) DO UPDATE SET
                 filename = excluded.filename,
                 session_id = excluded.session_id,
@@ -504,6 +571,12 @@ def upsert_document(doc: dict[str, Any]) -> None:
                 page_count = excluded.page_count,
                 error = excluded.error,
                 upload_path = excluded.upload_path,
+                company = excluded.company,
+                ticker = excluded.ticker,
+                doc_type = excluded.doc_type,
+                fiscal_period = excluded.fiscal_period,
+                subjects = excluded.subjects,
+                stage = excluded.stage,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at
             """,
@@ -516,6 +589,12 @@ def upsert_document(doc: dict[str, Any]) -> None:
                 int(doc.get("page_count") or 0),
                 doc.get("error"),
                 doc.get("upload_path"),
+                doc.get("company"),
+                doc.get("ticker"),
+                doc.get("doc_type"),
+                doc.get("fiscal_period"),
+                doc.get("subjects"),
+                doc.get("stage"),
                 float(doc["created_at"]),
                 _now(),
             ),
@@ -523,7 +602,8 @@ def upsert_document(doc: dict[str, Any]) -> None:
 
 
 def update_document(doc_id: str, **fields: Any) -> None:
-    allowed = {"filename", "session_id", "status", "chunk_count", "page_count", "error", "upload_path", "created_at"}
+    allowed = {"filename", "session_id", "status", "chunk_count", "page_count", "error", "upload_path", "created_at",
+               "company", "ticker", "doc_type", "fiscal_period", "subjects", "stage"}
     assignments: list[str] = []
     values: list[Any] = []
     for key, value in fields.items():
@@ -546,7 +626,8 @@ def list_documents(session_id: str | None = None) -> list[dict[str, Any]]:
             rows = conn.execute(
                 """
                 SELECT doc_id, filename, session_id, status, chunk_count, page_count,
-                       error, upload_path, created_at
+                       error, upload_path, company, ticker, doc_type, fiscal_period,
+                       subjects, stage, created_at
                 FROM documents
                 ORDER BY created_at DESC
                 """
@@ -555,7 +636,8 @@ def list_documents(session_id: str | None = None) -> list[dict[str, Any]]:
             rows = conn.execute(
                 """
                 SELECT doc_id, filename, session_id, status, chunk_count, page_count,
-                       error, upload_path, created_at
+                       error, upload_path, company, ticker, doc_type, fiscal_period,
+                       subjects, stage, created_at
                 FROM documents
                 WHERE session_id = ?
                 ORDER BY created_at DESC
@@ -753,6 +835,96 @@ def list_kg_traversals(run_id: str) -> list[dict[str, Any]]:
             (run_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Session sidebar layout (groups, pin, order) ─────────────────────────────
+
+
+def get_session_layout() -> dict[str, Any]:
+    """Return persisted session groups and per-session layout metadata."""
+    with _connect() as conn:
+        groups = conn.execute(
+            """
+            SELECT id, name, color, collapsed, sort_order, created_at
+            FROM session_groups
+            ORDER BY sort_order ASC, created_at ASC
+            """
+        ).fetchall()
+        sessions = conn.execute(
+            """
+            SELECT session_id, title_override, pinned, group_id, sort_order, updated_at
+            FROM session_layout
+            ORDER BY sort_order ASC, updated_at ASC
+            """
+        ).fetchall()
+    return {
+        "groups": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "color": r["color"],
+                "collapsed": bool(r["collapsed"]),
+                "sort_order": int(r["sort_order"]),
+                "created_at": r["created_at"],
+            }
+            for r in groups
+        ],
+        "sessions": [
+            {
+                "session_id": r["session_id"],
+                "title_override": r["title_override"],
+                "pinned": bool(r["pinned"]),
+                "group_id": r["group_id"],
+                "sort_order": int(r["sort_order"]),
+                "updated_at": r["updated_at"],
+            }
+            for r in sessions
+        ],
+    }
+
+
+def replace_session_layout(
+    *,
+    groups: list[dict[str, Any]],
+    sessions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Replace all session layout rows (single-workspace sidebar state)."""
+    now = _now()
+    with _connect() as conn:
+        conn.execute("DELETE FROM session_layout")
+        conn.execute("DELETE FROM session_groups")
+        for g in groups:
+            conn.execute(
+                """
+                INSERT INTO session_groups (id, name, color, collapsed, sort_order, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    g["id"],
+                    g["name"],
+                    g["color"],
+                    1 if g.get("collapsed") else 0,
+                    int(g.get("sort_order") or 0),
+                    g.get("created_at") or now,
+                ),
+            )
+        for s in sessions:
+            conn.execute(
+                """
+                INSERT INTO session_layout
+                (session_id, title_override, pinned, group_id, sort_order, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    s["session_id"],
+                    s.get("title_override"),
+                    1 if s.get("pinned") else 0,
+                    s.get("group_id"),
+                    int(s.get("sort_order") or 0),
+                    s.get("updated_at") or now,
+                ),
+            )
+    return get_session_layout()
 
 
 init_db()

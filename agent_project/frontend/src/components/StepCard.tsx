@@ -30,7 +30,7 @@ function ToolRow({ tc }: { tc: ToolCall }) {
         {/* Tool name */}
         <span
           className={`text-[11px] font-medium leading-snug flex-shrink-0 ${
-            display.group === 'workflow' ? 'text-violet-300' : 'text-zinc-400'
+            display.group === 'workflow' ? 'text-violet-300' : 'text-ink-muted'
           }`}
         >
           {display.label}
@@ -60,7 +60,7 @@ function ToolRow({ tc }: { tc: ToolCall }) {
       </button>
 
       {expanded && cleanedSummary && (
-        <p className="ml-6 mb-1 text-[11px] text-zinc-700 leading-relaxed border-l border-[#252525] pl-2.5">
+        <p className="ml-6 mb-1 text-[11px] text-zinc-700 leading-relaxed border-l border-border-hover pl-2.5">
           {cleanedSummary}
         </p>
       )}
@@ -86,7 +86,7 @@ export function StepCard({ step, index, isLast }: Props) {
     <div className="relative flex gap-3">
       {/* Vertical connector line */}
       {!isLast && (
-        <div className="absolute left-[6px] top-[14px] bottom-0 w-px bg-[#1e1e1e]" />
+        <div className="absolute left-[6px] top-[14px] bottom-0 w-px bg-surface-3" />
       )}
 
       {/* Step indicator dot */}
@@ -101,7 +101,7 @@ export function StepCard({ step, index, isLast }: Props) {
               ? 'border-emerald-600 bg-emerald-600'
               : isFailed
               ? 'border-red-600 bg-red-600/20'
-              : 'border-[#2a2a2a] bg-transparent'
+              : 'border-border-hover bg-transparent'
             }
           `}
         >
@@ -112,7 +112,7 @@ export function StepCard({ step, index, isLast }: Props) {
           )}
           {isFailed && (
             <svg width="6" height="6" viewBox="0 0 6 6" fill="none">
-              <path d="M1.5 1.5L4.5 4.5M4.5 1.5L1.5 4.5" stroke="#ef4444" strokeWidth="1.2" strokeLinecap="round" />
+              <path d="M1.5 1.5L4.5 4.5M4.5 1.5L1.5 4.5" stroke="var(--color-danger)" strokeWidth="1.2" strokeLinecap="round" />
             </svg>
           )}
         </div>
@@ -136,7 +136,7 @@ export function StepCard({ step, index, isLast }: Props) {
           </span>
           <p
             className={`text-xs leading-relaxed transition-colors duration-300
-              ${isRunning ? 'text-zinc-200' : isComplete ? 'text-zinc-500' : 'text-[#3a3a3a]'}
+              ${isRunning ? 'text-ink' : isComplete ? 'text-ink-dim' : 'text-[#3a3a3a]'}
             `}
           >
             {description}

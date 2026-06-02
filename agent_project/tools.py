@@ -221,12 +221,16 @@ def run_dcf_workflow(
     allow_external_assumptions: bool = True,
     assumption_overrides: dict[str, float] | None = None,
     parent_step_id: str = "workflow_dcf",
+    parent_run_id: str | None = None,
 ) -> str:
     """Run a deterministic DCF valuation workflow for a ticker.
 
     Default (assumption_review_mode=True): gathers evidence, proposes
     assumptions, returns them for review.  After user responds, call again
     with assumption_overrides and assumption_review_mode=False to complete.
+
+    ``parent_run_id`` links this run to a source run (clone/rerun) so the KG
+    records lineage and the run accumulates instead of overwriting.
 
     The tool result includes a detailed report with assumption provenance,
     WACC decomposition, confidence label, and quality flags.
@@ -239,6 +243,8 @@ def run_dcf_workflow(
         assumption_overrides=assumption_overrides,
         parent_step_id=parent_step_id,
         session_id=_session_ctx.get(),
+        parent_run_id=parent_run_id,
+        run_trigger="rerun" if parent_run_id else "initial",
     )
 
     if payload.get("__dcf_hitl__"):

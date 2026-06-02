@@ -50,9 +50,9 @@ function ArtifactImages({
             <img
               src={`/artifacts/${threadId}/${filename}`}
               alt={label}
-              className="rounded-xl border border-[#2a2a2a] max-w-full"
+              className="rounded-xl border border-border-hover max-w-full"
             />
-            <figcaption className="text-xs text-zinc-600 text-center">{label}</figcaption>
+            <figcaption className="text-xs text-ink-dim text-center">{label}</figcaption>
           </figure>
         )
       })}
@@ -89,10 +89,10 @@ export function ReportPane({
   return (
     <div className="flex-1 flex flex-col overflow-hidden min-w-0">
       {/* Top bar */}
-      <div className="flex items-center gap-3 px-6 py-3.5 border-b border-[#1a1a1a] flex-shrink-0">
+      <div className="flex items-center gap-3 px-6 py-3.5 border-b border-border flex-shrink-0">
         <button
           onClick={onReset}
-          className="text-zinc-700 hover:text-zinc-400 transition-colors duration-150 flex-shrink-0"
+          className="text-zinc-700 hover:text-ink-muted transition-colors duration-150 flex-shrink-0"
           title="New research"
         >
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
@@ -106,7 +106,7 @@ export function ReportPane({
           </svg>
         </button>
 
-        <h2 className="flex-1 text-sm text-zinc-300 font-medium truncate">{query}</h2>
+        <h2 className="flex-1 text-sm text-ink-muted font-medium truncate">{query}</h2>
 
         <div className="flex items-center gap-1.5 flex-shrink-0">
           {(status === 'executing' || status === 'synthesizing' || status === 'planning') ? (
@@ -116,7 +116,7 @@ export function ReportPane({
           ) : status === 'error' ? (
             <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
           ) : null}
-          <span className="text-xs text-zinc-600">{STATUS_LABEL[status] ?? ''}</span>
+          <span className="text-xs text-ink-dim">{STATUS_LABEL[status] ?? ''}</span>
         </div>
       </div>
 
@@ -127,7 +127,7 @@ export function ReportPane({
           <div className="space-y-3 animate-fade-up">
             {status === 'planning' && <Skeleton lines={[60, 90, 75]} />}
             {status === 'awaiting_approval' && (
-              <p className="text-sm text-zinc-600">
+              <p className="text-sm text-ink-dim">
                 Review and approve the plan on the right to begin execution.
               </p>
             )}
@@ -166,7 +166,7 @@ function Skeleton({ lines }: { lines: number[] }) {
   return (
     <div className="space-y-2.5 pt-2">
       {lines.map((w, i) => (
-        <div key={i} className="h-3 rounded-md bg-[#1a1a1a]" style={{ width: `${w}%` }} />
+        <div key={i} className="h-3 rounded-md bg-surface-2" style={{ width: `${w}%` }} />
       ))}
     </div>
   )

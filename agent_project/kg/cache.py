@@ -86,6 +86,7 @@ TTL: dict[str, float] = {
     "news_item":            float("inf"),    # news article — historical event
     "market_metric_price":  3600.0,          # 1h — current snapshot (refreshable)
     "market_metric_fund":   86400.0,         # 24h — current FY snapshot (refreshable)
+    "market_period":        86400.0,         # 24h — latest-reported-period probe (Option B)
     "person":               2592000.0,       # 30d — entity attributes
     # ── Layer 2 — Derived inferences (rebuildable, hash-checked) ─────────────
     "driver":               604800.0,        # 7d narrative stability
@@ -223,6 +224,38 @@ class KGCache:
         """Unconditional fetch by id (bypasses TTL/confidence checks)."""
         return self._nodes.get(node_id)
 
+    def query(
+        self,
+        ticker: str | None = None,
+        node_type: str | None = None,
+        field: str | None = None,
+    ) -> list[KGNode]:
+        """Return nodes matching the given filters, read from durable storage.
+
+        Reads from SQLite (not just the in-memory map) so callers don't have to
+        pre-hydrate the cache scope — the KG audit and the ingest
+        dedup/contradiction checks rely on this. ``ticker=None`` returns the
+        whole graph.
+        """
+        rows = storage.list_kg_nodes(ticker=ticker) if ticker else storage.list_kg_nodes()
+        out: list[KGNode] = []
+        for n in rows:
+            if node_type and n.get("node_type") != node_type:
+                continue
+            if field and n.get("field") != field:
+                continue
+            out.append(n)  # type: ignore[arg-type]
+        return out
+
+    def get_nearest(
+        self, ticker: str, node_type: str, field: str,
+    ) -> KGNode | None:
+        """Most-recently-updated node matching (ticker, node_type, field)."""
+        matches = self.query(ticker=ticker, node_type=node_type, field=field)
+        if not matches:
+            return None
+        return max(matches, key=lambda n: float(n.get("updated_at", 0) or 0))
+
     def put(
         self,
         ticker: str,
@@ -309,6 +342,15 @@ class KGCache:
         with self._lock:
             removed = self._nodes.pop(node_id, None)
         logger.info("KG INVALIDATE id=%s removed=%s", node_id, removed is not None)
+
+    def delete(self, node_id: str) -> None:
+        """Hard-delete a node from durable storage AND the in-memory cache.
+
+        Used by the KG audit auto-fixer to purge stale Layer-2 facts. Unlike
+        ``invalidate`` (memory-only), this removes the row from SQLite too.
+        """
+        storage.delete_kg_node(node_id)
+        self.invalidate(node_id)
 
     def add_edge(
         self,

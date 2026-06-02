@@ -6,13 +6,14 @@ import logging
 from typing import Any
 
 from .activity import emit_step, emit_workflow_terminal
+from .idgen import new_run_id
 from .state import DCFState
 
 logger = logging.getLogger(__name__)
 
 
 def normalize_input_node(state: DCFState) -> dict:
-    """Validate ticker and horizon, emit workflow-started span."""
+    """Validate ticker and horizon, mint the unique KG run id, emit start span."""
     parent_step_id = state.get("parent_step_id") or "workflow_dcf"
     emit_workflow_terminal(
         parent_step_id=parent_step_id,
@@ -25,14 +26,28 @@ def normalize_input_node(state: DCFState) -> dict:
         raise ValueError("ticker is required for DCF workflow.")
     horizon = int(state.get("horizon_years") or 5)
     horizon = min(max(horizon, 3), 10)
+
+    # ── Mint unique KG run identity (once per run) ──────────────────────────
+    # If a parent_run_id was supplied (clone/rerun), encode lineage in the id.
+    parent_run_id = state.get("parent_run_id") or None
+    kg_run_id = state.get("kg_run_id") or new_run_id(ticker, parent_run_id=parent_run_id)
+    run_trigger = state.get("run_trigger") or ("rerun" if parent_run_id else "initial")
+
     logger.info(
-        "DCF normalize_input ticker=%s horizon_years=%d", ticker, horizon,
+        "DCF normalize_input ticker=%s horizon_years=%d kg_run_id=%s trigger=%s parent=%s",
+        ticker, horizon, kg_run_id, run_trigger, parent_run_id or "-",
     )
     emit_step(
         "normalize_input", "complete", parent_step_id,
         {"ticker": ticker, "horizon_years": horizon, "summary_line": f"{ticker} {horizon}yr horizon"},
     )
-    return {"ticker": ticker, "horizon_years": horizon}
+    return {
+        "ticker": ticker,
+        "horizon_years": horizon,
+        "kg_run_id": kg_run_id,
+        "parent_run_id": parent_run_id,
+        "run_trigger": run_trigger,
+    }
 
 
 def cache_check_node(state: DCFState) -> dict:

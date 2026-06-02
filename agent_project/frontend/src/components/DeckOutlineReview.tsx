@@ -74,7 +74,7 @@ export function DeckOutlineReview({ review, threadId, onApprove, onReject }: Pro
 
   if (rejecting) {
     return (
-      <div className="flex items-center gap-2 px-1 py-2 text-[11px] text-zinc-500">
+      <div className="flex items-center gap-2 px-1 py-2 text-[11px] text-ink-dim">
         <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 flex-shrink-0" />
         Outline rejected.
       </div>
@@ -82,24 +82,24 @@ export function DeckOutlineReview({ review, threadId, onApprove, onReject }: Pro
   }
 
   return (
-    <div className="rounded border border-[#1a1a2a] bg-[#07070f] overflow-hidden">
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-[#141420] text-[11px]">
+    <div className="rounded border border-border bg-bg overflow-hidden">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-border text-[11px]">
         <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
-        <span className="text-zinc-300 font-medium truncate">
+        <span className="text-ink-muted font-medium truncate">
           Review outline — {review.deck_title || 'Deck'}
         </span>
-        <span className="ml-auto text-zinc-600 tabular-nums shrink-0">
+        <span className="ml-auto text-ink-dim tabular-nums shrink-0">
           {editedSlides.length} slides
         </span>
       </div>
 
       {review.outline?.rationale && (
-        <div className="px-3 py-2 border-b border-[#0f0f18] text-[10px] text-zinc-600 leading-relaxed">
+        <div className="px-3 py-2 border-b border-border-subtle text-[10px] text-ink-dim leading-relaxed">
           {review.outline.rationale}
         </div>
       )}
 
-      <div className="max-h-52 overflow-y-auto divide-y divide-[#0f0f18]">
+      <div className="max-h-52 overflow-y-auto divide-y divide-border-subtle">
         {editedSlides.map((slide, idx) => (
           <div
             key={slide.slide_id || idx}
@@ -113,7 +113,7 @@ export function DeckOutlineReview({ review, threadId, onApprove, onReject }: Pro
               type="text"
               value={slide.title}
               onChange={e => updateTitle(idx, e.target.value)}
-              className="w-full bg-transparent border-b border-transparent hover:border-[#2a2a3a] focus:border-indigo-500/50 focus:outline-none text-zinc-300 truncate"
+              className="w-full bg-transparent border-b border-transparent hover:border-border-accent focus:border-indigo-500/50 focus:outline-none text-ink-muted truncate"
               title="Edit slide title"
             />
           </div>
@@ -121,8 +121,8 @@ export function DeckOutlineReview({ review, threadId, onApprove, onReject }: Pro
       </div>
 
       {review.blocks_preview.length > 0 && (
-        <details className="border-t border-[#0f0f18] px-3 py-2 text-[10px] text-zinc-600">
-          <summary className="cursor-pointer hover:text-zinc-500">
+        <details className="border-t border-border-subtle px-3 py-2 text-[10px] text-ink-dim">
+          <summary className="cursor-pointer hover:text-ink-dim">
             {review.blocks_preview.length} content block(s)
           </summary>
           <ul className="mt-2 space-y-1 max-h-24 overflow-y-auto">
@@ -137,7 +137,7 @@ export function DeckOutlineReview({ review, threadId, onApprove, onReject }: Pro
         </details>
       )}
 
-      <div className="flex gap-2 px-3 py-3 border-t border-[#141420]">
+      <div className="flex gap-2 px-3 py-3 border-t border-border">
         <button
           type="button"
           onClick={handleApprove}
@@ -148,7 +148,7 @@ export function DeckOutlineReview({ review, threadId, onApprove, onReject }: Pro
         <button
           type="button"
           onClick={handleReject}
-          className="flex-1 py-2 rounded-lg text-xs font-medium bg-[#161616] hover:bg-[#1e1e1e] active:bg-[#121212] text-zinc-500 border border-[#2a2a2a] transition-colors duration-150"
+          className="flex-1 py-2 rounded-lg text-xs font-medium bg-surface hover:bg-surface-3 active:bg-surface text-ink-dim border border-border-hover transition-colors duration-150"
         >
           Reject
         </button>

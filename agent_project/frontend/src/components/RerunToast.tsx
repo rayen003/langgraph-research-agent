@@ -70,7 +70,7 @@ export function RerunToast({ toast, onView, onDismiss, onInspect }: Props) {
           tabIndex={0}
           onClick={(e) => { e.stopPropagation(); onDismiss() }}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onDismiss() } }}
-          className="text-zinc-500 hover:text-zinc-300 text-[12px] px-1"
+          className="text-ink-dim hover:text-ink-muted text-[12px] px-1"
           title="dismiss"
         >
           ✕

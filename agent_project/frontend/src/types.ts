@@ -141,6 +141,8 @@ export interface SessionMessage {
   id: string
   type: SessionMessageType
   content: string
+  /** Files staged in the composer when this user message was sent. */
+  attachedDocs?: AttachedDocSnapshot[]
   /** Only set on research_report messages */
   threadId?: string
   artifactPaths?: string[]
@@ -164,6 +166,17 @@ export interface SessionMessage {
   invalidationReason?: string
 }
 
+export type SessionGroupColor = 'blue' | 'teal' | 'indigo' | 'slate' | 'violet' | 'amber'
+
+export interface SessionGroup {
+  id: string
+  name: string
+  color: SessionGroupColor
+  collapsed?: boolean
+  sortOrder: number
+  createdAt: string
+}
+
 export interface Session {
   id: string
   title: string
@@ -171,17 +184,36 @@ export interface Session {
   chatThreadId: string
   messages: SessionMessage[]
   createdAt: string
+  /** Pinned sessions float to the top of the sidebar. */
+  pinned?: boolean
+  /** Optional group membership for sidebar organization. */
+  groupId?: string | null
+  /** Sort index within pinned bucket, group, or ungrouped list. */
+  sortOrder?: number
 }
+
+export type DocStage =
+  | 'queued' | 'uploading' | 'parsing' | 'chunking' | 'embedding' | 'ready' | 'error'
 
 export interface DocumentInfo {
   doc_id: string
   filename: string
   session_id: string
   status: 'processing' | 'ready' | 'error'
+  /** Fine-grained ingest progress while status === 'processing'. */
+  stage?: DocStage | null
   chunk_count: number
   page_count: number
   error?: string | null
   created_at: number
+}
+
+/** Snapshot of an attachment at send time (shown on the user bubble). */
+export interface AttachedDocSnapshot {
+  doc_id: string
+  filename: string
+  status: DocumentInfo['status']
+  page_count?: number
 }
 
 export interface JobSummary {

@@ -27,7 +27,7 @@ except ImportError:  # LangGraph >=1.0 style
         raise Interrupt(payload)
 from pydantic import BaseModel, Field
 
-from documents import search_documents, _session_ctx
+from documents import search_documents, _session_ctx, list_docs
 from plan_store import save_plan as save_plan_to_store, update_step as store_update_step, save_report as store_save_report
 from storage import set_session_memory
 from tools import (
@@ -156,9 +156,17 @@ STATIC_SYSTEM_PROMPT = (
     "You never break character, never ask for clarification, and never offer optional follow-ups.\n"
     "\n"
     "## Tool rules\n"
-    "- search_documents: search the user's uploaded files (PDFs, spreadsheets, reports). "
-    "ALWAYS call this BEFORE search_web for every step — uploaded documents may already contain the data you need. "
-    "Only use search_web when search_documents returns no relevant results.\n"
+    "- search_documents returns a RELEVANCE VERDICT, not raw text chunks:\n"
+    "  {\"status\": \"relevant\"|\"partial\"|\"mismatch\"|\"none\", \"covered\": [...], \"missing\": [...], \"chunk_ids\": [...]}\n"
+    "  * status='relevant': docs cover everything needed. Fetch chunks with retrieve_tool_result(chunk_id).\n"
+    "  * status='partial': docs cover SOME of what was asked. Fetch relevant chunks, then use search_web for the missing topics.\n"
+    "  * status='mismatch': docs are about DIFFERENT entities than the query. STOP and tell the user:\n"
+    "    'The uploaded documents appear to be about [company from docs], but you asked about [user's company]. Which should I analyze?'\n"
+    "    Do NOT silently fall back to search_web. Ask the user.\n"
+    "  * status='gate_skipped': gate model was skipped (you passed skip_gate=True). Evaluate chunk metadata yourself.\n"
+    "  * status='none': no docs uploaded or no matches. Proceed with search_web.\n"
+    "  ALWAYS call search_documents BEFORE search_web for every step.\n"
+    "  Pass skip_gate=True when you already know what docs contain from prior turns — saves ~1-2s.\n"
     f"- search_web budget: maximum {MAX_SEARCHES_PER_STEP} calls per step. Be precise.\n"
     "- search_web returns a summary + tool_result_id pointer ONLY. "
     "You MUST call retrieve_tool_result(tool_result_id) to read the full content.\n"
@@ -472,19 +480,46 @@ def plan_node(state: dict) -> dict:
             f"{prior}\n"
         )
 
+    # ── Document inventory: surface uploaded docs to the planner ──────────
+    doc_context = ""
+    session_id = state.get("session_id") or ""
+    if session_id:
+        docs = list_docs(session_id)
+        ready_docs = [d for d in docs if d.get("status") == "ready"]
+        if ready_docs:
+            lines = []
+            for d in ready_docs:
+                label = d.get("filename", "unknown")
+                company = d.get("company") or ""
+                ticker = d.get("ticker") or ""
+                doc_type = d.get("doc_type") or ""
+                period = d.get("fiscal_period") or ""
+                meta_parts = [p for p in [company, ticker, doc_type, period] if p]
+                if meta_parts:
+                    label += f" ({', '.join(meta_parts)})"
+                lines.append(f"- {label}")
+            doc_context = (
+                "\n\nUploaded documents available (search with the search_documents tool):\n"
+                + "\n".join(lines) + "\n"
+                "If uploaded documents are about a DIFFERENT company/topic than the user asked, "
+                "include a step that calls search_documents FIRST to check relevance before using search_web.\n"
+            )
+
     planner = llm.with_structured_output(PlanDraft)
     draft = planner.invoke([
         HumanMessage(content=(
             "Create a concise execution plan (3-6 steps) for this task. "
             "Return just meaningful steps.\n\n"
             "Important constraints:\n"
-            "- Data retrieval: use search_web for news/articles/text. "
+            "- Data retrieval: use search_documents FIRST for any uploaded-doc content. "
+            "Use search_web for news/articles/text not found in docs. "
             "For bulk structured data (price history, CSVs, JSON APIs), use execute_python "
             "with pandas.read_csv(url) or requests — it has full network access.\n"
             "- For explicit DCF/intrinsic-value valuation tasks, include a step that calls "
             "run_dcf_workflow (deterministic workflow) instead of improvising formulas in plain text.\n"
             "- execute_python can fetch, compute, AND visualize in a single step.\n"
-            f"{memory_section}\n"
+            f"{memory_section}"
+            f"{doc_context}"
             "Task:\n" + str(query)
         ))
     ])

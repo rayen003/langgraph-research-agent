@@ -2,6 +2,98 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Dark mode (default) ──────────────────────────── */
+:root {
+  --color-bg: #08080a;
+  --color-bg-raised: #0c0c10;
+  --color-bg-overlay: #101016;
+  --color-bg-input: #14141c;
+  --color-surface: #18181e;
+  --color-surface-2: #1c1c24;
+  --color-surface-3: #22222c;
+  --color-border: #1e1e28;
+  --color-border-subtle: #18181f;
+  --color-border-hover: #282836;
+  --color-border-accent: #2a2a3c;
+  --color-ink: #e4e4eb;
+  --color-ink-muted: #8b8b99;
+  --color-ink-dim: #5a5a66;
+  --color-ink-disabled: #3a3a44;
+  --color-accent: #3b82f6;
+  --color-accent-soft: rgba(59, 130, 246, 0.12);
+  --color-accent-ring: rgba(59, 130, 246, 0.4);
+  --color-accent-muted: #6366f1;
+  --color-success: #10b981;
+  --color-success-soft: rgba(16, 185, 129, 0.12);
+  --color-danger: #ef4444;
+  --color-danger-soft: rgba(239, 68, 68, 0.12);
+  --color-warn: #f59e0b;
+  --color-warn-soft: rgba(245, 158, 11, 0.12);
+
+  --color-prose-heading: #f4f4f5;
+  --color-prose-body: #d4d4d8;
+  --color-prose-muted: #a1a1aa;
+  --color-prose-link: #818cf8;
+  --color-prose-code-bg: #18181b;
+  --color-prose-code-text: #a5b4fc;
+  --color-prose-pre-bg: #111116;
+  --color-prose-pre-border: #27272a;
+  --color-prose-blockquote-border: #3f3f46;
+  --color-prose-blockquote-text: #71717a;
+  --color-prose-th-text: #a1a1aa;
+  --color-prose-td-border: #1e1e1e;
+  --color-prose-hr: #27272a;
+  --color-prose-strong: #e4e4e7;
+  --color-scrollbar-thumb: #27272a;
+  --color-scrollbar-thumb-hover: #3f3f46;
+}
+
+/* ── Light mode ─────────────────────────────────────── */
+html.light {
+  --color-bg: #f8f8fa;
+  --color-bg-raised: #ffffff;
+  --color-bg-overlay: #f3f3f6;
+  --color-bg-input: #ffffff;
+  --color-surface: #f0f0f3;
+  --color-surface-2: #e8e8ed;
+  --color-surface-3: #dedee4;
+  --color-border: #d4d4dc;
+  --color-border-subtle: #e4e4ea;
+  --color-border-hover: #c0c0cc;
+  --color-border-accent: #b8b8cc;
+  --color-ink: #18181e;
+  --color-ink-muted: #525260;
+  --color-ink-dim: #6b6b78;
+  --color-ink-disabled: #b0b0be;
+  --color-accent: #2563eb;
+  --color-accent-soft: rgba(37, 99, 235, 0.1);
+  --color-accent-ring: rgba(37, 99, 235, 0.35);
+  --color-accent-muted: #4f46e5;
+  --color-success: #059669;
+  --color-success-soft: rgba(5, 150, 105, 0.1);
+  --color-danger: #dc2626;
+  --color-danger-soft: rgba(220, 38, 38, 0.1);
+  --color-warn: #d97706;
+  --color-warn-soft: rgba(217, 119, 6, 0.1);
+
+  --color-prose-heading: #18181e;
+  --color-prose-body: #3f3f46;
+  --color-prose-muted: #6b7280;
+  --color-prose-link: #4f46e5;
+  --color-prose-code-bg: #f0f0f3;
+  --color-prose-code-text: #6d28d9;
+  --color-prose-pre-bg: #f8f8fa;
+  --color-prose-pre-border: #d4d4dc;
+  --color-prose-blockquote-border: #d4d4dc;
+  --color-prose-blockquote-text: #6b7280;
+  --color-prose-th-text: #525260;
+  --color-prose-td-border: #e4e4ea;
+  --color-prose-hr: #d4d4dc;
+  --color-prose-strong: #18181e;
+  --color-scrollbar-thumb: #c0c0cc;
+  --color-scrollbar-thumb-hover: #a0a0aa;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -13,37 +105,65 @@ body,
 }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  margin: 0;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
   -webkit-font-smoothing: antialiased;
-  background: #0a0a0a;
-  color: #e4e4e7;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--color-ink);
+  background: var(--color-bg);
+  transition: background 0.2s ease, color 0.15s ease;
 }
 
-/* ── Scrollbar ─────────────────────────────────────────── */
 ::-webkit-scrollbar {
   width: 4px;
+  height: 4px;
 }
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
 ::-webkit-scrollbar-thumb {
-  background: #27272a;
+  background: var(--color-scrollbar-thumb);
   border-radius: 2px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
-  background: #3f3f46;
+  background: var(--color-scrollbar-thumb-hover);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent-ring);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--color-accent-soft);
+  color: var(--color-ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* ── Prose (report markdown) ───────────────────────────── */
 .prose {
-  color: #d4d4d8;
+  color: var(--color-prose-body);
   line-height: 1.75;
 }
 .prose h1,
 .prose h2,
 .prose h3,
 .prose h4 {
-  color: #f4f4f5;
+  color: var(--color-prose-heading);
   font-weight: 500;
   letter-spacing: -0.015em;
 }
@@ -51,26 +171,26 @@ body {
 .prose h2 { font-size: 1.1rem;  margin-top: 1.75rem; }
 .prose h3 { font-size: 0.95rem; margin-top: 1.5rem; }
 .prose p  { margin-top: 0.85rem; }
-.prose strong { color: #e4e4e7; font-weight: 500; }
-.prose em { color: #a1a1aa; }
+.prose strong { color: var(--color-prose-strong); font-weight: 500; }
+.prose em { color: var(--color-prose-muted); }
 .prose a {
-  color: #818cf8;
+  color: var(--color-prose-link);
   text-decoration: none;
 }
 .prose a:hover {
   text-decoration: underline;
 }
 .prose code {
-  color: #a5b4fc;
-  background: #18181b;
+  color: var(--color-prose-code-text);
+  background: var(--color-prose-code-bg);
   padding: 0.15em 0.45em;
   border-radius: 4px;
   font-size: 0.82em;
   font-family: 'Fira Code', 'JetBrains Mono', 'Menlo', monospace;
 }
 .prose pre {
-  background: #111116;
-  border: 1px solid #27272a;
+  background: var(--color-prose-pre-bg);
+  border: 1px solid var(--color-prose-pre-border);
   border-radius: 8px;
   padding: 1rem 1.2rem;
   overflow-x: auto;
@@ -78,12 +198,12 @@ body {
 .prose pre code {
   background: transparent;
   padding: 0;
-  color: #e4e4e7;
+  color: var(--color-prose-body);
   font-size: 0.82rem;
 }
 .prose blockquote {
-  border-left: 2px solid #3f3f46;
-  color: #71717a;
+  border-left: 2px solid var(--color-prose-blockquote-border);
+  color: var(--color-prose-blockquote-text);
   margin-left: 0;
   padding-left: 1rem;
 }
@@ -91,7 +211,7 @@ body {
 .prose li { margin-top: 0.3rem; }
 .prose hr {
   border: none;
-  border-top: 1px solid #27272a;
+  border-top: 1px solid var(--color-prose-hr);
   margin: 1.5rem 0;
 }
 .prose table {
@@ -101,15 +221,15 @@ body {
 }
 .prose th {
   text-align: left;
-  color: #a1a1aa;
+  color: var(--color-prose-th-text);
   font-weight: 500;
-  border-bottom: 1px solid #27272a;
+  border-bottom: 1px solid var(--color-border);
   padding: 0.5rem 0.75rem;
 }
 .prose td {
-  border-bottom: 1px solid #1e1e1e;
+  border-bottom: 1px solid var(--color-prose-td-border);
   padding: 0.5rem 0.75rem;
-  color: #d4d4d8;
+  color: var(--color-prose-body);
 }
 .prose tr:last-child td {
   border-bottom: none;

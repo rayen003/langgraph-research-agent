@@ -164,9 +164,16 @@ def _try_write_kg_snapshot(
         brief_hash = hashlib.sha256(
             json.dumps(brief, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:10]
-        # Anchor "ticker" — for deck_run we use the deck title slug + session.
-        # This keeps the node ID deterministic across re-runs of the same brief.
+        # Anchor "ticker" — when the deck has a source DCF run, nest it under
+        # that company's ticker (parsed from the dcf_run node id, e.g.
+        # "META::dcf_run::workflow_dcf::meta" → "META") so the deck groups under
+        # the company in the KG instead of becoming its own top-level ticker.
+        # Falls back to a session-scoped anchor for DCF-less decks.
         deck_anchor = f"deck::{session_id}"
+        if dcf_run_id and "::" in dcf_run_id:
+            parsed_ticker = dcf_run_id.split("::", 1)[0].strip()
+            if parsed_ticker:
+                deck_anchor = parsed_ticker
         deck_run_field = f"run::{brief_hash}"
 
         # Deck run anchor (Layer 3 — immutable run artifact)
@@ -189,7 +196,11 @@ def _try_write_kg_snapshot(
             run_id=brief_hash,
         )
 
-        # One node per slide (run-scoped, content-keyed for stability)
+        deck_run_id = f"{deck_anchor}::deck_run::{brief_hash}::{deck_run_field}"
+
+        # One node per slide (run-scoped, content-keyed for stability).
+        # Each slide also gets a HAS_SLIDE edge from the deck_run so slides
+        # nest under their deck instead of floating as orphans.
         for s in slides:
             slide_id = s.get("slide_id", "")
             if not slide_id:
@@ -208,8 +219,18 @@ def _try_write_kg_snapshot(
                 session_id=session_id,
                 run_id=brief_hash,
             )
+            try:
+                cache.add_edge(
+                    src_id=deck_run_id,
+                    tgt_id=f"{deck_anchor}::deck_slide::{brief_hash}::{slide_id}",
+                    relation="HAS_SLIDE",
+                    session_id=session_id,
+                    confidence=1.0,
+                    source="workflow_deck",
+                )
+            except Exception:
+                logger.warning("Failed to write HAS_SLIDE edge — continuing.", exc_info=True)
 
-        deck_run_id = f"{deck_anchor}::deck_run::{brief_hash}::{deck_run_field}"
         logger.info("KG snapshot written: %s + %d slide nodes", deck_run_id, len(slides))
 
         # ── HAS_DECK edge: dcf_run → deck_run ──────────────────────────────

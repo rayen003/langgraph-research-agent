@@ -84,3 +84,9 @@ node_modules/
 
 # Old monolithic DCF backup (retrieve from git history instead)
 agent_project/graphs/workflows/dcf.py.bak
+
+# session/tooling junk
+.lean-ctx/
+.codex/
+agent_project/.lean-ctx/
+agent_project/kg.db

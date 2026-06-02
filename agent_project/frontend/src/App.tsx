@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useAgentRun } from './hooks/useAgentRun'
 import { useSessionManager } from './hooks/useSessionManager'
 import { useJobs } from './hooks/useJobs'
@@ -10,7 +10,12 @@ import { DocumentPreview } from './components/DocumentPreview'
 import { DeckPreview } from './components/DeckPreview'
 import { JobsPanel } from './components/JobsPanel'
 import { KnowledgePanel } from './components/KnowledgePanel'
+import { KgNotificationPanel } from './components/KgNotificationPanel'
+import type { KgNode } from './hooks/useKnowledgeGraph'
+import { ResizablePanel } from './components/ResizablePanel'
+import { usePanelHidden } from './hooks/usePanelHidden'
 import { RerunToast, type RerunToastState } from './components/RerunToast'
+import { SettingsButton } from './components/SettingsPanel'
 import type { JobSummary, Mode } from './types'
 
 let _msgCounter = 0
@@ -18,9 +23,13 @@ const nextMsgId = () => `m_${Date.now()}_${++_msgCounter}`
 
 export default function App() {
   const { state, startRun, amendMessage, approve, reject, reset } = useAgentRun()
-  const { sessions, activeSession, newSession, selectSession, deleteSession, addMessage, truncateMessagesFrom, updateChatThreadId } = useSessionManager()
+  const { sessions, groups, activeSession, newSession, selectSession, deleteSession, renameSession, pinSession, createGroup, updateGroup, deleteGroup, moveSessionToGroup, reorderSessions, addMessage, truncateMessagesFrom, updateChatThreadId } = useSessionManager()
   const { researchJobs, runningCount } = useJobs(true)
-  const { docs, upload, remove: removeDoc } = useDocuments(activeSession?.id ?? '')
+  const { docs, upload, remove: removeDoc } = useDocuments(
+    activeSession?.id ?? '',
+    () => setKgRefreshTrigger(t => t + 1),
+  )
+  const [composerDocIds, setComposerDocIds] = useState<Set<string>>(() => new Set())
   const [mode, setMode] = useState<Mode>('auto')
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null)
   const [selectedDeck, setSelectedDeck] = useState<{ threadId: string; filename: string; title?: string } | null>(null)
@@ -29,6 +38,24 @@ export default function App() {
   // Increments when a rerun completes so KnowledgePanel can refresh the KG
   // and pick up the new DCF run nodes written during the workflow.
   const [kgRefreshTrigger, setKgRefreshTrigger] = useState(0)
+
+  // App-level KG node feed for the always-mounted notification widget. Lives
+  // here (not inside KnowledgePanel) so toasts about KG writes — document fact
+  // extraction, filings, DCF runs — surface even while the KG panel is CLOSED
+  // (the common case: user uploads from the chat composer). Refetches whenever
+  // kgRefreshTrigger bumps (rerun complete, or a document finishes ingest →
+  // onDocReady), which is exactly when new nodes have been written.
+  const [kgNotifNodes, setKgNotifNodes] = useState<KgNode[]>([])
+  useEffect(() => {
+    const sid = activeSession?.id
+    if (!sid) return
+    let cancelled = false
+    fetch(`/kg/${encodeURIComponent(sid)}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!cancelled && d) setKgNotifNodes(d.nodes ?? []) })
+      .catch(() => { /* offline */ })
+    return () => { cancelled = true }
+  }, [activeSession?.id, kgRefreshTrigger])
 
   // Auto-clear selection when doc disappears or session changes
   useEffect(() => {
@@ -153,24 +180,66 @@ export default function App() {
       ? { ...prev, status: 'error', error: state.error ?? 'error' } : prev)
   }, [state.status, state.thread_id, state.error])
 
+  // Stage uploaded docs in the composer until the user sends a message.
+  useEffect(() => {
+    setComposerDocIds(new Set(docs.map(d => d.doc_id)))
+  }, [activeSession?.id])
+
+  const composerDocs = useMemo(
+    () => docs.filter(d => composerDocIds.has(d.doc_id)),
+    [docs, composerDocIds],
+  )
+
+  const handleUpload = useCallback(async (file: File) => {
+    const info = await upload(file)
+    if (info) {
+      setComposerDocIds(prev => new Set([...prev, info.doc_id]))
+    }
+  }, [upload])
+
+  const handleRemoveComposerDoc = useCallback(async (docId: string) => {
+    setComposerDocIds(prev => {
+      const next = new Set(prev)
+      next.delete(docId)
+      return next
+    })
+    await removeDoc(docId)
+    if (selectedDocId === docId) setSelectedDocId(null)
+  }, [removeDoc, selectedDocId])
+
   const handleSubmit = useCallback(
     (query: string, selectedMode: Mode) => {
       if (!activeSession) return
 
-      // New turn → allow a fresh commit even on a reused thread_id. Without
-      // this, the second+ message in a chat thread (same thread_id, memory
-      // continuity) hits the committedRef guard from the first run and never
-      // gets its assistant response added to the session.
       if (!query.startsWith('[DCF_APPROVED]')) {
         committedRef.current.clear()
       }
 
-      // Add user message to the active session (skip internal approval triggers)
+      const attached = composerDocs.filter(d => d.status !== 'error')
+
       if (!query.startsWith('[DCF_APPROVED]')) {
-        addMessage(activeSession.id, { id: nextMsgId(), type: 'user', content: query })
+        addMessage(activeSession.id, {
+          id: nextMsgId(),
+          type: 'user',
+          content: query,
+          attachedDocs: attached.length
+            ? attached.map(d => ({
+                doc_id: d.doc_id,
+                filename: d.filename,
+                status: d.status,
+                page_count: d.page_count,
+              }))
+            : undefined,
+        })
+        if (attached.length) {
+          setComposerDocIds(prev => {
+            const next = new Set(prev)
+            attached.forEach(d => next.delete(d.doc_id))
+            return next
+          })
+        }
       }
 
-      // Chat queries reuse the session's dedicated chatThreadId for multi-turn context
       const resolvedIsChat =
         selectedMode === 'chat' ||
         (selectedMode === 'auto' && state.resolved_intent === 'chat')
@@ -182,7 +251,7 @@ export default function App() {
         activeSession.id,
       )
     },
-    [activeSession, state.resolved_intent, startRun, addMessage],
+    [activeSession, state.resolved_intent, startRun, addMessage, composerDocs],
   )
 
   const handleNewSession = useCallback(() => {
@@ -204,8 +273,17 @@ export default function App() {
 
   const isRunActive = !['idle', 'complete', 'error', 'rejected'].includes(state.status)
 
-  // Execution panel: show for ANY active non-idle run (research or chat)
-  const showExecutionPanel = isRunActive
+  // Execution panel: show ONLY for workflow runs (DCF, deck, research plan-then-execute).
+  // Chat-only runs (web search, ReAct) should NOT trigger the sidebar — the activity
+  // trace is already embedded inline in the chat thread.
+  const hasWorkflowActivity = state.activity.some(
+    (a: any) => a?.kind === 'workflow' || a?.name?.startsWith('workflow:')
+  )
+  const showExecutionPanel = isRunActive && (
+    hasWorkflowActivity ||
+    state.dcf_review != null ||
+    state.deck_review != null
+  )
 
   const selectedDoc = docs.find(d => d.doc_id === selectedDocId) ?? null
   // Priority: doc preview > execution sidebar.  KG now opens as a full-screen
@@ -213,19 +291,44 @@ export default function App() {
   const rightPanel: 'doc' | 'execution' | 'deck' | null =
     selectedDeck ? 'deck' : selectedDoc ? 'doc' : showExecutionPanel ? 'execution' : null
   const rightPanelOpen = rightPanel !== null
-  const rightPanelWidth =
-    rightPanel === 'doc' || rightPanel === 'deck' ? 520 : 360
+  const rightPanelStorageKey =
+    rightPanel === 'deck'
+      ? 'ui.rightPanel.deck'
+      : rightPanel === 'doc'
+        ? 'ui.rightPanel.doc'
+        : 'ui.rightPanel.execution'
+  const rightPanelDefaultWidth = rightPanel === 'execution' ? 360 : 520
+  const rightPanelRevealLabel =
+    rightPanel === 'execution' ? 'Trace' : rightPanel === 'deck' ? 'Deck' : 'Doc'
+
+  const sessionsPanel = usePanelHidden('ui.panel.sessions.hidden')
+  const executionPanel = usePanelHidden('ui.rightPanel.execution.hidden')
+  const docPanel = usePanelHidden('ui.rightPanel.doc.hidden')
+  const deckPanel = usePanelHidden('ui.rightPanel.deck.hidden')
+  const rightPanelVisibility =
+    rightPanel === 'deck' ? deckPanel : rightPanel === 'doc' ? docPanel : executionPanel
 
   return (
-    <div className="h-screen bg-[#0a0a0a] text-zinc-100 flex overflow-hidden">
+    <div className="h-screen bg-bg text-ink flex overflow-hidden">
 
       {/* ── Left: Sessions sidebar ─────────────────────────────── */}
       <SessionsSidebar
         sessions={sessions}
+        groups={groups}
         activeId={activeSession?.id ?? ''}
         onSelect={selectSession}
         onNew={handleNewSession}
         onDelete={deleteSession}
+        onRename={renameSession}
+        onPin={pinSession}
+        onCreateGroup={() => createGroup()}
+        onUpdateGroup={updateGroup}
+        onDeleteGroup={deleteGroup}
+        onMoveToGroup={moveSessionToGroup}
+        onReorderSessions={reorderSessions}
+        hidden={sessionsPanel.hidden}
+        onHide={sessionsPanel.hide}
+        onReveal={sessionsPanel.show}
         disabled={isRunActive}
       />
 
@@ -236,27 +339,35 @@ export default function App() {
         mode={mode}
         onModeChange={setMode}
         onSubmit={handleSubmit}
-        onUpload={upload}
-        docs={docs}
+        onUpload={handleUpload}
+        docs={composerDocs}
         selectedDocId={selectedDocId}
         onSelectDoc={(id) => {
           setSelectedDeck(null)
           setSelectedDocId(id === selectedDocId ? null : id)
         }}
-        onRemoveDoc={removeDoc}
+        onRemoveDoc={handleRemoveComposerDoc}
         disabled={false}
         onOpenDeckPreview={handleOpenDeckPreview}
         onAmendMessage={handleAmendMessage}
       />
 
-      {/* ── Right: Doc preview OR Execution panel (slides in) ───── */}
-      <div
-        style={{ width: rightPanelOpen ? `${rightPanelWidth}px` : '0' }}
-        className="flex-shrink-0 overflow-hidden transition-[width] duration-300 ease-in-out"
-      >
-        <div style={{ width: `${rightPanelWidth}px` }} className="h-full">
+      {/* ── Right: Doc preview OR Execution panel ───────────────── */}
+      {rightPanelOpen && rightPanel && (
+        <ResizablePanel
+          key={rightPanelStorageKey}
+          defaultWidth={rightPanelDefaultWidth}
+          minWidth={280}
+          maxWidth={900}
+          side="left"
+          storageKey={rightPanelStorageKey}
+          className="border-l border-border-subtle bg-bg"
+          hidden={rightPanelVisibility.hidden}
+          onReveal={rightPanelVisibility.show}
+          revealLabel={rightPanelRevealLabel}
+        >
           {rightPanel === 'doc' && selectedDoc && (
-            <DocumentPreview doc={selectedDoc} onClose={() => setSelectedDocId(null)} />
+            <DocumentPreview doc={selectedDoc} onClose={() => setSelectedDocId(null)} onHide={rightPanelVisibility.hide} />
           )}
           {rightPanel === 'deck' && selectedDeck && (
             <DeckPreview
@@ -264,6 +375,7 @@ export default function App() {
               filename={selectedDeck.filename}
               title={selectedDeck.title}
               onClose={handleCloseDeckPreview}
+              onHide={rightPanelVisibility.hide}
             />
           )}
           {rightPanel === 'execution' && (
@@ -278,10 +390,11 @@ export default function App() {
               threadId={state.thread_id}
               onApprove={approve}
               onReject={reject}
+              onHide={rightPanelVisibility.hide}
             />
           )}
-        </div>
-      </div>
+        </ResizablePanel>
+      )}
 
       {/* ── Jobs panel ─────────────────────────────────────────── */}
       <JobsPanel
@@ -292,16 +405,27 @@ export default function App() {
 
       {/* ── KB toggle (floating, bottom-right) ─────────────────── */}
       <button
+        type="button"
         onClick={() => setKgPanelOpen(o => !o)}
-        className={`fixed bottom-4 right-4 z-40 px-3 py-2 rounded-full text-[12px] border shadow-lg transition ${
-          kgPanelOpen
-            ? 'bg-teal-500/20 text-teal-300 border-teal-500/40 hover:bg-teal-500/30'
-            : 'bg-zinc-900 text-zinc-400 border-zinc-700 hover:bg-zinc-800 hover:text-zinc-200'
-        }`}
-        title="Toggle Knowledge Graph"
+        aria-pressed={kgPanelOpen}
+        className={`
+          fixed bottom-4 right-4 z-40
+          flex items-center px-3.5 py-2 rounded-xl
+          text-[11px] font-medium tracking-[0.06em] uppercase
+          border shadow-lg shadow-black/40
+          transition-colors duration-150
+          ${kgPanelOpen
+            ? 'bg-bg-overlay text-ink border-accent-ring/35 hover:border-accent-ring/50'
+            : 'bg-bg-overlay text-ink-dim border-border-hover hover:border-border-hover hover:text-ink-muted'
+          }
+        `}
+        title={kgPanelOpen ? 'Close knowledge graph' : 'Open knowledge graph'}
       >
-        🧠 {kgPanelOpen ? 'Close KB' : 'Knowledge Base'}
+        {kgPanelOpen ? 'Close' : 'Knowledge'}
       </button>
+
+      {/* ── Settings button (bottom-left) ──── */}
+      <SettingsButton />
 
       {/* ── KB full-screen modal ──────────────────────────────── */}
       {kgPanelOpen && (
@@ -357,7 +481,7 @@ export default function App() {
         />
       )}
 
-      {/* ── Rerun toast (bottom-right, above the 🧠 button) ───── */}
+      {/* ── Rerun toast (bottom-right, above KB toggle) ───────── */}
       {rerunToast && (
         <RerunToast
           toast={rerunToast}
@@ -370,6 +494,9 @@ export default function App() {
           onDismiss={() => setRerunToast(null)}
         />
       )}
+
+      {/* ── KG write notifications (always mounted, even with KG panel closed) ── */}
+      <KgNotificationPanel nodes={kgNotifNodes} />
     </div>
   )
 }

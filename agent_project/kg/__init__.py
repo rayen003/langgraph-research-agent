@@ -15,5 +15,34 @@ Public entry points:
 """
 
 from .cache import KGCache, KGNode, KGEdge, get_cache
+from .ingest import (
+    DocumentFact,
+    IngestResult,
+    IngestStatus,
+    Layer,
+    ingest_fact,
+    ingest_facts,
+    kg_write,
+    SOURCE_TIER_PRECEDENCE,
+    MIN_CONFIDENCE_FOR_KG_WRITE,
+    NODE_TYPE_LAYER_MAP,
+)
+from .audit import (
+    AuditFinding,
+    AuditSeverity,
+    run_audit,
+    cross_source_consistency,
+    staleness_detection,
+    orphan_detection,
+    entity_coherence,
+    hallucination_spot_check,
+    get_audit_findings,
+    persist_findings,
+)
 
-__all__ = ["KGCache", "KGNode", "KGEdge", "get_cache"]
+__all__ = [
+    "KGCache", "KGNode", "KGEdge", "get_cache",
+    "DocumentFact", "IngestResult", "IngestStatus", "Layer",
+    "ingest_fact", "ingest_facts", "kg_write",
+    "SOURCE_TIER_PRECEDENCE", "MIN_CONFIDENCE_FOR_KG_WRITE", "NODE_TYPE_LAYER_MAP",
+]

@@ -25,10 +25,14 @@ GET    /workflows/dcf/runs/{thread_id}/result
 GET    /health                           liveness check
 """
 
+import os
+
+# Before chromadb (or anything that imports it) — silences broken PostHog telemetry.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 import asyncio
 import json
 import logging
-import os
 import sys
 import time
 import traceback
@@ -44,7 +48,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFil
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from typing import Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import requests
 
 dotenv.load_dotenv(Path(__file__).parent / ".env")
@@ -58,10 +62,12 @@ from storage import (  # noqa: E402
     append_job_event,
     get_job,
     get_report as get_stored_report,
+    get_session_layout,
     get_session_memory,
     list_job_events,
     list_jobs as list_stored_jobs,
     mark_stale_running_jobs,
+    replace_session_layout,
     update_job,
     upsert_job,
 )
@@ -1495,8 +1501,17 @@ def get_dcf_report_markdown(thread_id: str) -> Response:
 
 
 @app.get("/runs/{thread_id}/dcf-report.pdf")
-def get_dcf_report_pdf(thread_id: str) -> Response:
-    """Download the DCF valuation report as a formatted PDF."""
+def get_dcf_report_pdf(
+    thread_id: str,
+    inline: bool = Query(default=False),
+) -> Response:
+    """Render the DCF valuation report as a formatted PDF.
+
+    ``inline=true`` serves it with ``Content-Disposition: inline`` so the
+    browser renders it in a new tab (used by the "Open report" action on the
+    DCF node); the default ``attachment`` keeps the download behaviour for the
+    report card's download button.
+    """
     from report_export import load_dcf_report_markdown, render_report_pdf  # noqa: PLC0415
 
     run_dir = _runs_dir_for(thread_id)
@@ -1509,11 +1524,12 @@ def get_dcf_report_pdf(thread_id: str) -> Response:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}") from exc
+    disposition = "inline" if inline else "attachment"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{base_name}-report.pdf"',
+            "Content-Disposition": f'{disposition}; filename="{base_name}-report.pdf"',
         },
     )
 
@@ -1662,10 +1678,19 @@ class DocumentInfo(BaseModel):
     filename: str
     session_id: str
     status: str           # "processing" | "ready" | "error"
+    # Fine-grained ingest progress for the upload card (in-memory only):
+    # uploading → parsing → chunking → embedding → ready | error.
+    stage: str | None = None
     chunk_count: int = 0
     page_count: int = 0
     error: str | None = None
     created_at: float
+    # Entity metadata extracted at upload (gpt-4o-mini). Surfaced to the UI so
+    # the doc card + planner can show "Meta Platforms (META) · earnings_call".
+    company: str | None = None
+    ticker: str | None = None
+    doc_type: str | None = None
+    fiscal_period: str | None = None
 
 
 @app.post("/documents", response_model=DocumentInfo)
@@ -1684,6 +1709,7 @@ async def upload_document(
         "filename": filename,
         "session_id": session_id,
         "status": "processing",
+        "stage": "queued",
         "chunk_count": 0,
         "page_count": 0,
         "error": None,
@@ -1739,6 +1765,48 @@ def remove_document(doc_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Session sidebar layout (groups, pin, order — no message history)
+# ---------------------------------------------------------------------------
+
+class SessionGroupModel(BaseModel):
+    id: str
+    name: str
+    color: str
+    collapsed: bool = False
+    sort_order: int = 0
+    created_at: str
+
+
+class SessionLayoutItemModel(BaseModel):
+    session_id: str
+    title_override: str | None = None
+    pinned: bool = False
+    group_id: str | None = None
+    sort_order: int = 0
+    updated_at: str | None = None
+
+
+class SessionLayoutPayload(BaseModel):
+    groups: list[SessionGroupModel] = Field(default_factory=list)
+    sessions: list[SessionLayoutItemModel] = Field(default_factory=list)
+
+
+@app.get("/sessions/layout", response_model=SessionLayoutPayload)
+def read_session_layout() -> SessionLayoutPayload:
+    data = get_session_layout()
+    return SessionLayoutPayload(**data)
+
+
+@app.put("/sessions/layout", response_model=SessionLayoutPayload)
+def write_session_layout(body: SessionLayoutPayload) -> SessionLayoutPayload:
+    data = replace_session_layout(
+        groups=[g.model_dump() for g in body.groups],
+        sessions=[s.model_dump() for s in body.sessions],
+    )
+    return SessionLayoutPayload(**data)
+
+
+# ---------------------------------------------------------------------------
 # Knowledge Graph endpoints
 # ---------------------------------------------------------------------------
 
@@ -1768,6 +1836,13 @@ class KGEdgeCreate(BaseModel):
 class KGQueryRequest(BaseModel):
     question: str
     ticker: str | None = None
+
+
+class KGCompareChatRequest(BaseModel):
+    """Side-chat over an assembled cross-run comparison artifact."""
+    question: str
+    diff: dict[str, Any]
+    history: list[dict[str, str]] | None = None
 
 
 @app.get("/kg/{session_id}")
@@ -1896,6 +1971,95 @@ async def kg_query(session_id: str, body: KGQueryRequest) -> dict[str, Any]:
         session_id=session_id,
     )
     return result
+
+
+@app.post("/kg/{session_id}/compare-chat")
+async def kg_compare_chat(session_id: str, body: KGCompareChatRequest) -> dict[str, Any]:
+    """Side-chat over an assembled cross-run comparison. LLM reasons over the
+    structured diff the frontend built (bounded context, no graph traversal)."""
+    from kg.compare import discuss_comparison  # noqa: PLC0415
+    import anyio  # noqa: PLC0415
+    # discuss_comparison is sync (LLM .invoke) — run off the event loop.
+    return await anyio.to_thread.run_sync(
+        lambda: discuss_comparison(body.diff, body.question, body.history)
+    )
+
+
+# ---------------------------------------------------------------------------
+# KG Audit endpoints
+# ---------------------------------------------------------------------------
+
+
+class KGAuditRequest(BaseModel):
+    ticker: str | None = None
+    tickers: list[str] | None = None  # audit a specific subset; None/empty = all
+    checks: list[str] | None = None  # cross_source, staleness, orphan, entity_coherence, hallucination
+    sample_size: int = 5
+    auto_fix: bool = True
+
+
+@app.post("/kg/audit")
+async def kg_audit_run(body: KGAuditRequest) -> dict[str, Any]:
+    """Run quality audit on the Knowledge Graph.
+
+    Deterministic checks (no LLM): cross_source, staleness, orphan, entity_coherence.
+    LLM spot-check: hallucination (re-extracts from source chunks, compares).
+
+    All findings written to a separate kg_audit_log table.
+    """
+    from kg import run_audit  # noqa: PLC0415
+    import anyio  # noqa: PLC0415
+
+    # A specific subset of tickers → audit each and merge; otherwise a single
+    # ticker (or None = whole graph). Keeps the per-ticker run_audit contract.
+    targets: list[str | None]
+    if body.tickers:
+        targets = [t.upper() for t in body.tickers if t]
+    else:
+        targets = [body.ticker]
+
+    def _run_all() -> list[Any]:
+        out: list[Any] = []
+        for tk in targets:
+            out.extend(run_audit(
+                ticker=tk,
+                checks=body.checks,
+                sample_size=body.sample_size,
+                auto_fix=body.auto_fix,
+            ))
+        return out
+
+    findings = await anyio.to_thread.run_sync(_run_all)
+    by_severity = {}
+    by_check = {}
+    for f in findings:
+        d = f.to_dict()
+        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+        by_check[f.check_type] = by_check.get(f.check_type, 0) + 1
+    return {
+        "total_findings": len(findings),
+        "by_severity": by_severity,
+        "by_check": by_check,
+        "findings": [f.to_dict() for f in findings],
+    }
+
+
+@app.get("/kg/audit/findings")
+async def kg_audit_findings(
+    ticker: str | None = None,
+    severity: str | None = None,
+    check_type: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Retrieve previously logged audit findings."""
+    from kg import get_audit_findings  # noqa: PLC0415
+    findings = get_audit_findings(
+        ticker=ticker,
+        severity=severity,
+        check_type=check_type,
+        limit=limit,
+    )
+    return {"findings": findings}
 
 
 # ---------------------------------------------------------------------------

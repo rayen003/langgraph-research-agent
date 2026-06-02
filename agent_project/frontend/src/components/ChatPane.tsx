@@ -21,10 +21,10 @@ export function ChatPane({ messages, status, onReset }: Props) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden min-w-0">
       {/* Top bar */}
-      <div className="flex items-center gap-3 px-6 py-3.5 border-b border-[#1a1a1a] flex-shrink-0">
+      <div className="flex items-center gap-3 px-6 py-3.5 border-b border-border flex-shrink-0">
         <button
           onClick={onReset}
-          className="text-zinc-700 hover:text-zinc-400 transition-colors duration-150 flex-shrink-0"
+          className="text-zinc-700 hover:text-ink-muted transition-colors duration-150 flex-shrink-0"
           title="New session"
         >
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
@@ -37,12 +37,12 @@ export function ChatPane({ messages, status, onReset }: Props) {
             />
           </svg>
         </button>
-        <span className="text-sm text-zinc-500 font-medium">Chat</span>
+        <span className="text-sm text-ink-dim font-medium">Chat</span>
         <div className="flex-1" />
         {isResponding && (
           <div className="flex items-center gap-1.5">
             <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            <span className="text-xs text-zinc-600">Responding…</span>
+            <span className="text-xs text-ink-dim">Responding…</span>
           </div>
         )}
       </div>
@@ -64,8 +64,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   if (isUser) {
     return (
       <div className="flex justify-end animate-fade-up">
-        <div className="max-w-[75%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-[#1e1e28] border border-[#2a2a3a]">
-          <p className="text-sm text-zinc-200 leading-relaxed whitespace-pre-wrap">{message.content}</p>
+        <div className="max-w-[75%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-surface-3 border border-border-accent">
+          <p className="text-sm text-ink leading-relaxed whitespace-pre-wrap">{message.content}</p>
         </div>
       </div>
     )
@@ -78,10 +78,10 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         <div className="flex items-center gap-1.5 px-1">
           <div className="w-4 h-4 rounded-md bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center flex-shrink-0">
             <svg width="8" height="8" viewBox="0 0 12 12" fill="none">
-              <path d="M2 9L5 3L8 7L10 4" stroke="#818cf8" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M2 9L5 3L8 7L10 4" stroke="var(--color-accent-muted)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </div>
-          <span className="text-[11px] text-zinc-600 font-medium">Agent</span>
+          <span className="text-[11px] text-ink-dim font-medium">Agent</span>
         </div>
 
         {/* Content */}

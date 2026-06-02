@@ -1,5 +1,7 @@
 import { useState } from 'react'
+import { Search, X, Check } from 'lucide-react'
 import type { KgQueryResult } from '../hooks/useKnowledgeGraph'
+import { Markdown } from './kg/Markdown'
 
 interface Props {
   onClose: () => void
@@ -30,41 +32,42 @@ export function KgQueryPanel({ onClose, onQuery, onClearHighlight, highlightCoun
   }
 
   return (
-    <div className="h-full w-[360px] flex-shrink-0 border-l border-[#1c1c24] bg-[#0c0c12] flex flex-col">
-      <div className="px-4 py-3 border-b border-[#1c1c24] flex items-center justify-between">
-        <div className="text-zinc-300 font-medium text-sm">Query</div>
-        <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 text-[13px]">✕</button>
-      </div>
+    <div className="h-full flex flex-col bg-surface">
+      <header className="flex items-center gap-2.5 px-4 h-12 border-b border-edge flex-shrink-0">
+        <Search size={16} className="text-ink-muted" />
+        <div className="text-[14px] font-medium text-ink flex-1">Ask</div>
+        <button onClick={onClose} aria-label="Close" className="text-ink-dim hover:text-ink p-1 -mr-1 rounded hover:bg-surface-2 transition">
+          <X size={16} />
+        </button>
+      </header>
 
-      <div className="p-4 space-y-3 border-b border-[#1c1c24]">
+      <div className="p-4 space-y-3 border-b border-edge">
         <div>
-          <label className="text-[10px] uppercase text-zinc-600 tracking-wider">Question</label>
+          <label className="text-[11px] uppercase tracking-wide text-ink-dim font-medium">Question</label>
           <textarea
             value={question}
             onChange={e => setQuestion(e.target.value)}
             rows={3}
-            placeholder="Ask anything about what the agent knows..."
-            className="w-full mt-1 bg-[#0a0a0a] border border-[#2a2a36] rounded px-2 py-1.5 text-zinc-200 text-[12px] placeholder:text-zinc-700 focus:outline-none focus:border-indigo-500/50"
-            onKeyDown={e => {
-              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAsk()
-            }}
+            placeholder="Ask anything about what the agent knows…"
+            className="w-full mt-1.5 bg-surface-2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] placeholder:text-ink-dim focus:outline-none focus:border-accent/50 resize-none"
+            onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAsk() }}
           />
         </div>
 
         <div>
-          <label className="text-[10px] uppercase text-zinc-600 tracking-wider">Ticker (optional)</label>
+          <label className="text-[11px] uppercase tracking-wide text-ink-dim font-medium">Ticker (optional)</label>
           <input
             value={ticker}
             onChange={e => setTicker(e.target.value.toUpperCase())}
             placeholder="META"
-            className="w-full mt-1 bg-[#0a0a0a] border border-[#2a2a36] rounded px-2 py-1.5 text-zinc-200 text-[12px] font-mono placeholder:text-zinc-700 focus:outline-none focus:border-indigo-500/50"
+            className="w-full mt-1.5 bg-surface-2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] font-mono placeholder:text-ink-dim focus:outline-none focus:border-accent/50"
           />
         </div>
 
         <button
           onClick={handleAsk}
           disabled={busy || !question.trim()}
-          className="w-full px-3 py-1.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 hover:bg-indigo-500/30 disabled:opacity-50 text-[12px]"
+          className="w-full px-3 py-2 rounded-md bg-accent-soft text-accent border border-accent/40 hover:bg-accent/20 disabled:opacity-50 text-[13px] font-medium transition"
         >
           {busy ? 'Querying…' : 'Ask'}
         </button>
@@ -72,9 +75,9 @@ export function KgQueryPanel({ onClose, onQuery, onClearHighlight, highlightCoun
         {highlightCount > 0 && (
           <button
             onClick={onClearHighlight}
-            className="w-full px-2 py-1 rounded bg-teal-500/10 text-teal-400 border border-teal-500/30 text-[11px] hover:bg-teal-500/20"
+            className="w-full px-2 py-1.5 rounded-md text-ink-muted border border-edge hover:bg-surface-2 text-[12px] transition"
           >
-            Clear highlight ({highlightCount} nodes)
+            Clear highlight · {highlightCount}
           </button>
         )}
       </div>
@@ -82,13 +85,13 @@ export function KgQueryPanel({ onClose, onQuery, onClearHighlight, highlightCoun
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {!result ? (
           <div>
-            <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-2">Examples</div>
-            <div className="space-y-1">
+            <div className="text-[11px] uppercase tracking-wide text-ink-dim font-medium mb-2">Examples</div>
+            <div className="space-y-1.5">
               {EXAMPLES.map(ex => (
                 <button
                   key={ex}
                   onClick={() => setQuestion(ex)}
-                  className="block w-full text-left text-[11px] px-2 py-1.5 rounded bg-zinc-800/40 text-zinc-400 hover:bg-zinc-800/80 hover:text-zinc-200 transition"
+                  className="block w-full text-left text-[12px] px-2.5 py-2 rounded-md bg-surface-2 text-ink-muted hover:text-ink hover:border-accent/30 border border-transparent transition"
                 >
                   {ex}
                 </button>
@@ -98,16 +101,16 @@ export function KgQueryPanel({ onClose, onQuery, onClearHighlight, highlightCoun
         ) : (
           <>
             <div>
-              <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-1">Answer</div>
-              <pre className="text-zinc-200 text-[11px] whitespace-pre-wrap leading-relaxed font-sans">
-                {result.answer}
-              </pre>
+              <div className="text-[11px] uppercase tracking-wide text-ink-dim font-medium mb-1.5">Answer</div>
+              <div className="text-ink-muted">
+                <Markdown text={result.answer} />
+              </div>
             </div>
 
             {(result.traversal_edges?.length ?? 0) > 0 && (
               <div>
-                <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-1">
-                  Traversal route ({result.traversal_edges.length} hops)
+                <div className="text-[11px] uppercase tracking-wide text-ink-dim font-medium mb-1.5">
+                  Route · {result.traversal_edges.length} hops
                 </div>
                 <div className="space-y-1">
                   {result.traversal_edges.slice(0, 30).map((e, i) => {
@@ -117,31 +120,26 @@ export function KgQueryPanel({ onClose, onQuery, onClearHighlight, highlightCoun
                       return { src: short(e.src_id), tgt: short(e.tgt_id) }
                     })()
                     return (
-                      <div key={`${e.src_id}->${e.tgt_id}-${i}`} className="text-[10px] flex items-center gap-1 truncate">
-                        <span className="font-mono text-zinc-400 truncate">{labels.src}</span>
-                        <span className="text-teal-500">─{e.relation ?? 'REL'}→</span>
-                        <span className="font-mono text-zinc-400 truncate">{labels.tgt}</span>
+                      <div key={`${e.src_id}->${e.tgt_id}-${i}`} className="text-[11px] flex items-center gap-1 truncate">
+                        <span className="font-mono text-ink-muted truncate">{labels.src}</span>
+                        <span className="text-accent">→</span>
+                        <span className="font-mono text-ink-muted truncate">{labels.tgt}</span>
                       </div>
                     )
                   })}
                   {result.traversal_edges.length > 30 && (
-                    <div className="text-[10px] text-zinc-600">
-                      … {result.traversal_edges.length - 30} more hops
-                    </div>
+                    <div className="text-[11px] text-ink-dim">… {result.traversal_edges.length - 30} more</div>
                   )}
                 </div>
-                <div className="mt-2 text-[10px] text-teal-400">
-                  ✓ Route animated in graph · {result.traversal_path.length} nodes highlighted
+                <div className="mt-2 flex items-center gap-1.5 text-[11px] text-accent">
+                  <Check size={12} /> {result.traversal_path.length} nodes highlighted
                 </div>
               </div>
             )}
 
             {(result.traversal_edges?.length ?? 0) === 0 && result.traversal_path.length > 0 && (
-              <div>
-                <div className="text-[10px] uppercase text-zinc-600 tracking-wider mb-1">
-                  Matched nodes ({result.traversal_path.length})
-                </div>
-                <div className="mt-1 text-[10px] text-teal-400">✓ Highlighted in graph</div>
+              <div className="flex items-center gap-1.5 text-[11px] text-accent">
+                <Check size={12} /> {result.traversal_path.length} matched · highlighted in graph
               </div>
             )}
           </>

@@ -3,6 +3,7 @@ import type { ActivityEntry } from '../lib/activity'
 import { StepCard } from './StepCard'
 import { ActivityTrace, DcfHitlSection } from './ActivityTrace'
 import { DeckOutlineReview } from './DeckOutlineReview'
+import { PanelHideButton } from './PanelHideButton'
 
 interface Props {
   status: RunStatus
@@ -15,6 +16,7 @@ interface Props {
   onApprove: () => void
   onReject: () => void
   threadId?: string | null
+  onHide?: () => void
 }
 
 export function ExecutionSidebar({
@@ -28,6 +30,7 @@ export function ExecutionSidebar({
   onApprove,
   onReject,
   threadId,
+  onHide,
 }: Props) {
   const totalSteps = steps.length
   const hasActivity = activity && activity.length > 0
@@ -55,23 +58,26 @@ export function ExecutionSidebar({
   const isRejected = status === 'rejected'
 
   return (
-    <div className="w-full flex flex-col bg-[#0d0d0d] border-l border-[#1a1a1a] overflow-hidden h-full">
+    <div className="w-full flex flex-col bg-bg border-l border-border overflow-hidden h-full">
 
       {/* ── Header ───────────────────────────────────────── */}
-      <div className="px-5 pt-5 pb-4 border-b border-[#161616] flex-shrink-0 space-y-3">
+      <div className="px-5 pt-5 pb-4 border-b border-border flex-shrink-0 space-y-3">
         <div className="flex items-center justify-between">
-          <span className="text-[11px] font-medium text-zinc-600 tracking-widest uppercase">
+          <span className="text-[11px] font-medium text-ink-dim tracking-widest uppercase">
             {isChatMode ? 'Workflow' : 'Execution'}
           </span>
-          {totalSteps > 0 && (
-            <span className="text-[11px] text-zinc-700 tabular-nums">
-              {completedSteps} / {totalSteps} steps
-            </span>
-          )}
+          <div className="flex items-center gap-1">
+            {totalSteps > 0 && (
+              <span className="text-[11px] text-zinc-700 tabular-nums">
+                {completedSteps} / {totalSteps} steps
+              </span>
+            )}
+            {onHide && <PanelHideButton onHide={onHide} edge="right" className="text-ink-dim hover:text-ink-muted" />}
+          </div>
         </div>
 
         {/* Progress bar */}
-        <div className="h-[2px] bg-[#1a1a1a] rounded-full overflow-hidden">
+        <div className="h-[2px] bg-surface-3 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-700 ease-out ${
               isComplete && isDegraded
@@ -116,7 +122,7 @@ export function ExecutionSidebar({
 
         {/* Chat mode: render activity trace directly */}
         {isChatMode && (
-          <ActivityTrace activities={activity!} defaultOpen label="DCF Workflow" />
+          <ActivityTrace activities={activity!} defaultOpen label="Activity" />
         )}
 
         {status === 'planning' && (
@@ -137,14 +143,14 @@ export function ExecutionSidebar({
         {isSynthesizing && (
           <div className="flex items-center gap-2.5 pt-1 animate-fade-up">
             <div className="w-1.5 h-1.5 rounded-full bg-violet-500 animate-pulse flex-shrink-0" />
-            <span className="text-xs text-zinc-600">Synthesizing report…</span>
+            <span className="text-xs text-ink-dim">Synthesizing report…</span>
           </div>
         )}
 
         {isComplete && (
           <div className="flex items-center gap-2 pt-1 animate-fade-up">
             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0" />
-            <span className="text-xs text-zinc-600">Report ready</span>
+            <span className="text-xs text-ink-dim">Report ready</span>
           </div>
         )}
 
@@ -163,7 +169,7 @@ export function ExecutionSidebar({
         )}
 
         {isRejected && (
-          <p className="text-xs text-zinc-600 pt-1 animate-fade-up">
+          <p className="text-xs text-ink-dim pt-1 animate-fade-up">
             Plan rejected. Start a new research query to try again.
           </p>
         )}
@@ -171,7 +177,7 @@ export function ExecutionSidebar({
 
       {/* ── HITL footer ──────────────────────────────────── */}
       {isAwaiting && (
-        <div className="flex-shrink-0 px-5 py-4 border-t border-[#161616] space-y-3 animate-fade-up">
+        <div className="flex-shrink-0 px-5 py-4 border-t border-border space-y-3 animate-fade-up">
           {isAwaitingAssumptions && dcfReview && threadId && (
             <DcfHitlSection review={dcfReview} threadId={threadId} onApprove={onApprove} onReject={onReject} />
           )}
@@ -180,7 +186,7 @@ export function ExecutionSidebar({
           )}
           {!isAwaitingAssumptions && !isAwaitingOutlineReview && (
             <>
-              <p className="text-[11px] text-zinc-600 leading-relaxed">
+              <p className="text-[11px] text-ink-dim leading-relaxed">
                 {isAwaitingPlan
                   ? 'Review the plan above. Once approved, execution begins immediately.'
                   : 'Review workflow assumptions. Approve to continue deterministic valuation.'}
@@ -189,7 +195,7 @@ export function ExecutionSidebar({
                 <button onClick={onApprove} className="flex-1 py-2 rounded-lg text-xs font-medium bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white transition-colors duration-150">
                   {isAwaitingPlan ? 'Approve & Run' : 'Approve Assumptions'}
                 </button>
-                <button onClick={onReject} className="flex-1 py-2 rounded-lg text-xs font-medium bg-[#161616] hover:bg-[#1e1e1e] active:bg-[#121212] text-zinc-500 border border-[#2a2a2a] transition-colors duration-150">
+                <button onClick={onReject} className="flex-1 py-2 rounded-lg text-xs font-medium bg-surface hover:bg-surface-2 active:bg-surface text-ink-dim border border-border-hover transition-colors duration-150">
                   {isAwaitingPlan ? 'Reject' : 'Reject Assumptions'}
                 </button>
               </div>
@@ -237,7 +243,7 @@ function CurrentStepLabel({
     const running = steps.find(s => s.status === 'running')
     if (running) {
       return (
-        <p className="text-[11px] text-zinc-600 truncate">
+        <p className="text-[11px] text-ink-dim truncate">
           <span className="text-indigo-400">Step {completedSteps + 1}</span>
           {' '}—{' '}
           <span>{running.description.length > 50 ? running.description.slice(0, 50) + '…' : running.description}</span>
@@ -253,10 +259,10 @@ function PlanSkeleton() {
     <div className="space-y-5">
       {[70, 85, 60, 75].map((w, i) => (
         <div key={i} className="flex gap-3 items-start">
-          <div className="w-3.5 h-3.5 rounded-full bg-[#1e1e1e] flex-shrink-0 mt-0.5" />
+          <div className="w-3.5 h-3.5 rounded-full bg-surface-2 flex-shrink-0 mt-0.5" />
           <div className="flex-1 space-y-1.5">
-            <div className="h-2.5 rounded bg-[#1a1a1a]" style={{ width: `${w}%` }} />
-            <div className="h-2 rounded bg-[#161616]" style={{ width: `${w - 20}%` }} />
+            <div className="h-2.5 rounded bg-surface-3" style={{ width: `${w}%` }} />
+            <div className="h-2 rounded bg-surface" style={{ width: `${w - 20}%` }} />
           </div>
         </div>
       ))}

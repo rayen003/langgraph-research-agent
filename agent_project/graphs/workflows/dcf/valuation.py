@@ -879,8 +879,12 @@ def finalize_node(state: dict) -> dict:
         model_validity != "invalid"
         and not (isinstance(eff_conf, (int, float)) and eff_conf < kg_min_confidence)
     )
+    # Use the unique per-run id (minted in normalize_input_node) for KG run
+    # scoping so reruns accumulate. Fall back to parent_step_id only if absent
+    # (e.g. a direct workflow invocation that skipped normalize_input).
+    kg_run_id = state.get("kg_run_id") or parent_step_id
     try:
-        _write_to_kg(state, payload, parent_step_id, write_shared=write_shared)
+        _write_to_kg(state, payload, kg_run_id, write_shared=write_shared)
     except Exception:  # noqa: BLE001
         logger.exception("DCF KG back-write failed (non-fatal)")
 
@@ -902,7 +906,7 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
         future cache hits, so a low-quality run is excluded to avoid
         poisoning the cache.
     """
-    from kg import get_cache  # noqa: PLC0415
+    from kg import get_cache, kg_write  # noqa: PLC0415
 
     cache = get_cache()
     ticker = payload["ticker"]
@@ -911,24 +915,38 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
     # ── Company anchor + DCFRun ─────────────────────────────────────────────
     # Company anchor is shared but cheap and idempotent — write always so
     # run-scoped edges (HAS_RUN) have a valid src_id even on invalid runs.
-    cache.put(
+    kg_write(
         ticker=ticker, node_type="company", field="anchor",
         value={"ticker": ticker},
         source="agent_inferred", confidence=1.0, session_id=session_id,
     )
     company_node_id = f"{ticker}::company::anchor"
 
-    cache.put(
+    import time as _time  # noqa: PLC0415
+    from utils import get_run_dir  # noqa: PLC0415
+    # The run directory name IS the thread_id; the DCF report (dcf_output.json
+    # / report files) is persisted there. Store it so the UI can open the
+    # report via GET /runs/{thread_id}/dcf-report.pdf without extra lookups.
+    thread_id = get_run_dir().name
+    kg_write(
         ticker=ticker, node_type="dcf_run", field="meta",
         value={
             "horizon_years": payload["horizon_years"],
             "profile": payload.get("profile"),
             "confidence_label": payload["confidence_label"],
             "result_path": payload.get("result_path") or "",
+            "thread_id": thread_id,
             # Phase 2: persist validity so KG can distinguish reliable runs
             # from degraded ones (the UI can colour-code dcf_run nodes).
             "model_validity": payload.get("model_validity", "valid"),
             "invalidation_reason": payload.get("invalidation_reason") or "",
+            # ── Run registry metadata (Phase 0) ──────────────────────────────
+            "run_id": run_id,
+            "created_at": _time.time(),
+            "parent_run_id": state.get("parent_run_id") or None,
+            "trigger": state.get("run_trigger") or "initial",
+            "label": None,  # user-editable later (registry labels)
+            "implied_share_price": payload.get("valuation", {}).get("implied_share_price"),
         },
         source="dcf_output", confidence=1.0,
         run_id=run_id, session_id=session_id,
@@ -945,7 +963,7 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
     for field, value in assumptions.items():
         prov = provenance.get(field, "dcf_output")
         source = prov.get("source", "dcf_output") if isinstance(prov, dict) else str(prov)
-        cache.put(
+        kg_write(
             ticker=ticker, node_type="run_assumption", field=field,
             value=value, source=source, confidence=0.95,
             run_id=run_id, session_id=session_id, respect_user_lock=False,
@@ -963,7 +981,7 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
                      "pv_cash_flows", "terminal_pv")
     for field in output_fields:
         if field in valuation:
-            cache.put(
+            kg_write(
                 ticker=ticker, node_type="run_output", field=field,
                 value=valuation[field], source="dcf_output", confidence=1.0,
                 run_id=run_id, session_id=session_id, respect_user_lock=False,
@@ -975,28 +993,96 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
             )
 
     shared_written = 0
-    if write_shared:
-        # ── Shared fundamentals refresh ────────────────────────────────────
-        for field in ("base_revenue", "shares_outstanding", "net_debt"):
-            if field in assumptions:
-                cache.put(
-                    ticker=ticker, node_type="market_metric_fund", field=field,
-                    value=assumptions[field],
-                    source=(lambda p: p.get("source", "fmp") if isinstance(p, dict) else str(p))(provenance.get(field, "fmp")),
-                    confidence=0.95, session_id=session_id,
-                )
-                cache.add_edge(
-                    src_id=company_node_id,
-                    tgt_id=f"{ticker}::market_metric_fund::{field}",
-                    relation="HAS_METRIC", session_id=session_id, source="dcf_output",
-                )
-                shared_written += 1
+    # ── Raw fundamentals (FACTS) — persisted ALWAYS ────────────────────────
+    # Statement-derived inputs come from FMP/yfinance; their validity is
+    # independent of THIS valuation's confidence. A low-confidence DCF doesn't
+    # make the company's revenue/beta/sector wrong. So these anchored facts are
+    # written regardless of write_shared — only the DERIVED, rebuildable
+    # inferences (synthesis/thesis/drivers, below) are gated to avoid poisoning
+    # the cache. Without this, a low-confidence run leaves the KG with zero
+    # Fundamentals even though the data was fetched.
+    state_fundamentals = state.get("fundamentals") or {}
+    features = state.get("features") or {}
+    for field in ("base_revenue", "shares_outstanding", "net_debt",
+                  "fcff_margin", "tax_rate"):
+        # Prefer the canonical fundamentals meta (has source/as_of); fall back
+        # to the assumption value when the fundamentals dict lacks the field.
+        fmeta = state_fundamentals.get(field)
+        if isinstance(fmeta, dict) and fmeta.get("value") is not None:
+            metric_value = fmeta["value"]
+            metric_source = str(fmeta.get("source") or "fmp")
+        elif field in assumptions:
+            metric_value = assumptions[field]
+            metric_source = (lambda p: p.get("source", "fmp") if isinstance(p, dict) else str(p))(provenance.get(field, "fmp"))
+        else:
+            continue
+        kg_write(
+            ticker=ticker, node_type="market_metric_fund", field=field,
+            value=metric_value, source=metric_source,
+            confidence=0.95, session_id=session_id,
+        )
+        cache.add_edge(
+            src_id=company_node_id,
+            tgt_id=f"{ticker}::market_metric_fund::{field}",
+            relation="HAS_METRIC", session_id=session_id, source="dcf_output",
+        )
+        shared_written += 1
 
+    # Beta (CAPM input) — slow-moving, safe to cache with the fundamentals.
+    beta_val = features.get("beta")
+    if isinstance(beta_val, (int, float)) and 0 < float(beta_val) <= 2.5:
+        kg_write(
+            ticker=ticker, node_type="market_metric_fund", field="beta",
+            value=float(beta_val), source="fmp",
+            confidence=0.9, session_id=session_id,
+        )
+        cache.add_edge(
+            src_id=company_node_id,
+            tgt_id=f"{ticker}::market_metric_fund::beta",
+            relation="HAS_METRIC", session_id=session_id, source="dcf_output",
+        )
+
+    # Company profile (sector/industry) — lets the warm-cache hydrate
+    # reconstruct the sector profile bucket without an API call.
+    profile_meta = state.get("profile_meta") or {}
+    if profile_meta.get("sector") or profile_meta.get("industry"):
+        kg_write(
+            ticker=ticker, node_type="company", field="profile",
+            value={"sector": profile_meta.get("sector"),
+                   "industry": profile_meta.get("industry")},
+            source="dcf_output", confidence=0.95, session_id=session_id,
+        )
+
+    # ── Cached fiscal period anchor ────────────────────────────────────
+    # All annual fund fields share one statement period. Record it so the
+    # cache-check probe can detect fiscal-period rotation (a fresh earnings
+    # report) independently of TTL: if FMP later reports a newer period than
+    # this, the cached fundamentals are stale even within their 24h TTL.
+    cached_as_of = ""
+    for field in ("base_revenue", "net_debt", "shares_outstanding"):
+        fmeta = state_fundamentals.get(field)
+        if isinstance(fmeta, dict) and fmeta.get("as_of"):
+            cached_as_of = str(fmeta["as_of"])
+            break
+    if cached_as_of:
+        kg_write(
+            ticker=ticker, node_type="market_period", field="cached_fy",
+            value={"as_of": cached_as_of}, source="dcf_output",
+            confidence=1.0, session_id=session_id,
+        )
+        cache.add_edge(
+            src_id=company_node_id,
+            tgt_id=f"{ticker}::market_period::cached_fy",
+            relation="HAS_PERIOD", session_id=session_id, source="dcf_output",
+        )
+
+    # ── Derived inferences (GATED by confidence) ───────────────────────────
+    if write_shared:
         # ── Shared synthesis + thesis (input_hash for compound staleness) ─
         input_hash = cache.evidence_hash(ticker)
         company_state = state.get("company_state") or {}
         if company_state:
-            cache.put(
+            kg_write(
                 ticker=ticker, node_type="company_synthesis", field="full",
                 value=company_state, source="llm_inferred", confidence=0.85,
                 input_hash=input_hash, session_id=session_id,
@@ -1009,7 +1095,7 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
             shared_written += 1
         thesis = state.get("thesis") or {}
         if thesis and not thesis.get("_fallback"):
-            cache.put(
+            kg_write(
                 ticker=ticker, node_type="thesis", field="full",
                 value=thesis, source="llm_inferred", confidence=0.85,
                 input_hash=input_hash, session_id=session_id,
@@ -1028,7 +1114,7 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
             d_name = str(driver.get("driver", "")).strip().replace(" ", "_")
             if not d_name:
                 continue
-            cache.put(
+            kg_write(
                 ticker=ticker, node_type="driver", field=d_name,
                 value={
                     "direction": driver.get("direction", "neutral"),
@@ -1049,7 +1135,8 @@ def _write_to_kg(state: dict, payload: dict, run_id: str, write_shared: bool = T
             "summary_line": (
                 f"wrote DCFRun + {len(assumptions)} assumptions, "
                 f"{sum(1 for f in output_fields if f in valuation)} outputs"
-                + (f", {shared_written} shared facts refreshed" if write_shared else " (shared facts skipped: model invalid)")
+                + f", {shared_written} shared facts refreshed"
+                + ("" if write_shared else " (derived inferences skipped: low confidence)")
             ),
             "run_node_id": dcf_run_id,
             "ticker": ticker,

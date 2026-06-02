@@ -3,7 +3,41 @@ import { MarkdownRenderer } from './MarkdownRenderer'
 import { QueryInput } from './QueryInput'
 import { ActivityTrace, ResearchStepsTrace } from './ActivityTrace'
 import type { ActivityEntry } from '../lib/activity'
-import type { AgentRunState, DocumentInfo, DcfReviewState, EvidenceItem, Mode, Session, SessionMessage, StepState, ToolCall } from '../types'
+import type { AgentRunState, AttachedDocSnapshot, DocumentInfo, DcfReviewState, EvidenceItem, Mode, Session, SessionMessage, StepState, ToolCall } from '../types'
+import { AttachmentChip } from './AttachmentChip'
+
+// ── Copy button ───────────────────────────────────────────────────
+function CopyButton({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // fallback silently
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      title={copied ? 'Copied!' : 'Copy message'}
+      className="opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 flex items-center justify-center rounded-md text-ink-dim hover:text-ink hover:bg-surface flex-shrink-0"
+    >
+      {copied ? (
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+          <path d="M3 8L6 11L13 4" stroke="var(--color-success)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      ) : (
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+          <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
+          <path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        </svg>
+      )}
+    </button>
+  )
+}
 
 const IMAGE_RE = /\.(png|jpg|jpeg|webp|gif|svg)$/i
 const ARTIFACT_MARKER_RE = /\[ARTIFACTS?\]|\[CHART\]/i
@@ -97,17 +131,17 @@ function DeckArtifactCard({
   }
 
   return (
-    <div className="rounded-lg border border-[#1e1e2a] bg-[#07070f] px-4 py-3 space-y-2">
+    <div className="rounded-lg border border-border bg-bg px-4 py-3 space-y-2">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-sm font-medium text-zinc-200 truncate">{deckTitle}</p>
-          <p className="text-[11px] text-zinc-600">PowerPoint deck · {filename}</p>
+          <p className="text-sm font-medium text-ink truncate">{deckTitle}</p>
+          <p className="text-[11px] text-ink-dim">PowerPoint deck · {filename}</p>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           <button
             type="button"
             onClick={() => onPreview?.(filename, deckTitle, threadId)}
-            className="px-2.5 py-1 rounded-md border border-indigo-500/40 text-[11px] text-indigo-300 hover:bg-indigo-500/10 transition-colors"
+            className="px-2.5 py-1 rounded-md border border-accent text-[11px] text-indigo-300 hover:bg-indigo-500/10 transition-colors"
           >
             Preview
           </button>
@@ -115,7 +149,7 @@ function DeckArtifactCard({
             type="button"
             onClick={handleDownload}
             disabled={busy}
-            className="px-2.5 py-1 rounded-md border border-[#252535] text-[11px] text-zinc-300 hover:text-zinc-100 hover:border-[#33334a] transition-colors disabled:opacity-50"
+            className="px-2.5 py-1 rounded-md border border-border-hover text-[11px] text-ink-muted hover:text-ink hover:border-border-accent transition-colors disabled:opacity-50"
           >
             {busy ? '…' : 'Download'}
           </button>
@@ -170,7 +204,7 @@ function DcfReportDownloadMenu({ threadId }: { threadId: string }) {
         <select
           value={format}
           onChange={e => setFormat(e.target.value as 'pdf' | 'md')}
-          className="bg-transparent text-[11px] text-zinc-300 px-2 py-1 border-r border-zinc-700 outline-none cursor-pointer hover:text-zinc-100"
+          className="bg-transparent text-[11px] text-ink-muted px-2 py-1 border-r border-zinc-700 outline-none cursor-pointer hover:text-ink"
           aria-label="Report format"
         >
           <option value="pdf">PDF</option>
@@ -180,7 +214,7 @@ function DcfReportDownloadMenu({ threadId }: { threadId: string }) {
           type="button"
           onClick={handleDownload}
           disabled={busy}
-          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800/80 transition-colors disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-ink-muted hover:text-ink hover:bg-zinc-800/80 transition-colors disabled:opacity-50"
         >
           <span aria-hidden>↓</span>
           {busy ? 'Preparing…' : 'Download'}
@@ -236,16 +270,16 @@ function EvidenceSourceDrawer({
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/45" role="dialog" aria-modal="true" aria-label={`Source for citation ${citationNumber}`}>
       <button className="flex-1 cursor-default" aria-label="Close source drawer" onClick={onClose} />
-      <aside className="h-full w-full max-w-md border-l border-[#24242a] bg-[#08080b] shadow-2xl flex flex-col">
-        <div className="flex items-start justify-between gap-3 border-b border-[#1d1d22] px-5 py-4">
+      <aside className="h-full w-full max-w-md border-l border-border bg-bg shadow-2xl flex flex-col">
+        <div className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0">
             <div className="text-[11px] uppercase tracking-wide text-indigo-300">Source [{citationNumber}]</div>
-            <h2 className="mt-1 text-sm font-semibold text-zinc-100 leading-snug break-words">{title}</h2>
+            <h2 className="mt-1 text-sm font-semibold text-ink leading-snug break-words">{title}</h2>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md px-2 py-1 text-sm text-zinc-500 hover:bg-zinc-900 hover:text-zinc-200"
+            className="rounded-md px-2 py-1 text-sm text-ink-dim hover:bg-zinc-900 hover:text-ink"
             aria-label="Close source drawer"
           >
             ×
@@ -254,41 +288,41 @@ function EvidenceSourceDrawer({
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
           {!evidence ? (
-            <p className="text-sm text-zinc-400">No source metadata was available for this citation.</p>
+            <p className="text-sm text-ink-muted">No source metadata was available for this citation.</p>
           ) : (
             <>
-              <div className="rounded-lg border border-[#1d1d22] bg-[#0d0d11] p-3 space-y-2">
+              <div className="rounded-lg border border-border bg-bg p-3 space-y-2">
                 <div className="flex flex-wrap gap-2 text-[10px]">
                   <span className="rounded bg-indigo-500/10 px-2 py-0.5 font-medium text-indigo-300">{tier.replace('_', ' ')}</span>
-                  <span className="rounded bg-zinc-900 px-2 py-0.5 text-zinc-400">{evidence.kind}</span>
+                  <span className="rounded bg-zinc-900 px-2 py-0.5 text-ink-muted">{evidence.kind}</span>
                   {'inferred' in evidence && evidence.inferred && (
                     <span className="rounded bg-amber-500/10 px-2 py-0.5 text-amber-300">metadata inferred</span>
                   )}
-                  {evidence.as_of && <span className="rounded bg-zinc-900 px-2 py-0.5 text-zinc-400">{evidence.as_of.slice(0, 10)}</span>}
+                  {evidence.as_of && <span className="rounded bg-zinc-900 px-2 py-0.5 text-ink-muted">{evidence.as_of.slice(0, 10)}</span>}
                 </div>
                 {value && (
                   <div>
-                    <div className="text-[11px] text-zinc-500">Value used</div>
-                    <div className="text-lg font-semibold text-zinc-100">{value}</div>
+                    <div className="text-[11px] text-ink-dim">Value used</div>
+                    <div className="text-lg font-semibold text-ink">{value}</div>
                   </div>
                 )}
                 {evidence.field && (
-                  <div className="text-xs text-zinc-400">
-                    Field: <span className="font-mono text-zinc-200">{evidence.field}</span>
+                  <div className="text-xs text-ink-muted">
+                    Field: <span className="font-mono text-ink">{evidence.field}</span>
                   </div>
                 )}
-                <div className="text-xs text-zinc-500 break-all">Evidence ID: {evidence.evidence_id}</div>
+                <div className="text-xs text-ink-dim break-all">Evidence ID: {evidence.evidence_id}</div>
               </div>
 
               {evidence.text && !evidence.inferred && (
-                <div className="rounded-lg border border-[#1d1d22] bg-[#0b0b0e] p-3">
-                  <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-zinc-500">Excerpt</div>
-                  <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-zinc-300">{evidence.text}</p>
+                <div className="rounded-lg border border-border bg-bg p-3">
+                  <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-ink-dim">Excerpt</div>
+                  <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-ink-muted">{evidence.text}</p>
                 </div>
               )}
 
               {evidence.inferred && !evidence.url && (
-                <p className="text-sm text-zinc-400">
+                <p className="text-sm text-ink-muted">
                   Source metadata was not archived with this completed run. The numbered citation still marks where this claim was anchored in the report.
                 </p>
               )}
@@ -305,20 +339,20 @@ function EvidenceSourceDrawer({
               )}
 
               {isApiBacked && (
-                <div className="rounded-lg border border-[#1d1d22] bg-[#0b0b0e] p-3">
+                <div className="rounded-lg border border-border bg-bg p-3">
                   <button
                     type="button"
                     onClick={loadRawData}
-                    className="text-sm font-medium text-zinc-200 hover:text-white"
+                    className="text-sm font-medium text-ink hover:text-white"
                   >
                     {rawOpen ? 'Underlying FMP API data' : 'View underlying FMP API data'}
                   </button>
                   {rawOpen && (
                     <div className="mt-3">
-                      {loadingRaw && <p className="text-xs text-zinc-500">Loading source data…</p>}
+                      {loadingRaw && <p className="text-xs text-ink-dim">Loading source data…</p>}
                       {rawError && <p className="text-xs text-red-300">{rawError}</p>}
                       {rawData && (
-                        <pre className="max-h-72 overflow-auto rounded-md bg-black/40 p-3 text-[10px] leading-relaxed text-zinc-400">
+                        <pre className="max-h-72 overflow-auto rounded-md bg-black/40 p-3 text-[10px] leading-relaxed text-ink-muted">
                           {rawData}
                         </pre>
                       )}
@@ -338,10 +372,14 @@ function EvidenceSourceDrawer({
 
 function UserBubble({
   content,
+  attachedDocs,
   onEdit,
+  onSelectDoc,
 }: {
   content: string
+  attachedDocs?: AttachedDocSnapshot[]
   onEdit?: (newContent: string) => void
+  onSelectDoc?: (docId: string) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(content)
@@ -386,14 +424,14 @@ function UserBubble({
               }
             }}
             rows={Math.min(8, Math.max(2, draft.split('\n').length))}
-            className="w-full px-4 py-2.5 rounded-2xl bg-[#1a1a24] border border-indigo-500/40 text-sm text-zinc-100 leading-relaxed resize-none focus:outline-none focus:border-indigo-400"
+            className="w-full px-4 py-2.5 rounded-2xl bg-surface border border-accent text-sm text-ink leading-relaxed resize-none focus:outline-none focus:border-indigo-400"
           />
           <div className="flex items-center justify-end gap-2 text-[11px]">
-            <span className="text-zinc-600 mr-auto">⌘/Ctrl + Enter to send · Esc to cancel</span>
+            <span className="text-ink-dim mr-auto">⌘/Ctrl + Enter to send · Esc to cancel</span>
             <button
               type="button"
               onClick={() => { setDraft(content); setEditing(false) }}
-              className="px-2.5 py-1 rounded-md border border-[#252535] text-zinc-400 hover:text-zinc-200 hover:border-[#33334a]"
+              className="px-2.5 py-1 rounded-md border border-border-hover text-ink-muted hover:text-ink hover:border-border-accent"
             >
               Cancel
             </button>
@@ -412,13 +450,28 @@ function UserBubble({
   }
 
   return (
-    <div className="group flex justify-end items-start gap-1.5 animate-fade-up">
+    <div className="group flex flex-col items-end gap-2">
+      {attachedDocs && attachedDocs.length > 0 && (
+        <div className="flex gap-2 justify-end overflow-x-auto max-w-full pb-0.5">
+          {attachedDocs.map((doc, i) => (
+            <AttachmentChip
+              key={doc.doc_id}
+              variant="sent"
+              doc={doc}
+              onSelect={onSelectDoc}
+              animationDelayMs={i * 50}
+            />
+          ))}
+        </div>
+      )}
+      <div className="flex justify-end items-start gap-1.5 animate-message-send">
+      <CopyButton content={content} />
       {onEdit && (
         <button
           type="button"
           onClick={() => { setDraft(content); setEditing(true) }}
           title="Edit message"
-          className="mt-1 opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 flex items-center justify-center rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-[#1a1a22]"
+          className="mt-1 opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 flex items-center justify-center rounded-md text-ink-dim hover:text-ink hover:bg-surface"
         >
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
             <path
@@ -430,8 +483,9 @@ function UserBubble({
           </svg>
         </button>
       )}
-      <div className="max-w-[72%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-[#1a1a24] border border-[#252535]">
-        <p className="text-sm text-zinc-200 leading-relaxed whitespace-pre-wrap">{content}</p>
+      <div className="max-w-[72%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-surface-3 border border-border-hover">
+        <p className="text-sm text-ink leading-relaxed whitespace-pre-wrap">{content}</p>
+      </div>
       </div>
     </div>
   )
@@ -440,19 +494,19 @@ function UserBubble({
 function AgentLabel() {
   return (
     <div className="flex items-center gap-1.5 mb-1.5">
-      <div className="w-4 h-4 rounded-md bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center flex-shrink-0">
+      <div className="w-4 h-4 rounded-md bg-accent-soft border border-accent-ring/30 flex items-center justify-center flex-shrink-0">
         <svg width="8" height="8" viewBox="0 0 12 12" fill="none">
-          <path d="M2 9L5 3L8 7L10 4" stroke="#818cf8" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M2 9L5 3L8 7L10 4" stroke="var(--color-accent-muted)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </div>
-      <span className="text-[11px] text-zinc-600 font-medium">Agent</span>
+      <span className="text-[11px] text-ink-dim font-medium">Agent</span>
     </div>
   )
 }
 
 function DegradedBanner({ reason }: { reason?: string }) {
   return (
-    <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-200">
+    <div className="rounded-md border border-danger/40 bg-danger-soft px-3 py-2 text-[12px] text-red-200">
       <div className="font-semibold flex items-center gap-1.5">
         <span>⚠</span>
         <span>Degraded result — model marked invalid</span>
@@ -553,6 +607,7 @@ function ChatBubble({
             ) : (
               <>
                 <MarkdownRenderer content={content} streaming={streaming} />
+                {!streaming && <CopyButton content={content} />}
                 {!streaming && deckFilename && threadId && (
                   <DeckArtifactCard
                     threadId={threadId}
@@ -596,7 +651,7 @@ function DcfReportCard({
   const openEvidence = openCitation && citationMap ? evidenceById.get(citationMap[openCitation]) : undefined
 
   return (
-    <div className="rounded-xl border border-[#1e1e1e] bg-[#080808] px-6 py-5">
+    <div className="rounded-xl border border-border bg-bg px-6 py-5">
       <MarkdownRenderer content={linkifiedPreChart} streaming={false} onCitationClick={setOpenCitation} />
 
       {hasMarker && sensitivityImage && threadId && (
@@ -604,9 +659,9 @@ function DcfReportCard({
           <img
             src={`/artifacts/${threadId}/${sensitivityImage.split('/').pop()}`}
             alt="Sensitivity heatmap"
-            className="w-full max-w-xl rounded-lg border border-[#1e1e1e]"
+            className="w-full max-w-xl rounded-lg border border-border"
           />
-          <figcaption className="text-[11px] text-zinc-500">
+          <figcaption className="text-[11px] text-ink-dim">
             WACC × terminal growth sensitivity
           </figcaption>
         </figure>
@@ -615,7 +670,7 @@ function DcfReportCard({
       {postChart && <MarkdownRenderer content={linkifiedPostChart} streaming={false} onCitationClick={setOpenCitation} />}
 
       {canDownload && (
-        <div className="mt-6 pt-4 border-t border-[#1e1e1e] flex justify-end">
+        <div className="mt-6 pt-4 border-t border-border flex justify-end">
           <DcfReportDownloadMenu threadId={threadId!} />
         </div>
       )}
@@ -677,7 +732,7 @@ function ResearchReportCard({
         ) : null}
         <div
           className={`
-            rounded-xl border border-[#1e1e1e] bg-[#080808] px-6 py-5
+            rounded-xl border border-border bg-bg px-6 py-5
             ${streaming ? '' : ''}
           `}
         >
@@ -711,9 +766,9 @@ function ArtifactImages({ artifactPaths, threadId }: { artifactPaths: string[]; 
             <img
               src={`/artifacts/${threadId}/${filename}`}
               alt={label}
-              className="rounded-xl border border-[#2a2a2a] max-w-full"
+              className="rounded-xl border border-border-hover max-w-full"
             />
-            <figcaption className="text-xs text-zinc-600 text-center">{label}</figcaption>
+            <figcaption className="text-xs text-ink-dim text-center">{label}</figcaption>
           </figure>
         )
       })}
@@ -751,7 +806,7 @@ function ResearchStatusCard({ run }: { run: AgentRunState }) {
               ${status === 'awaiting_approval' ? 'bg-amber-500' : 'bg-indigo-500 animate-pulse'}
             `}
           />
-          <span className="text-sm text-zinc-500">{label}</span>
+          <span className="text-sm text-ink-dim">{label}</span>
         </div>
       </div>
     </div>
@@ -764,7 +819,7 @@ function ThinkingDots() {
       {[0, 1, 2].map(i => (
         <div
           key={i}
-          className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-pulse"
+          className="w-1.5 h-1.5 rounded-full bg-ink-dim animate-pulse"
           style={{ animationDelay: `${i * 150}ms` }}
         />
       ))}
@@ -778,15 +833,24 @@ function CommittedMessage({
   msg,
   onOpenDeckPreview,
   onEdit,
+  onSelectDoc,
 }: {
   msg: SessionMessage
   onOpenDeckPreview?: (filename: string, deckTitle: string | undefined, threadId: string) => void
   onEdit?: (newContent: string) => void
+  onSelectDoc?: (docId: string) => void
 }) {
   if (msg.type === 'user') {
     if (msg.content.startsWith('[DCF_APPROVED]')) return null
     if (msg.content.startsWith('[DECK_COMPLETE]')) return null
-    return <UserBubble content={msg.content} onEdit={onEdit} />
+    return (
+      <UserBubble
+        content={msg.content}
+        attachedDocs={msg.attachedDocs}
+        onEdit={onEdit}
+        onSelectDoc={onSelectDoc}
+      />
+    )
   }
   if (msg.type === 'chat_response') {
     return (
@@ -817,97 +881,6 @@ function CommittedMessage({
     )
   }
   return null
-}
-
-// ── Document card (attachment) ────────────────────────────────────────────────
-
-const FILE_COLORS: Record<string, { bg: string; border: string; text: string; label: string }> = {
-  pdf:  { bg: 'bg-red-500/15',    border: 'border-red-500/25',    text: 'text-red-400',    label: 'PDF'  },
-  docx: { bg: 'bg-blue-500/15',   border: 'border-blue-500/25',   text: 'text-blue-400',   label: 'Word' },
-  doc:  { bg: 'bg-blue-500/15',   border: 'border-blue-500/25',   text: 'text-blue-400',   label: 'Word' },
-  xlsx: { bg: 'bg-emerald-500/15',border: 'border-emerald-500/25',text: 'text-emerald-400',label: 'Excel'},
-  xls:  { bg: 'bg-emerald-500/15',border: 'border-emerald-500/25',text: 'text-emerald-400',label: 'Excel'},
-  csv:  { bg: 'bg-teal-500/15',   border: 'border-teal-500/25',   text: 'text-teal-400',   label: 'CSV'  },
-  txt:  { bg: 'bg-zinc-500/15',   border: 'border-zinc-500/25',   text: 'text-zinc-400',   label: 'Text' },
-  md:   { bg: 'bg-zinc-500/15',   border: 'border-zinc-500/25',   text: 'text-zinc-400',   label: 'MD'   },
-}
-
-function DocumentCard({
-  doc,
-  selected,
-  onSelect,
-  onRemove,
-}: {
-  doc: DocumentInfo
-  selected?: boolean
-  onSelect?: (id: string) => void
-  onRemove?: (id: string) => void
-}) {
-  const ext = doc.filename.split('.').pop()?.toLowerCase() ?? ''
-  const color = FILE_COLORS[ext] ?? { bg: 'bg-zinc-500/15', border: 'border-zinc-500/25', text: 'text-zinc-400', label: ext.toUpperCase() }
-  const isProcessing = doc.status === 'processing'
-  const isError = doc.status === 'error'
-  const name = doc.filename.length > 22 ? doc.filename.slice(0, 20) + '…' : doc.filename
-  const clickable = !isProcessing && !isError && !!onSelect
-
-  return (
-    <div
-      className={`
-        relative flex items-center gap-2.5 px-3 py-2.5 rounded-xl border
-        transition-colors duration-150 cursor-default select-none
-        ${isError
-          ? 'border-red-900/40 bg-red-950/20'
-          : selected
-            ? 'border-indigo-600/50 bg-indigo-950/20'
-            : 'border-[#252535] bg-[#111118] hover:border-[#33334a]'
-        }
-      `}
-      style={{ minWidth: 140, maxWidth: 200 }}
-    >
-      {/* File type icon */}
-      <button
-        type="button"
-        onClick={() => clickable && onSelect?.(doc.doc_id)}
-        disabled={!clickable}
-        className={`flex items-center gap-2.5 min-w-0 flex-1 ${clickable ? 'cursor-pointer' : 'cursor-default'}`}
-      >
-        <div className={`w-9 h-9 rounded-lg ${color.bg} border ${color.border} flex items-center justify-center flex-shrink-0`}>
-          {isProcessing ? (
-            <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin" style={{ color: color.text.replace('text-', '') }} />
-          ) : (
-            <svg width="16" height="16" viewBox="0 0 14 14" fill="none" className={color.text}>
-              <path d="M2.5 1.5h6L11 4.5v8H2.5v-11z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-              <path d="M8 1.5V5h2.5" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-            </svg>
-          )}
-        </div>
-
-        {/* Name + type */}
-        <div className="min-w-0 text-left">
-          <p className={`text-xs font-medium truncate leading-tight ${isError ? 'text-red-400' : selected ? 'text-zinc-100' : 'text-zinc-200'}`}>
-            {name}
-          </p>
-          <p className="text-[11px] text-zinc-500 leading-tight mt-0.5">
-            {isProcessing ? 'Processing…' : isError ? 'Error' : color.label}
-          </p>
-        </div>
-      </button>
-
-      {/* Remove button */}
-      {onRemove && (
-        <button
-          type="button"
-          onClick={(e) => { e.stopPropagation(); onRemove(doc.doc_id) }}
-          className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[#1a1a22] border border-[#2a2a38] flex items-center justify-center text-zinc-500 hover:text-zinc-200 hover:bg-[#252535] transition-colors"
-          title="Remove"
-        >
-          <svg width="7" height="7" viewBox="0 0 7 7" fill="none">
-            <path d="M1 1l5 5M6 1L1 6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-          </svg>
-        </button>
-      )}
-    </div>
-  )
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -971,12 +944,9 @@ export function MessageThread({
     !!activeRun.query &&
     lastCommittedUser?.content !== activeRun.query
 
-  // Auto-scroll on new content
   useEffect(() => {
-    if (runActive || isSynthesizing) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [activeRun.report, liveChatMessages.length, runActive, isSynthesizing, showPendingUser])
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages.length, runActive, isSynthesizing, showPendingUser])
 
   const isInputBusy =
     disabled ||
@@ -994,7 +964,16 @@ export function MessageThread({
       {/* Message list */}
       <div className="flex-1 overflow-y-auto">
         {isEmpty ? (
-          <EmptyState mode={mode} onSubmit={onSubmit} onModeChange={onModeChange} onUpload={onUpload} />
+          <EmptyState
+            mode={mode}
+            onSubmit={onSubmit}
+            onModeChange={onModeChange}
+            onUpload={onUpload}
+            docs={docs}
+            selectedDocId={selectedDocId}
+            onSelectDoc={onSelectDoc}
+            onRemoveDoc={onRemoveDoc}
+          />
         ) : (
           <div className="max-w-3xl mx-auto px-6 py-8 space-y-6">
             {/* Committed session messages */}
@@ -1003,6 +982,7 @@ export function MessageThread({
                 key={msg.id}
                 msg={msg}
                 onOpenDeckPreview={onOpenDeckPreview}
+                onSelectDoc={onSelectDoc}
                 onEdit={
                   onAmendMessage && !runActive && msg.type === 'user'
                     ? (newContent) => onAmendMessage(idx, msg.content, newContent)
@@ -1094,28 +1074,18 @@ export function MessageThread({
 
       {/* Input bar */}
       {!isEmpty && (
-        <div className="border-t border-[#141414] px-4 pt-3 pb-4 bg-[#0a0a0a] flex-shrink-0">
-          <div className="max-w-3xl mx-auto space-y-2.5">
-            {/* Attachment cards — visible above input when docs uploaded */}
-            {docs.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {docs.map(doc => (
-                  <DocumentCard
-                    key={doc.doc_id}
-                    doc={doc}
-                    selected={doc.doc_id === selectedDocId}
-                    onSelect={onSelectDoc}
-                    onRemove={onRemoveDoc}
-                  />
-                ))}
-              </div>
-            )}
+        <div className="border-t border-border-subtle px-4 pt-3 pb-4 bg-bg flex-shrink-0 overflow-visible">
+          <div className="max-w-3xl mx-auto">
             <QueryInput
               onSubmit={onSubmit}
               onUpload={onUpload}
               disabled={isInputBusy}
               mode={mode}
               onModeChange={onModeChange}
+              docs={docs}
+              selectedDocId={selectedDocId}
+              onSelectDoc={onSelectDoc}
+              onRemoveDoc={onRemoveDoc}
             />
           </div>
         </div>
@@ -1131,11 +1101,19 @@ function EmptyState({
   onSubmit,
   onModeChange,
   onUpload,
+  docs = [],
+  selectedDocId,
+  onSelectDoc,
+  onRemoveDoc,
 }: {
   mode: Mode
   onSubmit: (query: string, mode: Mode) => void
   onModeChange: (mode: Mode) => void
   onUpload?: (file: File) => void
+  docs?: DocumentInfo[]
+  selectedDocId?: string | null
+  onSelectDoc?: (docId: string) => void
+  onRemoveDoc?: (docId: string) => void
 }) {
   const examples =
     mode === 'chat'
@@ -1147,14 +1125,14 @@ function EmptyState({
   return (
     <div className="flex-1 flex flex-col items-center justify-center min-h-full px-6 py-16 space-y-8">
       <div className="w-full max-w-xl space-y-2 text-center">
-        <h2 className="text-xl font-medium text-zinc-100 tracking-tight">
+        <h2 className="text-xl font-medium text-ink tracking-tight">
           {mode === 'chat'
             ? 'What would you like to discuss?'
             : mode === 'research'
               ? 'What do you want to research?'
               : 'What can I help you with?'}
         </h2>
-        <p className="text-sm text-zinc-600">
+        <p className="text-sm text-ink-muted">
           {mode === 'chat'
             ? 'Quick answers, explanations, and follow-ups.'
             : mode === 'research'
@@ -1171,6 +1149,10 @@ function EmptyState({
           autoFocus
           mode={mode}
           onModeChange={onModeChange}
+          docs={docs}
+          selectedDocId={selectedDocId}
+          onSelectDoc={onSelectDoc}
+          onRemoveDoc={onRemoveDoc}
         />
       </div>
 
@@ -1179,7 +1161,7 @@ function EmptyState({
           <button
             key={ex}
             onClick={() => onSubmit(ex, mode)}
-            className="px-3 py-1.5 rounded-full border border-[#222] text-xs text-zinc-600 hover:text-zinc-300 hover:border-[#333] transition-colors duration-150"
+            className="px-3 py-1.5 rounded-full border border-border text-xs text-ink-dim hover:text-ink-muted hover:border-border-hover transition-colors duration-150"
           >
             {ex}
           </button>

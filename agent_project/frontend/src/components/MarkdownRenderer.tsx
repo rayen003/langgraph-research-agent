@@ -9,38 +9,38 @@ const ListDepthCtx = createContext(0)
 const components: Components = {
   // ── Headings ──────────────────────────────────────────────────────────────
   h1: ({ children }) => (
-    <h1 className="mt-8 mb-3 text-lg font-semibold text-zinc-100 tracking-tight border-b border-[#1e1e1e] pb-2">
+    <h1 className="mt-8 mb-3 text-lg font-semibold text-ink tracking-tight border-b border-border pb-2">
       {children}
     </h1>
   ),
   h2: ({ children }) => (
-    <h2 className="mt-7 mb-3 text-base font-semibold text-zinc-100 tracking-tight flex items-center gap-2">
+    <h2 className="mt-7 mb-3 text-base font-semibold text-ink tracking-tight flex items-center gap-2">
       <span className="inline-block w-0.5 h-4 rounded-full bg-indigo-500 flex-shrink-0" />
       {children}
     </h2>
   ),
   h3: ({ children }) => (
-    <h3 className="mt-5 mb-2 text-sm font-semibold text-zinc-300 tracking-tight">
+    <h3 className="mt-5 mb-2 text-sm font-semibold text-ink-muted tracking-tight">
       {children}
     </h3>
   ),
   h4: ({ children }) => (
-    <h4 className="mt-4 mb-1.5 text-sm font-medium text-zinc-400 uppercase tracking-wider">
+    <h4 className="mt-4 mb-1.5 text-sm font-medium text-ink-muted uppercase tracking-wider">
       {children}
     </h4>
   ),
 
   // ── Body ──────────────────────────────────────────────────────────────────
   p: ({ children }) => (
-    <p className="mt-3 text-sm text-zinc-300 leading-[1.85] first:mt-0">
+    <p className="mt-3 text-sm text-ink-muted leading-[1.85] first:mt-0">
       {children}
     </p>
   ),
   strong: ({ children }) => (
-    <strong className="font-semibold text-zinc-100">{children}</strong>
+    <strong className="font-semibold text-ink">{children}</strong>
   ),
   em: ({ children }) => (
-    <em className="italic text-zinc-400">{children}</em>
+    <em className="italic text-ink-muted">{children}</em>
   ),
 
   // ── Lists — depth-aware ───────────────────────────────────────────────────
@@ -77,7 +77,7 @@ const components: Components = {
     const isTop = depth === 1
     return (
       <li className={`flex items-start gap-2.5 text-sm leading-[1.8] ${
-        isTop ? 'text-zinc-300' : 'text-zinc-400'
+        isTop ? 'text-ink-muted' : 'text-ink-muted'
       }`}>
         <span className={`flex-shrink-0 rounded-full ${
           isTop
@@ -91,7 +91,7 @@ const components: Components = {
 
   // ── Blockquote ────────────────────────────────────────────────────────────
   blockquote: ({ children }) => (
-    <blockquote className="mt-4 pl-4 border-l-2 border-indigo-500/30 text-zinc-400 text-sm italic">
+    <blockquote className="mt-4 pl-4 border-l-2 border-indigo-500/30 text-ink-muted text-sm italic">
       {children}
     </blockquote>
   ),
@@ -100,47 +100,47 @@ const components: Components = {
   code: ({ children, className }) => {
     const isInline = !className
     return isInline ? (
-      <code className="px-1.5 py-0.5 rounded bg-[#1a1a1e] text-indigo-300 text-[0.8em] font-mono">
+      <code className="px-1.5 py-0.5 rounded bg-surface-2 text-indigo-300 text-[0.8em] font-mono">
         {children}
       </code>
     ) : (
-      <code className={`block text-[0.78rem] font-mono text-zinc-300 ${className ?? ''}`}>
+      <code className={`block text-[0.78rem] font-mono text-ink-muted ${className ?? ''}`}>
         {children}
       </code>
     )
   },
   pre: ({ children }) => (
-    <pre className="mt-4 rounded-xl bg-[#0d0d10] border border-[#1e1e1e] px-4 py-3.5 overflow-x-auto text-[0.78rem] leading-relaxed">
+    <pre className="mt-4 rounded-xl bg-bg border border-border px-4 py-3.5 overflow-x-auto text-[0.78rem] leading-relaxed">
       {children}
     </pre>
   ),
 
   // ── Table ─────────────────────────────────────────────────────────────────
   table: ({ children }) => (
-    <div className="mt-5 overflow-x-auto rounded-xl border border-[#222]">
+    <div className="mt-5 overflow-x-auto rounded-xl border border-border-hover">
       <table className="w-full text-sm border-collapse">{children}</table>
     </div>
   ),
   thead: ({ children }) => (
-    <thead className="bg-[#111116]">{children}</thead>
+    <thead className="bg-bg-overlay">{children}</thead>
   ),
   th: ({ children }) => (
-    <th className="px-3 py-2 text-left text-[11px] font-semibold text-zinc-500 uppercase tracking-wider border-b border-[#222] align-top">
+    <th className="px-3 py-2 text-left text-[11px] font-semibold text-ink-dim uppercase tracking-wider border-b border-border-hover align-top">
       {children}
     </th>
   ),
   td: ({ children }) => (
-    <td className="px-3 py-2 text-sm text-zinc-300 border-b border-[#1a1a1a] last:border-none align-top break-words whitespace-normal">
+    <td className="px-3 py-2 text-sm text-ink-muted border-b border-border last:border-none align-top break-words whitespace-normal">
       {children}
     </td>
   ),
   tr: ({ children }) => (
-    <tr className="hover:bg-[#111116] transition-colors duration-100">{children}</tr>
+    <tr className="hover:bg-bg-overlay transition-colors duration-100">{children}</tr>
   ),
 
   // ── Misc ──────────────────────────────────────────────────────────────────
   hr: () => (
-    <hr className="my-6 border-none h-px bg-[#1e1e1e]" />
+    <hr className="my-6 border-none h-px bg-surface-3" />
   ),
   a: ({ href, children }) => (
     <a

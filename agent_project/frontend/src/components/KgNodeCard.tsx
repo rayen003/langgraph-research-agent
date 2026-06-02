@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { KgNode } from '../hooks/useKnowledgeGraph'
+import { KgValueView } from './KgValueView'
 
 interface Props {
   node: KgNode
@@ -41,58 +42,58 @@ export function KgNodeCard({ node, onClose, onPatch, onDelete }: Props) {
   }
 
   return (
-    <div className="absolute top-12 right-3 z-20 w-80 bg-[#11111a] border border-[#2a2a36] rounded-md shadow-xl text-[11px]">
-      <div className="px-3 py-2 border-b border-[#2a2a36] flex items-center justify-between">
-        <div className="text-zinc-300 font-medium">{node.node_type}</div>
-        <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300">✕</button>
+    <div className="absolute top-12 right-3 z-20 w-96 max-h-[calc(100vh-5rem)] overflow-y-auto bg-bg-overlay border border-border-accent rounded-md shadow-xl text-[11px]">
+      <div className="px-3 py-2 border-b border-border-accent flex items-center justify-between">
+        <div className="text-ink-muted font-medium">{node.node_type}</div>
+        <button onClick={onClose} className="text-ink-dim hover:text-ink-muted">✕</button>
       </div>
 
       <div className="p-3 space-y-2">
         <div>
-          <div className="text-[9px] uppercase text-zinc-600 tracking-wider">Field</div>
-          <div className="text-zinc-300 font-mono">{node.ticker}::{node.field}</div>
+          <div className="text-[9px] uppercase text-ink-dim tracking-wider">Field</div>
+          <div className="text-ink-muted font-mono">{node.ticker}::{node.field}</div>
         </div>
 
         <div>
-          <div className="text-[9px] uppercase text-zinc-600 tracking-wider">Value</div>
+          <div className="text-[9px] uppercase text-ink-dim tracking-wider">Value</div>
           {editing ? (
             <textarea
               value={draftValue}
               onChange={e => setDraftValue(e.target.value)}
-              rows={4}
-              className="w-full mt-1 bg-[#0a0a0a] border border-[#2a2a36] rounded px-2 py-1 text-zinc-300 font-mono text-[10px]"
+              rows={8}
+              className="w-full mt-1 bg-bg border border-border-accent rounded px-2 py-1 text-ink-muted font-mono text-[10px]"
             />
           ) : (
-            <pre className="text-zinc-300 font-mono text-[10px] whitespace-pre-wrap break-all">
-              {typeof node.value === 'string' ? node.value : JSON.stringify(node.value, null, 2)}
-            </pre>
+            <div className="mt-1">
+              <KgValueView value={node.value} nodeType={node.node_type} />
+            </div>
           )}
         </div>
 
         <div className="grid grid-cols-2 gap-2">
           <div>
-            <div className="text-[9px] uppercase text-zinc-600 tracking-wider">Source</div>
-            <div className="text-zinc-400">{node.source}</div>
+            <div className="text-[9px] uppercase text-ink-dim tracking-wider">Source</div>
+            <div className="text-ink-muted">{node.source}</div>
           </div>
           <div>
-            <div className="text-[9px] uppercase text-zinc-600 tracking-wider">Confidence</div>
-            <div className="text-zinc-400">{(node.confidence * 100).toFixed(0)}%</div>
+            <div className="text-[9px] uppercase text-ink-dim tracking-wider">Confidence</div>
+            <div className="text-ink-muted">{(node.confidence * 100).toFixed(0)}%</div>
           </div>
         </div>
 
         <div>
-          <div className="text-[9px] uppercase text-zinc-600 tracking-wider">Updated</div>
-          <div className="text-zinc-500">{formatAge(node.updated_at)}</div>
+          <div className="text-[9px] uppercase text-ink-dim tracking-wider">Updated</div>
+          <div className="text-ink-dim">{formatAge(node.updated_at)}</div>
         </div>
 
         {node.run_id && (
           <div>
-            <div className="text-[9px] uppercase text-zinc-600 tracking-wider">Run</div>
-            <div className="text-zinc-500 font-mono text-[10px]">{node.run_id}</div>
+            <div className="text-[9px] uppercase text-ink-dim tracking-wider">Run</div>
+            <div className="text-ink-dim font-mono text-[10px]">{node.run_id}</div>
           </div>
         )}
 
-        <div className="flex gap-2 pt-2 border-t border-[#2a2a36]">
+        <div className="flex gap-2 pt-2 border-t border-border-accent">
           {editing ? (
             <>
               <button
@@ -103,7 +104,7 @@ export function KgNodeCard({ node, onClose, onPatch, onDelete }: Props) {
               </button>
               <button
                 onClick={() => setEditing(false)} disabled={busy}
-                className="px-2 py-1 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 hover:bg-zinc-700"
+                className="px-2 py-1 rounded bg-zinc-800 text-ink-muted border border-zinc-700 hover:bg-zinc-700"
               >
                 Cancel
               </button>
