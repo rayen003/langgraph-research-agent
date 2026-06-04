@@ -199,10 +199,7 @@ def cross_source_consistency(ticker: str | None = None, _cache: KGCache | None =
     # run_id and are intentionally per-run (each DCF run has its own wacc,
     # base_revenue, terminal_pv, …), so grouping them by (node_type, field)
     # across runs produces meaningless "contradictions". Exclude them.
-    RUN_SCOPED = {
-        "dcf_run", "run_assumption", "run_output", "run_scenario",
-        "scenario_result", "valuation_result",
-    }
+    from .schemas import RUN_SCOPED_NODE_TYPES as RUN_SCOPED  # noqa: PLC0415
 
     # Group SHARED nodes by (ticker, node_type, field). Ticker MUST be in the
     # key — when auditing the whole graph (ticker=None) different companies

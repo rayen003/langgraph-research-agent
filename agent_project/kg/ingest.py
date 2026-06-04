@@ -34,6 +34,7 @@ from enum import Enum
 from typing import Any
 
 from .cache import KGCache, get_cache
+from .schemas import validate_kg_value
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +341,17 @@ def ingest_fact(
                     ticker, node_type, field, result.reason,
                 )
                 return result
+
+    # ── 1b. Value-shape validation (advisory) ───────────────────────────
+    # Validate the payload against the canonical per-node_type schema. Never
+    # fatal — we log shape mismatches but still write (additive KG). This is
+    # the contract that prevents the scalar-vs-dict crash class.
+    _, _value_warnings = validate_kg_value(node_type, value)
+    if _value_warnings:
+        logger.warning(
+            "KG ingest value-shape ticker=%s node_type=%s field=%s warnings=%s",
+            ticker, node_type, field, _value_warnings,
+        )
 
     # ── 2. Confidence floor ──────────────────────────────────────────────
     confidence_floor = _get_confidence_floor(node_type)

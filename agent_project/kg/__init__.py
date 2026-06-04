@@ -15,6 +15,12 @@ Public entry points:
 """
 
 from .cache import KGCache, KGNode, KGEdge, get_cache
+from .schemas import (
+    validate_kg_value,
+    is_scalar_node,
+    SCALAR_NODE_TYPES,
+    RUN_SCOPED_NODE_TYPES,
+)
 from .ingest import (
     DocumentFact,
     IngestResult,
@@ -45,4 +51,6 @@ __all__ = [
     "DocumentFact", "IngestResult", "IngestStatus", "Layer",
     "ingest_fact", "ingest_facts", "kg_write",
     "SOURCE_TIER_PRECEDENCE", "MIN_CONFIDENCE_FOR_KG_WRITE", "NODE_TYPE_LAYER_MAP",
+    "validate_kg_value", "is_scalar_node",
+    "SCALAR_NODE_TYPES", "RUN_SCOPED_NODE_TYPES",
 ]
