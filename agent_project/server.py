@@ -1963,14 +1963,22 @@ async def kg_traversal(session_id: str, run_id: str) -> dict[str, Any]:
 
 @app.post("/kg/{session_id}/query")
 async def kg_query(session_id: str, body: KGQueryRequest) -> dict[str, Any]:
-    """Natural-language query against the KG. Returns answer + traversal subgraph."""
-    from kg.query import run_nl_query  # noqa: PLC0415
-    result = await run_nl_query(
-        question=body.question,
-        ticker=(body.ticker.upper() if body.ticker else None),
-        session_id=session_id,
+    """Natural-language query against the KG — multi-hop deep-research engine.
+
+    Same engine the ``query_knowledge_graph`` tool uses (single code path); the
+    manual panel benefits from the same hop-by-hop reasoning. Returns answer +
+    traversal subgraph (+ ``hops`` log).
+    """
+    from kg.deep_research import run_deep_research  # noqa: PLC0415
+    import anyio  # noqa: PLC0415
+    # run_deep_research is sync (LLM .invoke) — run off the event loop.
+    return await anyio.to_thread.run_sync(
+        lambda: run_deep_research(
+            question=body.question,
+            ticker=(body.ticker.upper() if body.ticker else None),
+            session_id=session_id,
+        )
     )
-    return result
 
 
 @app.post("/kg/{session_id}/compare-chat")

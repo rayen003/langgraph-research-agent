@@ -34,6 +34,7 @@ from tools import (
     calculator,
     execute_python,
     fetch_sec_filing,
+    query_knowledge_graph,
     retrieve_tool_result,
     run_dcf_workflow,
     search_web,
@@ -136,6 +137,7 @@ TOOLS = [
     run_dcf_workflow,
     search_documents,
     fetch_sec_filing,
+    query_knowledge_graph,
 ]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 agent_llm = llm.bind_tools(TOOLS)
@@ -156,6 +158,7 @@ STATIC_SYSTEM_PROMPT = (
     "You never break character, never ask for clarification, and never offer optional follow-ups.\n"
     "\n"
     "## Tool rules\n"
+    "- query_knowledge_graph: your OWN structured memory — prior DCF runs (assumptions, outputs, scenarios), theses, company synthesis, drivers, fundamentals, filings, uploaded-doc facts. Multi-hop reasoning. For any ticker you've analyzed, query the KG FIRST (before search_web) for analytical/chained questions; it's cheaper and grounded in your own work. Returns a synthesized answer + a tool_result_id for the traversal trail.\n"
     "- search_documents returns a RELEVANCE VERDICT, not raw text chunks:\n"
     "  {\"status\": \"relevant\"|\"partial\"|\"mismatch\"|\"none\", \"covered\": [...], \"missing\": [...], \"chunk_ids\": [...]}\n"
     "  * status='relevant': docs cover everything needed. Fetch chunks with retrieve_tool_result(chunk_id).\n"

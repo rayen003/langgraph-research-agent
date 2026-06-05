@@ -58,6 +58,12 @@ LangGraph-based research agent for financial analysis. Core capability: **determ
 
 ## Recent changes (2026-06)
 
+**Multi-hop KG deep research + tool consolidation (`kg/deep_research.py`)**
+- The KG is now the agent's **own memory, queryable as a tool**. `query_knowledge_graph(question, ticker?)` is in the shared tool set → both chat *and* research subgraphs consult prior DCF runs, theses, fundamentals, drivers, and filings *before* hitting the web. Precedence: **KG → documents (RAG) → web**.
+- The engine reasons hop-by-hop instead of dumping the whole subgraph: seed (company + 1-hop) → LLM decides *answer now* or *which real edges to expand* → expand → repeat (bounded: ≤4 hops, ≤80 nodes). The planner only ever picks from relations that actually exist on the frontier, so it can't hallucinate a hop. Handles cross-run and cross-ticker questions ("compare wacc across runs", "AAPL vs META tax rate", "do the assumptions match the thesis?").
+- Adjacency read from durable storage (not the partially-hydrated in-memory cache), so a fresh query process sees the full graph.
+- **One engine**: the manual `/kg/{session}/query` panel routes through the same `run_deep_research` — the visual traversal panel benefits from multi-hop too. The tool returns a synthesized answer inline + a `tool_result_id` for the full hop/node/edge trail, and emits a `kg_traversal` UI event. (Idea adapted from QuantMind's multi-hop DeepResearch.)
+
 KG ingestion, rendering, and audit hardening — driven by real upload/DCF sessions.
 
 **Document → KG ingestion**

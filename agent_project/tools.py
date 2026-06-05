@@ -449,6 +449,85 @@ def fetch_sec_filing(ticker: str, filing_type: str = "10-K") -> str:
     )
 
 
+@tool
+def query_knowledge_graph(question: str, ticker: str = "") -> str:
+    """Query the agent's OWN Knowledge Graph with multi-hop reasoning.
+
+    The KG is your structured memory — it holds every prior DCF run (assumptions,
+    outputs, scenarios), investment theses, company synthesis, drivers,
+    fundamentals (revenue/margins/wacc), SEC filings, and uploaded-document
+    facts. Consult this FIRST for anything about a ticker you've already
+    analyzed: it's cheaper, faster, and more grounded than a web search.
+
+    Use it for chained/analytical questions — "which assumptions drove AAPL's
+    implied price and do they match the thesis?", "compare tax rate across runs",
+    "how did META's growth assumption change?". The engine walks the graph
+    hop-by-hop (run → assumptions → thesis → drivers) and synthesizes an answer.
+
+    Args:
+        question: The analyst question, natural language.
+        ticker: Optional ticker hint (e.g. "AAPL"). Leave empty to infer from
+            the question.
+
+    Returns a JSON string with the synthesized ``answer`` plus a
+    ``tool_result_id`` pointing at the full traversal trail (hops + nodes +
+    edges) for inspection. The answer is usable directly; you do not need to
+    retrieve the trail unless you want to cite specific node ids.
+    """
+    from kg.deep_research import run_deep_research  # noqa: PLC0415
+
+    try:
+        result = run_deep_research(question, ticker=ticker or None)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": str(exc), "tool_name": "query_knowledge_graph"})
+
+    answer = result.get("answer", "")
+    matched = result.get("matched_nodes", []) or []
+    trail = {
+        "question": question,
+        "ticker": ticker,
+        "hops": result.get("hops", []),
+        "traversal_path": result.get("traversal_path", []),
+        "traversal_edges": result.get("traversal_edges", []),
+        "nodes": [
+            {
+                "id": n.get("id"), "ticker": n.get("ticker"),
+                "node_type": n.get("node_type"), "field": n.get("field"),
+                "value": n.get("value"), "source": n.get("source"),
+            }
+            for n in matched[:40]
+        ],
+    }
+
+    # Surface the traversal to the UI as an on-demand expander in the chat
+    # activity stream (collapsed by default; the analyst can open the trail).
+    emit_ui_event({
+        "type": "kg_traversal",
+        "question": question,
+        "ticker": ticker,
+        "hops": result.get("hops", []),
+        "node_count": len(result.get("traversal_path", [])),
+        "edge_count": len(result.get("traversal_edges", [])),
+        "traversal_path": result.get("traversal_path", []),
+        "traversal_edges": result.get("traversal_edges", []),
+        "nodes": trail["nodes"],
+    })
+
+    pointer_json = persist_tool_result(
+        "query_knowledge_graph",
+        {"question": question, "ticker": ticker},
+        json.dumps(trail, ensure_ascii=False),
+        summary=answer[:200],
+    )
+    pid = json.loads(pointer_json).get("tool_result_id")
+    return json.dumps({
+        "answer": answer,
+        "tool_result_id": pid,
+        "hops": len(result.get("hops", [])),
+        "nodes_traversed": len(result.get("traversal_path", [])),
+    }, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Tool collections
 # ---------------------------------------------------------------------------
@@ -464,6 +543,7 @@ ALL_TOOLS = [
     run_deck_workflow,
     search_documents,
     fetch_sec_filing,
+    query_knowledge_graph,
 ]
 
 # Chat subset — same tools minus research-only ones.  The chat subgraph
@@ -478,4 +558,5 @@ CHAT_CANONICAL = [
     run_deck_workflow,
     search_documents,
     fetch_sec_filing,
+    query_knowledge_graph,
 ]

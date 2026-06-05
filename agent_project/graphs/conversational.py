@@ -15,6 +15,7 @@ from tools import (
     calculator,
     execute_python,
     fetch_sec_filing,
+    query_knowledge_graph,
     retrieve_tool_result,
     run_dcf_workflow,
     run_deck_workflow,
@@ -41,6 +42,7 @@ CHAT_TOOLS = [
     execute_python,
     search_documents,
     fetch_sec_filing,
+    query_knowledge_graph,
     retrieve_tool_result,
     run_dcf_workflow,
     run_deck_workflow,
@@ -69,8 +71,9 @@ _CHAT_SYSTEM = (
     "* status='gate_skipped': passed skip_gate=True — `chunks` array has full text + metadata, evaluate relevance yourself.\n"
     "* status='none': no docs or no matches → proceed with search_web.\n"
     "Pass skip_gate=True when you already know the docs from prior turns — saves ~1-2s latency.\n"
+    "- query_knowledge_graph: query YOUR OWN memory — the Knowledge Graph of everything you've already analyzed (prior DCF runs + assumptions + outputs, investment theses, company synthesis, drivers, fundamentals like revenue/margins/wacc, SEC filings, uploaded-doc facts). Multi-hop reasoning. **Consult this FIRST** for any ticker you've analyzed before answering — it's cheaper and more grounded than the web. Use for analytical/chained questions ('which assumptions drove the implied price and do they match the thesis?', 'compare wacc across runs', 'how did the growth assumption change?'). Returns a synthesized answer inline + a tool_result_id for the traversal trail.\n"
     "- fetch_sec_filing: fetch 10-K/10-Q filings from SEC EDGAR. Use for company risks, MD&A, or business overview — prefer over search_web for company fundamentals.\n"
-    "- search_web: look up current news, prices, filings, or factual information NOT found in uploaded documents. "
+    "- search_web: look up current news, prices, filings, or factual information NOT found in the KG or uploaded documents. "
     "Returns a tool_result_id pointer + one-line summary — you MUST call retrieve_tool_result to read the full content.\n"
     "- retrieve_tool_result: read the full content of any tool result by its tool_result_id (search_web, execute_python, etc.)\n"
     "- calculator: evaluate mathematical expressions\n"
