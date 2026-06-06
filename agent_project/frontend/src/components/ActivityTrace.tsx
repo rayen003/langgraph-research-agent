@@ -1148,7 +1148,7 @@ function AssumptionJourneyDetail({ meta }: { meta: Record<string, unknown> }) {
   )
 }
 
-function DcfStepDetail({ stepName, meta }: { stepName: string; meta: Record<string, unknown> }) {
+export function DcfStepDetail({ stepName, meta }: { stepName: string; meta: Record<string, unknown> }) {
   switch (stepName) {
     case 'assemble_evidence': return <EvidenceDetail meta={meta} />
     case 'semantic_synthesis': return <SynthesisDetail meta={meta} />

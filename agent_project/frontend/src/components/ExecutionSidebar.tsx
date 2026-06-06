@@ -1,7 +1,8 @@
 import type { RunStatus, StepState, DcfReviewState, DeckReviewState } from '../types'
 import type { ActivityEntry } from '../lib/activity'
 import { StepCard } from './StepCard'
-import { ActivityTrace, DcfHitlSection } from './ActivityTrace'
+import { DcfHitlSection, DcfStepDetail } from './ActivityTrace'
+import { BlockStack } from './activity/BlockStack'
 import { DeckOutlineReview } from './DeckOutlineReview'
 import { PanelHideButton } from './PanelHideButton'
 
@@ -120,9 +121,17 @@ export function ExecutionSidebar({
           </div>
         )}
 
-        {/* Chat mode: render activity trace directly */}
+        {/* Workflow substeps → stacked blocks (right bar). Active block stays
+            expanded; completed collapse to a one-line summary. */}
         {isChatMode && (
-          <ActivityTrace activities={activity!} defaultOpen label="Activity" />
+          <BlockStack
+            entries={activity!}
+            renderBody={(e) =>
+              e.meta && Object.keys(e.meta).length > 0
+                ? <DcfStepDetail stepName={e.name} meta={e.meta} />
+                : null
+            }
+          />
         )}
 
         {status === 'planning' && (
