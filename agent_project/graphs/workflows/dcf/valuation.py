@@ -729,6 +729,9 @@ def finalize_node(state: dict) -> dict:
         "valuation_flags": state.get("valuation_flags", []),
         "market_snapshot": state["market_snapshot"],
         "valuation": state["valuation"],
+        # Explicit per-year forecast (Issue #8) — exposes the FCFF build so the
+        # valuation mechanics are auditable instead of only showing final inputs.
+        "projected_fcff": state.get("projected_fcff") or [],
         "sensitivity_table": state["sensitivity_table"],
         "sensitivity_chart": _resolve_chart_path(state.get("sensitivity_chart"), run_dir),
         "features": state.get("features") or {},

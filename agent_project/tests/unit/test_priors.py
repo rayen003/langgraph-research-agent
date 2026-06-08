@@ -450,3 +450,25 @@ def test_enforce_prevents_negative_valuation():
 
     clamped, _ = enforce_hard_bands(raw, "mega_cap_tech")
     assert _dcf_value_from_assumptions(clamped) > 0  # fixed: positive price
+
+
+# ---------------------------------------------------------------------------
+# 9. forecast_confidence — evidence/forecast split (Issue #4)
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_confidence_terminal_growth_is_low():
+    """Terminal growth is the least forecastable input — must not read high."""
+    from agent_project.graphs.workflows.dcf.priors import forecast_confidence
+    assert forecast_confidence("terminal_growth") <= 0.45
+
+
+def test_forecast_confidence_stable_fields_high():
+    from agent_project.graphs.workflows.dcf.priors import forecast_confidence
+    assert forecast_confidence("base_revenue") >= 0.95
+    assert forecast_confidence("tax_rate") >= 0.85
+
+
+def test_forecast_confidence_unknown_field_default():
+    from agent_project.graphs.workflows.dcf.priors import forecast_confidence
+    assert 0.0 < forecast_confidence("some_unknown_field") < 1.0

@@ -104,6 +104,34 @@ PROFILE_PRIORS: dict[str, dict[str, dict[str, float]]] = {
     },
 }
 
+# Issue #4: forecast confidence priors. Evidence confidence (in provenance/memo)
+# measures how well-SUPPORTED an assumption is; forecast confidence measures how
+# RELIABLY the future value can be predicted — independent of evidence quality.
+# A tax rate is highly forecastable (stable); terminal growth and out-year
+# margins are intrinsically uncertain no matter how good the narrative. Splitting
+# them stops a 90%-"confident" terminal-growth from misrepresenting reliability.
+FORECAST_CONFIDENCE: dict[str, float] = {
+    "base_revenue":             1.00,  # reported fact
+    "shares_outstanding":       0.95,
+    "net_debt":                 0.95,
+    "tax_rate":                 0.90,
+    "sbc_pct_revenue":          0.85,
+    "wacc":                     0.70,  # CAPM inputs (beta/ERP) are noisy
+    "revenue_growth":           0.55,
+    "fcff_margin":              0.50,
+    "buyback_yield":            0.50,
+    "revenue_growth_terminal":  0.40,
+    "fcff_margin_terminal":     0.40,
+    "terminal_growth":          0.40,  # the least forecastable DCF input
+}
+_DEFAULT_FORECAST_CONFIDENCE: float = 0.55
+
+
+def forecast_confidence(field: str) -> float:
+    """How reliably *field* can be forecast, independent of evidence quality."""
+    return FORECAST_CONFIDENCE.get(field, _DEFAULT_FORECAST_CONFIDENCE)
+
+
 # Output sanity rails (applied inside compute_valuation_node).
 _VALUATION_PRIORS: dict[str, dict[str, dict[str, float]]] = {
     "default": {

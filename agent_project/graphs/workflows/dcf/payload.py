@@ -20,6 +20,7 @@ from .sources import (
     wacc_input_ref_ids,
 )
 from .state import _TIER_A_FIELDS
+from .priors import forecast_confidence
 
 
 def _humanize_evidence_refs(
@@ -777,6 +778,31 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
                     )
             elif stack_final is not None:
                 lines.append(f"  - **Final WACC: {float(stack_final):.2%}**")
+
+            # Issue #1: when CAPM was clipped to the profile band, say WHY —
+            # otherwise the user can't tell whether the discount rate is market-
+            # derived or a heuristic override.
+            base_capm = next(
+                (float(c.get("value")) for c in stack_components
+                 if c.get("label") == "Base CAPM" and c.get("value") is not None),
+                None,
+            )
+            if base_capm is not None and valuation_wacc > 0 and abs(base_capm - valuation_wacc) > 1e-4:
+                beta_val = wacc_comp.get("beta")
+                beta_str = f" Raw beta ({float(beta_val):.2f})" if isinstance(beta_val, (int, float)) else " Raw beta"
+                direction = "down" if base_capm > valuation_wacc else "up"
+                edge = "ceiling" if direction == "down" else "floor"
+                lines.append("")
+                lines.append(
+                    f"  **Why adjusted:** CAPM WACC {base_capm:.2%} was clipped "
+                    f"{direction} to the profile band {edge} {valuation_wacc:.2%}."
+                )
+                lines.append(
+                    f"  {beta_str} likely {'overstates' if direction == 'down' else 'understates'} "
+                    f"the fundamental business risk of a stable mega-cap; the band "
+                    f"normalizes to sector-typical discount rates rather than a "
+                    f"point beta estimate."
+                )
         lines.append("")
 
         coherence = payload.get("coherence_assessment") or {}
@@ -820,13 +846,22 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
     proposals = memo.get("proposals") if isinstance(memo, dict) else None
     if proposals:
         lines.append("## Assumption Rationale")
+        lines.append(
+            "_Evidence = how well-supported the value is. "
+            "Forecast = how reliably the future value can be predicted "
+            "(intrinsic uncertainty, independent of evidence)._"
+        )
+        lines.append("")
         for prop in proposals:
             field = prop.get("field", "?")
             rationale = prop.get("rationale", "")
-            conf = prop.get("confidence", 0.5)
+            conf = prop.get("confidence", 0.5)  # evidence confidence
+            fc = forecast_confidence(field)
             refs = prop.get("evidence_refs", [])
             ref_markers = source_registry.format_refs(list(refs))
-            lines.append(f"**{field}** (confidence: {conf:.0%}) {ref_markers}")
+            lines.append(
+                f"**{field}** (evidence: {conf:.0%} · forecast: {fc:.0%}) {ref_markers}"
+            )
             lines.append(f"  {rationale}")
             lines.append("")
         overall = memo.get("overall_narrative", "")
@@ -900,6 +935,53 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
             sev = flag.get("severity", "?").upper()
             msg = flag.get("message", "")
             lines.append(f"- **{sev}:** {msg}")
+        lines.append("")
+
+    # Issue #8: explicit per-year forecast model. The engine already computed
+    # this; surfacing it lets the user audit the FCFF build (a tiny/negative
+    # FCFF row is the visible cause of an implausibly-low implied price).
+    projected = payload.get("projected_fcff") or []
+    if projected:
+        lines.append("## Forecast Model")
+        lines.append("")
+        lines.append("| Year | Revenue ($B) | Growth | FCFF margin | Econ. margin (− SBC) | FCFF ($B) |")
+        lines.append("|------|-------------|--------|-------------|----------------------|-----------|")
+        for row in projected:
+            yr = int(row.get("year", 0))
+            rev_b = float(row.get("revenue", 0.0)) / 1000.0
+            fcff_b = float(row.get("fcff", 0.0)) / 1000.0
+            growth = float(row.get("growth", 0.0))
+            margin = float(row.get("margin", 0.0))
+            eff = float(row.get("effective_margin", margin))
+            lines.append(
+                f"| Y{yr} | ${rev_b:,.1f} | {growth*100:.1f}% | "
+                f"{margin*100:.1f}% | {eff*100:.1f}% | ${fcff_b:,.1f} |"
+            )
+        lines.append("")
+        # Revenue bridge — base → terminal year, with CAGR.
+        base_rev_b = float((assumptions or {}).get("base_revenue", 0.0)) / 1000.0
+        last = projected[-1]
+        last_rev_b = float(last.get("revenue", 0.0)) / 1000.0
+        n_yrs = int(last.get("year", len(projected))) or len(projected)
+        if base_rev_b > 0 and last_rev_b > 0 and n_yrs > 0:
+            cagr = (last_rev_b / base_rev_b) ** (1.0 / n_yrs) - 1.0
+            lines.append(
+                f"- **Revenue bridge:** ${base_rev_b:,.1f}B base → "
+                f"${last_rev_b:,.1f}B by Y{n_yrs} ({cagr*100:.1f}% CAGR)."
+            )
+        # Value bridge — explicit PV + terminal PV → EV → equity → price.
+        if valuation:
+            pv = float(valuation.get("pv_cash_flows", 0.0)) / 1000.0
+            tvpv = float(valuation.get("terminal_pv", 0.0)) / 1000.0
+            evb = float(valuation.get("enterprise_value", 0.0)) / 1000.0
+            eqb = float(valuation.get("equity_value", 0.0)) / 1000.0
+            price = float(valuation.get("implied_share_price", 0.0))
+            tv_share = (tvpv / evb * 100.0) if evb else 0.0
+            lines.append(
+                f"- **Value bridge:** explicit PV ${pv:,.1f}B + terminal PV "
+                f"${tvpv:,.1f}B = EV ${evb:,.1f}B → equity ${eqb:,.1f}B → "
+                f"**${price:,.2f}/share** (terminal = {tv_share:.0f}% of EV)."
+            )
         lines.append("")
 
     if valuation:
