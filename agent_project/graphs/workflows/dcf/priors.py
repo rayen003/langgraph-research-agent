@@ -198,6 +198,65 @@ def check_against_band(
     return []
 
 
+def enforce_hard_bands(
+    assumptions: dict[str, float],
+    profile: str,
+    *,
+    fields: set[str] | None = None,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    """Clamp any assumption that violates a HARD band to the nearest bound.
+
+    A hard-band violation is economically implausible for the sector profile and,
+    left unclamped, produces a DEGENERATE valuation — e.g. an FCFF margin below
+    the SBC drag yields negative FCFF → negative terminal value → negative share
+    price (the AMZN -$7.64 bug). Detection alone (a ``block`` quality flag) only
+    lowered confidence; the bad value still reached the math. This clamps it.
+
+    Returns a NEW assumptions dict (never mutates the input) plus one ``warn``
+    quality flag per clamp carrying ``clamped_from`` / ``clamped_to`` for report
+    transparency. Pass ``fields`` to restrict the clamp (e.g. the margin fields
+    at the valuation chokepoint).
+    """
+    bands = PROFILE_PRIORS.get(profile) or PROFILE_PRIORS["default"]
+    out = dict(assumptions)
+    flags: list[dict[str, Any]] = []
+    for field, band in bands.items():
+        if fields is not None and field not in fields:
+            continue
+        if field not in out:
+            continue
+        try:
+            value = float(out[field])
+        except (TypeError, ValueError):
+            continue
+        hard_min = float(band.get("hard_min", float("-inf")))
+        hard_max = float(band.get("hard_max", float("inf")))
+        if value < hard_min:
+            bound, kind = hard_min, "floor"
+        elif value > hard_max:
+            bound, kind = hard_max, "cap"
+        else:
+            continue
+        out[field] = bound
+        flag = quality_flag(
+            code=f"{field}_clamped_to_hard_{kind}",
+            severity="warn",
+            field=field,
+            value=bound,
+            expected={"min": hard_min, "max": hard_max},
+            profile=profile,
+            message=(
+                f"{field} proposed at {value:.4g} — implausible for profile "
+                f"'{profile}'; CLAMPED to hard {kind} {bound:.4g}. Unclamped this "
+                f"would yield a degenerate valuation."
+            ),
+        )
+        flag["clamped_from"] = value
+        flag["clamped_to"] = bound
+        flags.append(flag)
+    return out, flags
+
+
 def check_assumption_plausibility(
     assumptions: dict[str, float],
     profile: str,

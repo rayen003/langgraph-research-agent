@@ -145,6 +145,24 @@ def project_cashflows_node(state: dict) -> dict:
     parent_step_id = state.get("parent_step_id") or "workflow_dcf"
     emit_step("project_cashflows", "start", parent_step_id)
     a = state["assumptions"]
+    # Universal floor-enforcement chokepoint. Base assumptions are already
+    # clamped at propose_assumptions, but scenario adjustments (base ± bounded
+    # delta) and the review loop can re-breach the profile floor — and the
+    # adjustment clamp (_FIELD_CLAMP) even permits negative margins. Re-clamp the
+    # margin fields here so NO path can drive FCFF negative via a sub-floor
+    # margin. Profile-aware; a no-op when assumptions are already in-band.
+    from .priors import enforce_hard_bands  # noqa: PLC0415
+    profile = state.get("profile", "default")
+    a, _margin_clamps = enforce_hard_bands(
+        a, profile, fields={"fcff_margin", "fcff_margin_terminal"}
+    )
+    if _margin_clamps:
+        for _c in _margin_clamps:
+            logger.warning(
+                "DCF project_cashflows margin re-clamped field=%s from=%.4g to=%.4g "
+                "(scenario/review breach of profile '%s' floor)",
+                _c["field"], _c["clamped_from"], _c["clamped_to"], profile,
+            )
     revenue = float(a["base_revenue"])
     growth_start = float(a["revenue_growth"])
     growth_end = float(a.get("revenue_growth_terminal", growth_start) or growth_start)

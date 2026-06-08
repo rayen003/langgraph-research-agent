@@ -27,7 +27,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from .activity import emit_step
-from .priors import check_assumption_plausibility, prior_band_midpoint
+from .priors import check_assumption_plausibility, enforce_hard_bands, prior_band_midpoint
 from .state import (
     _DEFAULT_EQUITY_RISK_PREMIUM,
     _DEFAULT_RISK_FREE_RATE,
@@ -770,14 +770,41 @@ def propose_assumptions_node(state: dict) -> dict:
         features=features, profile=profile, overrides=overrides,
     )
 
-    # ── Step 6: Plausibility checks ─────────────────────────────────────────
-    assumption_flags = check_assumption_plausibility(assumptions, profile)
-    if assumption_flags:
-        for flag in assumption_flags:
-            logger.warning(
-                "DCF assumption flag severity=%s field=%s value=%s",
-                flag.get("severity"), flag.get("field"), flag.get("value"),
-            )
+    # ── Step 6: Hard-band enforcement + plausibility checks ─────────────────
+    # Clamp implausible assumptions to their profile hard bounds BEFORE the
+    # valuation runs. A sub-floor FCFF margin (below the SBC drag) would
+    # otherwise produce negative FCFF → a negative implied share price. The
+    # clamp is recorded in provenance + surfaced as a warn flag so the report
+    # stays honest about the override.
+    assumptions, clamp_flags = enforce_hard_bands(assumptions, profile)
+    for flag in clamp_flags:
+        field = flag["field"]
+        prev = dict(provenance.get(field) or {})
+        prev_evidence = str(prev.get("evidence") or "")
+        provenance[field] = {
+            **prev,
+            "clamped": True,
+            "clamped_from": flag["clamped_from"],
+            "clamped_to": flag["clamped_to"],
+            "confidence": min(float(prev.get("confidence") or 0.5), 0.30),
+            "evidence": (
+                (prev_evidence + " ") if prev_evidence else ""
+            ) + (
+                f"[CLAMPED] proposed {flag['clamped_from']:.4g} is implausible for "
+                f"profile '{profile}'; clamped to {flag['clamped_to']:.4g}."
+            ),
+        }
+        logger.warning(
+            "DCF assumption CLAMPED field=%s from=%.4g to=%.4g profile=%s",
+            field, flag["clamped_from"], flag["clamped_to"], profile,
+        )
+
+    assumption_flags = clamp_flags + check_assumption_plausibility(assumptions, profile)
+    for flag in assumption_flags:
+        logger.warning(
+            "DCF assumption flag severity=%s field=%s value=%s",
+            flag.get("severity"), flag.get("field"), flag.get("value"),
+        )
 
     logger.info(
         "DCF propose_assumptions assumptions=%s provenance=%s flags=%d",

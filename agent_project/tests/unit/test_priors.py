@@ -27,6 +27,7 @@ from agent_project.graphs.workflows.dcf.priors import (
     check_valuation_sanity,
     compute_confidence_breakdown,
     compute_confidence_label,
+    enforce_hard_bands,
 )
 
 
@@ -373,3 +374,79 @@ def test_label_wrapper_matches_breakdown():
     """compute_confidence_label === compute_confidence_breakdown(...).label"""
     args = {"assumption_flags": [], "valuation_flags": [], "provenance": _good_provenance()}
     assert compute_confidence_label(**args) == compute_confidence_breakdown(**args)["label"]
+
+
+# ---------------------------------------------------------------------------
+# 8. enforce_hard_bands — floor/ceiling clamping (Tier 0 correctness guard)
+# ---------------------------------------------------------------------------
+
+
+def test_enforce_clamps_sub_floor_fcff_margin():
+    """The AMZN -$7.64 bug: fcff_margin 0.0283 < mega_cap_tech floor 0.05."""
+    out, flags = enforce_hard_bands({"fcff_margin": 0.0283}, "mega_cap_tech")
+    assert out["fcff_margin"] == 0.05
+    assert len(flags) == 1
+    assert flags[0]["field"] == "fcff_margin"
+    assert flags[0]["clamped_from"] == 0.0283
+    assert flags[0]["clamped_to"] == 0.05
+    assert flags[0]["severity"] == "warn"
+
+
+def test_enforce_clamps_both_margin_fields():
+    out, flags = enforce_hard_bands(
+        {"fcff_margin": 0.02, "fcff_margin_terminal": 0.01}, "mega_cap_tech"
+    )
+    assert out["fcff_margin"] == 0.05
+    assert out["fcff_margin_terminal"] == 0.05
+    assert {f["field"] for f in flags} == {"fcff_margin", "fcff_margin_terminal"}
+
+
+def test_enforce_clamps_above_hard_max():
+    out, flags = enforce_hard_bands({"terminal_growth": 0.10}, "mega_cap_tech")
+    assert out["terminal_growth"] == 0.045  # hard_max
+    assert flags[0]["code"].endswith("hard_cap")
+
+
+def test_enforce_noop_when_in_band():
+    """In-band assumptions pass through untouched, no flags."""
+    a = {"fcff_margin": 0.25, "revenue_growth": 0.15, "terminal_growth": 0.025}
+    out, flags = enforce_hard_bands(a, "mega_cap_tech")
+    assert out == a
+    assert flags == []
+
+
+def test_enforce_does_not_mutate_input():
+    a = {"fcff_margin": 0.01}
+    out, _ = enforce_hard_bands(a, "mega_cap_tech")
+    assert a["fcff_margin"] == 0.01  # original untouched
+    assert out["fcff_margin"] == 0.05
+
+
+def test_enforce_fields_filter():
+    """fields= restricts the clamp (used at the valuation chokepoint)."""
+    a = {"fcff_margin": 0.01, "terminal_growth": 0.10}
+    out, flags = enforce_hard_bands(a, "mega_cap_tech", fields={"fcff_margin"})
+    assert out["fcff_margin"] == 0.05         # clamped
+    assert out["terminal_growth"] == 0.10     # untouched (not in fields)
+    assert {f["field"] for f in flags} == {"fcff_margin"}
+
+
+def test_enforce_prevents_negative_valuation():
+    """End-to-end: a clamped sub-floor margin yields a POSITIVE implied price.
+
+    Reproduces the AMZN inputs (margin below SBC drag) and asserts the clamp
+    turns a degenerate negative price positive.
+    """
+    from agent_project.graphs.workflows.dcf.valuation import _dcf_value_from_assumptions
+
+    raw = {
+        "base_revenue": 716924.0, "revenue_growth": 0.16,
+        "fcff_margin": 0.0283, "fcff_margin_terminal": 0.015,
+        "revenue_growth_terminal": 0.07, "terminal_growth": 0.02,
+        "wacc": 0.10, "sbc_pct_revenue": 0.0272,
+        "net_debt": -57381.0, "shares_outstanding": 10827.0,
+    }
+    assert _dcf_value_from_assumptions(raw) < 0  # the bug: negative price
+
+    clamped, _ = enforce_hard_bands(raw, "mega_cap_tech")
+    assert _dcf_value_from_assumptions(clamped) > 0  # fixed: positive price
