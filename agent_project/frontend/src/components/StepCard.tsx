@@ -2,67 +2,90 @@ import { useState } from 'react'
 import type { StepState, ToolCall } from '../types'
 import { cleanToolSummary, getToolDisplay } from '../lib/toolLabels'
 
-function ToolRow({ tc }: { tc: ToolCall }) {
+/** Try to parse and format a JSON args preview into a cleaner label. */
+export function fmtArgsPreview(raw: string): string {
+  if (!raw) return ''
+  try {
+    const obj = JSON.parse(raw)
+    // Extract the most informative single field
+    const ticker = obj.ticker ? String(obj.ticker).toUpperCase() : ''
+    const mode = obj.assumption_review_mode ? 'review' : 'execute'
+    const overrides = obj.assumption_overrides ? `${Object.keys(obj.assumption_overrides).length} overrides` : ''
+    const horizon = obj.horizon_years ? `${obj.horizon_years}y` : ''
+    const parts = [ticker, mode, overrides, horizon].filter(Boolean)
+    return parts.length > 0 ? parts.join(' · ') : ''
+  } catch {
+    // Not JSON — truncate and clean quotes
+    const cleaned = raw.replace(/["\{\}]/g, '').trim()
+    return cleaned.length > 60 ? cleaned.slice(0, 60) + '…' : cleaned
+  }
+}
+
+function ToolRow({ tc, isLast }: { tc: ToolCall; isLast?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const cleanedSummary = cleanToolSummary(tc.summary, 240)
   const canExpand = tc.status !== 'running' && !!cleanedSummary
   const display = getToolDisplay(tc.tool_name)
-  const argsPreview = tc.args_preview || ''
+  const argsLabel = fmtArgsPreview(tc.args_preview || '')
+  const isDone = tc.status === 'done'
+  const isError = tc.status === 'error'
+  const isRunning = tc.status === 'running'
 
   return (
-    <div className="animate-slide-in">
-      <button
-        className="w-full flex items-center gap-2 py-[3px] text-left group"
-        onClick={() => canExpand && setExpanded(v => !v)}
-        disabled={!canExpand}
-      >
-        {/* Status dot */}
-        <span
-          className={`flex-shrink-0 w-1 h-1 rounded-full ${
-            tc.status === 'done'
-              ? 'bg-emerald-500'
-              : tc.status === 'error'
-              ? 'bg-red-500'
-              : 'bg-indigo-400 animate-pulse'
-          }`}
-        />
+    <div className="text-[11px]">
+      {/* Vertical connector line for tool call timeline */}
+      {!isLast && (
+        <div className={`ml-[9px] w-px h-2 ${isDone ? 'bg-emerald-600/20' : 'bg-border'}`} />
+      )}
+      <div className="flex items-center gap-2 py-0.5">
+        {/* Timeline node — circle matching step indicator style */}
+        <div className={`flex-shrink-0 w-[19px] h-[19px] rounded-full border flex items-center justify-center ${
+          isDone ? 'border-emerald-500/30 bg-emerald-500/10' :
+          isError ? 'border-red-500/30 bg-red-500/10' :
+          'border-indigo-400/20 bg-indigo-400/5'
+        }`}>
+          {isDone && (
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-emerald-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          )}
+          {isRunning && (
+            <div className="w-[6px] h-[6px] rounded-full bg-indigo-400 animate-pulse" />
+          )}
+          {isError && (
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+              <path d="M2 2L6 6M6 2L2 6" stroke="currentColor" className="text-red-400" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+          )}
+        </div>
 
-        {/* Tool name */}
-        <span
-          className={`text-[11px] font-medium leading-snug flex-shrink-0 ${
-            display.group === 'workflow' ? 'text-violet-300' : 'text-ink-muted'
-          }`}
-        >
-          {display.label}
-        </span>
-
-        {/* Args preview */}
-        {argsPreview && (
-          <span className="text-[11px] text-zinc-700 truncate min-w-0">
-            "{argsPreview}"
+        {/* Tool label + args */}
+        <div className="flex-1 min-w-0 flex items-center gap-1.5">
+          <span className={`font-medium ${isDone ? 'text-ink-muted' : isRunning ? 'text-indigo-300' : 'text-ink-muted'}`}>
+            {display.label}
           </span>
-        )}
+          {argsLabel && (
+            <span className="text-ink-dim truncate">{argsLabel}</span>
+          )}
+        </div>
 
         {/* Expand toggle */}
         {canExpand && (
-          <span className="ml-auto flex-shrink-0 text-zinc-700 opacity-0 group-hover:opacity-100 transition-opacity">
-            <svg
-              width="8"
-              height="8"
-              viewBox="0 0 8 8"
-              fill="none"
-              className={`transition-transform duration-150 ${expanded ? 'rotate-180' : ''}`}
-            >
+          <button
+            onClick={() => setExpanded(v => !v)}
+            className="flex-shrink-0 text-ink-dim hover:text-ink-muted"
+          >
+            <svg width="6" height="6" viewBox="0 0 8 8" fill="none" className={`transition-transform duration-150 ${expanded ? 'rotate-180' : ''}`}>
               <path d="M1 2.5L4 5.5L7 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
             </svg>
-          </span>
+          </button>
         )}
-      </button>
+      </div>
 
       {expanded && cleanedSummary && (
-        <p className="ml-6 mb-1 text-[11px] text-zinc-700 leading-relaxed border-l border-border-hover pl-2.5">
+        <div className="ml-7 mb-1 text-ink-dim leading-relaxed border-l border-border pl-2.5">
           {cleanedSummary}
-        </p>
+        </div>
       )}
     </div>
   )
@@ -83,71 +106,64 @@ export function StepCard({ step, index, isLast }: Props) {
   const description = step.description || 'Research step'
 
   return (
-    <div className="relative flex gap-3">
+    <div className="relative flex gap-3 group">
       {/* Vertical connector line */}
       {!isLast && (
-        <div className="absolute left-[6px] top-[14px] bottom-0 w-px bg-surface-3" />
+        <div className={`absolute left-[9px] top-5 bottom-0 w-px ${
+          isComplete ? 'bg-emerald-600/30' : 'bg-border'
+        }`} />
       )}
 
-      {/* Step indicator dot */}
-      <div className="flex-shrink-0 mt-[2px] z-10">
-        <div
-          className={`
-            w-3.5 h-3.5 rounded-full border flex items-center justify-center
-            transition-all duration-500
-            ${isRunning
-              ? 'border-indigo-500 bg-indigo-500/15 animate-pulse-ring'
-              : isComplete
-              ? 'border-emerald-600 bg-emerald-600'
-              : isFailed
-              ? 'border-red-600 bg-red-600/20'
-              : 'border-border-hover bg-transparent'
-            }
-          `}
-        >
+      {/* Timeline node */}
+      <div className="flex-shrink-0 mt-[3px] z-10">
+        <div className={`w-[19px] h-[19px] rounded-full border flex items-center justify-center transition-all duration-300 ${
+          isRunning ? 'border-indigo-400/50 bg-indigo-400/10' :
+          isComplete ? 'border-emerald-500/40 bg-emerald-500/10' :
+          isFailed ? 'border-red-500/40 bg-red-500/10' :
+          'border-border bg-transparent'
+        }`}>
           {isComplete && (
-            <svg width="6" height="6" viewBox="0 0 6 6" fill="none">
-              <path d="M1 3L2.5 4.5L5 1.5" stroke="white" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-emerald-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
           )}
+          {isRunning && (
+            <div className="w-[6px] h-[6px] rounded-full bg-indigo-400 animate-pulse" />
+          )}
           {isFailed && (
-            <svg width="6" height="6" viewBox="0 0 6 6" fill="none">
-              <path d="M1.5 1.5L4.5 4.5M4.5 1.5L1.5 4.5" stroke="var(--color-danger)" strokeWidth="1.2" strokeLinecap="round" />
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+              <path d="M2 2L6 6M6 2L2 6" stroke="currentColor" className="text-red-400" strokeWidth="1.2" strokeLinecap="round"/>
             </svg>
           )}
         </div>
       </div>
 
-      {/* Step body */}
-      <div
-        className={`
-          flex-1 min-w-0 pb-5 transition-all duration-300
-          ${isRunning ? 'animate-fade-up' : ''}
-        `}
-      >
-        {/* Step number + description */}
-        <div className="flex items-start gap-1.5">
-          <span
-            className={`text-[11px] flex-shrink-0 font-medium tabular-nums mt-0.5
-              ${isRunning ? 'text-indigo-400' : isComplete ? 'text-zinc-700' : 'text-[#333]'}
-            `}
-          >
-            {String(index + 1).padStart(2, '0')}
-          </span>
-          <p
-            className={`text-xs leading-relaxed transition-colors duration-300
-              ${isRunning ? 'text-ink' : isComplete ? 'text-ink-dim' : 'text-[#3a3a3a]'}
-            `}
-          >
+      {/* Content */}
+      <div className="flex-1 min-w-0 pb-3 transition-opacity duration-300">
+        {/* Step description */}
+        <div className="flex items-center gap-2">
+          <span className={`text-[11px] font-medium leading-snug ${
+            isRunning ? 'text-indigo-300' :
+            isComplete ? 'text-ink-muted' :
+            isFailed ? 'text-red-300' :
+            'text-ink-dim'
+          }`}>
             {description}
-          </p>
+          </span>
+          {/* Count badge — shown during running and after completion */}
+          {toolCalls.length > 0 && (
+            <span className="text-[10px] text-ink-dim">
+              {toolCalls.filter(t => t.status === 'done').length}/{toolCalls.length} done
+              {toolCalls.filter(t => t.status === 'running').length > 0 && ` · ${toolCalls.filter(t => t.status === 'running').length} running`}
+            </span>
+          )}
         </div>
 
-        {/* Tool calls (shown when running or complete) */}
+        {/* Tool calls */}
         {(isRunning || isComplete) && toolCalls.length > 0 && (
-          <div className="mt-2 ml-5 space-y-0">
+          <div className="mt-1 space-y-0">
             {toolCalls.map((tc, i) => (
-              <ToolRow key={i} tc={tc} />
+              <ToolRow key={i} tc={tc} isLast={i === toolCalls.length - 1} />
             ))}
           </div>
         )}

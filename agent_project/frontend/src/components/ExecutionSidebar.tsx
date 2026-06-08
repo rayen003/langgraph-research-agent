@@ -1,7 +1,7 @@
 import type { RunStatus, StepState, DcfReviewState, DeckReviewState } from '../types'
 import type { ActivityEntry } from '../lib/activity'
 import { StepCard } from './StepCard'
-import { DcfHitlSection, DcfStepDetail } from './ActivityTrace'
+import { DcfHitlSection, DcfStepDetail, dcfStepName, hasDcfStepDetail } from './ActivityTrace'
 import { BlockStack } from './activity/BlockStack'
 import { DeckOutlineReview } from './DeckOutlineReview'
 import { PanelHideButton } from './PanelHideButton'
@@ -122,13 +122,14 @@ export function ExecutionSidebar({
         )}
 
         {/* Workflow substeps → stacked blocks (right bar). Active block stays
-            expanded; completed collapse to a one-line summary. */}
+            expanded; completed collapse to header-only. The run_dcf_workflow
+            tool wrapper is dropped — workflow:dcf (+ substeps) is the root. */}
         {isChatMode && (
           <BlockStack
-            entries={activity!}
+            entries={activity!.filter(a => a.name !== 'run_dcf_workflow' && a.name !== 'run_deck_workflow')}
             renderBody={(e) =>
-              e.meta && Object.keys(e.meta).length > 0
-                ? <DcfStepDetail stepName={e.name} meta={e.meta} />
+              hasDcfStepDetail(e.name, e.meta)
+                ? <DcfStepDetail stepName={dcfStepName(e.name)} meta={e.meta!} />
                 : null
             }
           />

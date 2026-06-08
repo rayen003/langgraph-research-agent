@@ -20,8 +20,9 @@ from langchain_core.tools import tool
 from simpleeval import simple_eval
 
 from documents import search_documents, _session_ctx
-from graphs.workflows.dcf import run_dcf_workflow_sync, summarize_dcf_payload
+from graphs.workflows.dcf import dcf_workflow_app, run_dcf_workflow_sync, summarize_dcf_payload
 from graphs.workflows.dcf.hitl_snapshot import build_hitl_snapshot
+from lg_compat import Command
 from utils import (
     get_artifacts_dir,
     get_run_dir,
@@ -29,6 +30,7 @@ from utils import (
     emit_ui_event,
     set_dcf_hitl_payload,
     set_deck_hitl_payload,
+    set_thread_id,
 )
 from web_search import search_exa
 
@@ -69,6 +71,54 @@ def get_stock_data(ticker: str, period: str = "5y"):
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+
+def _persist_dcf_payload(payload: dict, args: dict[str, Any]) -> str:
+    """Persist a completed DCF payload using the canonical tool pointer shape."""
+    summary = summarize_dcf_payload(payload)
+    pointer = json.loads(
+        persist_tool_result(
+            "run_dcf_workflow",
+            args,
+            json.dumps(payload, ensure_ascii=False),
+            summary,
+        )
+    )
+    pointer["dcf_report_verbatim"] = True
+    return json.dumps(pointer, ensure_ascii=False)
+
+
+def resume_dcf_workflow_after_hitl(
+    *,
+    resume_payload: dict[str, Any],
+    thread_id: str | None = None,
+    args: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    """Resume the interrupted DCF graph with LangGraph Command(resume=...).
+
+    This is the native post-HITL path. It preserves the interrupted graph state
+    instead of starting a second compiled graph and trying to reconstruct state
+    from frontend overrides.
+    """
+    if thread_id:
+        set_thread_id(thread_id)
+    config = {
+        "configurable": {"thread_id": thread_id or get_run_dir().name},
+        "recursion_limit": 50,
+    }
+    result = dcf_workflow_app.invoke(Command(resume=resume_payload), config=config)
+    result_path = result.get("result_path") if isinstance(result, dict) else None
+    if not result_path:
+        raise RuntimeError("DCF resume finished without a result path.")
+
+    out_path = Path(str(result_path))
+    if not out_path.exists():
+        raise FileNotFoundError(f"DCF workflow result not found: {result_path}")
+
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    pointer = _persist_dcf_payload(payload, args or {"resume_payload": resume_payload})
+    report = summarize_dcf_payload(payload)
+    return payload, pointer, report
 
 
 @tool
@@ -281,28 +331,18 @@ def run_dcf_workflow(
             lines.append(f"| {field} | {val:.2%} | {source} | {conf:.0%} |")
         lines.append("")
         lines.append("Ask the user to approve, edit values, or reject.")
-        lines.append(
-            "After they respond, call again with assumption_overrides "
-            "and assumption_review_mode=False."
-        )
+        lines.append("After they respond, the server resumes this interrupted DCF graph natively.")
         return "\n".join(lines)
 
-    summary = summarize_dcf_payload(payload)
-    pointer = json.loads(
-        persist_tool_result(
-            "run_dcf_workflow",
-            {
-                "ticker": ticker,
-                "horizon_years": horizon_years,
-                "allow_external_assumptions": allow_external_assumptions,
-                "assumption_overrides": assumption_overrides or {},
-            },
-            json.dumps(payload, ensure_ascii=False),
-            summary,
-        )
+    return _persist_dcf_payload(
+        payload,
+        {
+            "ticker": ticker,
+            "horizon_years": horizon_years,
+            "allow_external_assumptions": allow_external_assumptions,
+            "assumption_overrides": assumption_overrides or {},
+        },
     )
-    pointer["dcf_report_verbatim"] = True
-    return json.dumps(pointer, ensure_ascii=False)
 
 
 @tool
@@ -520,12 +560,21 @@ def query_knowledge_graph(question: str, ticker: str = "") -> str:
         summary=answer[:200],
     )
     pid = json.loads(pointer_json).get("tool_result_id")
-    return json.dumps({
+    # B2: pass the planner's staleness verdict up to the chat agent. When
+    # needs_external is True the KG answer is the best available from cached
+    # (possibly stale) data — the agent MUST supplement with search_web rather
+    # than presenting it as current. external_reason names the gap.
+    payload = {
         "answer": answer,
         "tool_result_id": pid,
         "hops": len(result.get("hops", [])),
         "nodes_traversed": len(result.get("traversal_path", [])),
-    }, ensure_ascii=False)
+        "needs_external": bool(result.get("needs_external", False)),
+    }
+    external_reason = str(result.get("external_reason", "") or "").strip()
+    if external_reason:
+        payload["external_reason"] = external_reason
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------

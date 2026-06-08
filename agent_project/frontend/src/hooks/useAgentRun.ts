@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from 'react'
 import type { AgentRunState, ChatMessage, DcfReviewState, Mode, StepState, ToolCall } from '../types'
+import type { UserSettings } from '../lib/userSettings'
 import {
   activityStatusToToolStatus,
   isActivityEvent,
@@ -181,8 +182,19 @@ export function useAgentRun() {
             },
           }
 
-        case 'assumptions_submitted':
-          return { ...prev, status: 'chat_responding', dcf_review: null }
+        case 'assumptions_submitted': {
+          // Discard pre-HITL narration streamed before approval (the DCF
+          // workflow emits "### Bear/Base/Bull scenario…" chat_tokens into the
+          // streaming bubble while proposing assumptions). The post-approval
+          // report streams fresh into the same message, so wipe the junk now —
+          // otherwise it stays prepended above the report (m.content = junk +
+          // report is longer than the chat_complete payload, so the length
+          // check in chat_complete keeps it).
+          const msgs = prev.chat_messages.map(m =>
+            m.streaming && m.role === 'assistant' ? { ...m, content: '' } : m
+          )
+          return { ...prev, status: 'chat_responding', dcf_review: null, chat_messages: msgs }
+        }
 
         case 'assumptions_rejected':
           return { ...prev, status: 'rejected' }
@@ -282,8 +294,17 @@ export function useAgentRun() {
           const citationMap = (data.citation_map as Record<string, string>) ?? {}
           const msgs = prev.chat_messages.map(m => {
             if (!m.streaming) return m
-            // Use event content if it was never streamed token-by-token (tool-using runs)
-            return { ...m, streaming: false, content: m.content || content }
+            // Prefer the event content when it's the substantive final answer.
+            // A tool-using DCF run streams a short pre-tool preamble (a few
+            // chat_tokens) THEN delivers the full report via chat_complete; the
+            // old `m.content || content` kept the stray preamble and DROPPED the
+            // report. Use whichever is longer — the report always wins over a
+            // partial preamble, while a fully-streamed chat answer (event
+            // content empty/equal) keeps its streamed text.
+            const finalText = content && content.length > (m.content?.length ?? 0)
+              ? content
+              : (m.content || content)
+            return { ...m, streaming: false, content: finalText }
           })
           // If no streaming assistant message exists yet, add one now
           const hasAssistant = msgs.some(m => m.role === 'assistant')
@@ -333,7 +354,13 @@ export function useAgentRun() {
   }, [])
 
   const startRun = useCallback(
-    async (query: string, mode: Mode, chatThreadId?: string, sessionId?: string): Promise<string | null> => {
+    async (
+      query: string,
+      mode: Mode,
+      chatThreadId?: string,
+      sessionId?: string,
+      userSettings?: UserSettings,
+    ): Promise<string | null> => {
       esRef.current?.close()
 
       const userMsg: ChatMessage = { id: nextId(), role: 'user', content: query }
@@ -364,7 +391,13 @@ export function useAgentRun() {
       const res = await fetch('/runs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, mode, thread_id: threadIdToUse, session_id: sessionId }),
+        body: JSON.stringify({
+          query,
+          mode,
+          thread_id: threadIdToUse,
+          session_id: sessionId,
+          user_settings: userSettings,
+        }),
       })
       if (!res.ok) {
         const err = await res.text()

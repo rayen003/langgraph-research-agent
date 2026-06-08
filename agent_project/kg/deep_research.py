@@ -35,6 +35,7 @@ from .cache import KGNode, get_cache
 from .query import (
     _KG_SCHEMA,
     _build_traversal,
+    _fmt_temporal,
     _fmt_value,
     _get_query_llm,
     _normalize_ticker,
@@ -69,6 +70,27 @@ class HopDecision(BaseModel):
             "AVAILABLE RELATIONS list provided. Empty if nothing useful to expand."
         ),
     )
+    needs_external: bool = Field(
+        default=False,
+        description=(
+            "True when the KG cannot fully answer because its data is STALE or "
+            "MISSING for what the question needs — e.g. the question asks for "
+            "'latest / current / today' info but the relevant nodes report an old "
+            "`as_of` period (or are absent). Set this whenever the freshest "
+            "relevant node is too old to answer a current-events question. Still "
+            "provide the best answer you can from the (stale) subgraph — the "
+            "caller will supplement it with a live web search."
+        ),
+    )
+    external_reason: str = Field(
+        default="",
+        description=(
+            "When needs_external=True: one line naming what is missing and what "
+            "the KG has instead, e.g. 'KG has only FY2023 financials; current-year "
+            "figures need a web search' or 'no news newer than 40d; today's "
+            "headlines need web'."
+        ),
+    )
     reason: str = Field(default="", description="One short line: why answer / why expand.")
 
 
@@ -91,11 +113,12 @@ def _adjacency(cache) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
 
 def _serialize(nodes: list[KGNode], fwd: dict[str, list[dict]]) -> str:
     """Render visited nodes + the edges among them, using storage adjacency."""
-    lines = ["NODES (id | type | field | value | source conf):"]
+    lines = ["NODES (id | type | field | value | recency | source conf):"]
     for n in nodes:
         lines.append(
             f"  {n.get('id')} | {n.get('node_type')} | {n.get('field')} | "
-            f"{_fmt_value(n.get('value'))} | {n.get('source')} {n.get('confidence')}"
+            f"{_fmt_value(n.get('value'))} | {_fmt_temporal(n)} | "
+            f"{n.get('source')} {n.get('confidence')}"
         )
     ids = {n.get("id") for n in nodes}
     edge_lines = [
@@ -190,8 +213,10 @@ def _decide(question: str, tickers: list[str], visited: dict[str, KGNode],
     serialized = _serialize(list(visited.values()), fwd)
     rel_list = ", ".join(f"{r} ({c})" for r, c in sorted(available.items(), key=lambda x: -x[1]))
     prompt = (
-        "You answer analyst questions by REASONING over a knowledge-graph subgraph, "
-        "expanding it hop-by-hop until you have enough to answer.\n\n"
+        "The Knowledge Graph is a MEANS to answer the analyst question, not the goal. "
+        "Your job is to answer the QUESTION; the subgraph is the evidence you have on "
+        "hand. Reason over it, expanding hop-by-hop, but stay honest about whether it "
+        "actually holds what the question needs.\n\n"
         f"{_KG_SCHEMA}\n\n"
         f"Question: {question}\n"
         f"Tickers in scope: {', '.join(tickers) or '(any)'}\n"
@@ -200,13 +225,19 @@ def _decide(question: str, tickers: list[str], visited: dict[str, KGNode],
         f"{serialized}\n\n"
         f"AVAILABLE RELATIONS to expand next (relation (edge_count)): "
         f"{rel_list or '(none — nothing left to expand)'}\n\n"
-        "Decide:\n"
-        "- If the current subgraph already answers the question → sufficient=true, "
-        "give the answer, and list node_ids = EVERY node you used.\n"
-        "- If you need more (e.g. the question needs run_assumptions, drivers, prior "
-        "runs, or another ticker not yet pulled in) → sufficient=false and set "
-        "expand_relations to relations from the AVAILABLE list above that lead toward "
-        "the missing evidence. Choose ONLY from that list.\n"
+        "Decide (read the `recency` column — as_of period + ingest age — before judging):\n"
+        "- If the subgraph answers the question with data that is FRESH ENOUGH → "
+        "sufficient=true, give the answer, list node_ids = EVERY node you used.\n"
+        "- If more KG evidence would help (run_assumptions, drivers, prior runs, "
+        "another ticker not yet pulled in) → sufficient=false and set expand_relations "
+        "from the AVAILABLE list ONLY.\n"
+        "- TEMPORAL HONESTY: if the question asks for 'latest / current / today / "
+        "this year' info but the relevant nodes report an OLD `as_of` period (or no "
+        "such node exists), the KG is STALE for this question. Set needs_external=true "
+        "and external_reason (what's missing + what the KG has instead). Still give the "
+        "best answer from the stale nodes, clearly dated (e.g. 'As of FY2023 …') — do "
+        "NOT present stale data as current, and do NOT claim 'no recent news' just "
+        "because the KG lacks it (that means the KG is stale, not that none exists).\n"
         "- Never invent facts or node ids. Ground every claim in the subgraph."
     )
     structured = _get_query_llm().with_structured_output(HopDecision)
@@ -241,6 +272,9 @@ def run_deep_research(
             "query": {"question": question, "ticker": norm, "mode": "deep_research"},
             "answer": f"No KG data found for {norm or 'that query'}.",
             "matched_nodes": [], "traversal_path": [], "traversal_edges": [], "hops": [],
+            # Empty graph → the KG can't answer anything; caller must go external.
+            "needs_external": True,
+            "external_reason": f"No KG data for {norm or 'that query'} — use a web search.",
         }
 
     hops_log: list[dict[str, Any]] = []
@@ -272,9 +306,15 @@ def run_deep_research(
     matched = cited or list(visited.values())[:12]
     traversal_path, traversal_edges = _build_traversal(matched, cache, rev)
 
+    # B2: the planner flags when KG data is too stale/missing to answer alone, so
+    # the chat agent knows to supplement with a live web search instead of
+    # trusting a stale-but-confident KG answer.
+    needs_external = bool(decision.needs_external) if decision else False
+    external_reason = (decision.external_reason if decision else "").strip()
+
     logger.info(
-        "KG DEEP RESEARCH tickers=%s hops=%d visited=%d cited=%d",
-        tickers, len(hops_log), len(visited), len(cited),
+        "KG DEEP RESEARCH tickers=%s hops=%d visited=%d cited=%d needs_external=%s",
+        tickers, len(hops_log), len(visited), len(cited), needs_external,
     )
     return {
         "query": {"question": question, "ticker": norm, "mode": "deep_research"},
@@ -283,6 +323,8 @@ def run_deep_research(
         "traversal_path": traversal_path,
         "traversal_edges": traversal_edges,
         "hops": hops_log,
+        "needs_external": needs_external,
+        "external_reason": external_reason,
     }
 
 

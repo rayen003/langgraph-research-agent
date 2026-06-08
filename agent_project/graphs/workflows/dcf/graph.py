@@ -59,7 +59,7 @@ from .refinement import analyze_result_node, refine_assumptions_node, route_afte
 from .review import review_assumptions_node, route_after_assumptions
 from .review_loop import route_after_review, route_after_review_val, run_review_subgraph
 from .scenarios import scenario_generator_node
-from .state import DCFState
+from .state import DCFState, _TIER_A_FIELDS, filter_user_assumption_overrides
 from .synthesis import semantic_synthesis_node
 from .valuation import (
     collect_market_data_node,
@@ -173,10 +173,35 @@ def _build_memo_proposals(state_or_payload: dict) -> dict:
     return result
 
 
-_ALL_ASSUMPTION_FIELDS = frozenset({
-    "base_revenue", "revenue_growth", "fcff_margin", "wacc",
-    "terminal_growth", "net_debt", "shares_outstanding", "tax_rate",
+_REQUIRED_APPROVAL_FIELDS = frozenset({
+    "revenue_growth",
+    "fcff_margin",
+    "terminal_growth",
+    "tax_rate",
+    "wacc",
 })
+
+
+def _canonical_assumptions_from_snapshot(hitl: dict[str, Any] | None) -> dict[str, float]:
+    """Extract locked Tier A facts from HITL snapshot assumptions/fundamentals."""
+    if not hitl:
+        return {}
+
+    out: dict[str, float] = {}
+    snapshot_assumptions = hitl.get("assumptions") or {}
+    for field in _TIER_A_FIELDS:
+        value = snapshot_assumptions.get(field)
+        if isinstance(value, (int, float)):
+            out[field] = float(value)
+
+    fundamentals = hitl.get("fundamentals") or {}
+    for field in _TIER_A_FIELDS:
+        if field in out:
+            continue
+        meta = fundamentals.get(field)
+        if isinstance(meta, dict) and isinstance(meta.get("value"), (int, float)):
+            out[field] = float(meta["value"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -326,26 +351,22 @@ def run_dcf_workflow_sync(
     When ``assumption_review_mode=False``, auto-approves and runs to
     completion, returning the full dcf_output.json payload.
     """
-    overrides = assumption_overrides or {}
-    # Fast path only when a prior HITL snapshot exists — ensures thesis and
-    # company_state are always available (synthesis ran in the full workflow).
-    # Without a snapshot, run the full workflow so evidence/synthesis execute.
+    raw_overrides = assumption_overrides or {}
+    overrides = filter_user_assumption_overrides(raw_overrides)
+    # Fast path only when a prior HITL snapshot exists — ensures thesis,
+    # company_state, and canonical Tier A facts remain from the reviewed run.
+    # Without a snapshot, run the full workflow so evidence/fundamentals execute.
     _has_hitl_snapshot = bool(get_dcf_hitl_payload())
-    # Fast path: all explicit assumption fields supplied + no review needed.
-    # A prior HITL snapshot is preferred (enriches provenance/memo) but NOT
-    # required — if missing we just use simple user-provided provenance.
-    # This ensures KG-triggered reruns (no snapshot in thread context) still
-    # use the lightweight valuation graph instead of the full evidence+memo
-    # workflow, which would exceed LangGraph's 25-step recursion limit.
     use_fast_path = (
         not assumption_review_mode
-        and _ALL_ASSUMPTION_FIELDS.issubset(overrides.keys())
+        and _has_hitl_snapshot
+        and _REQUIRED_APPROVAL_FIELDS.issubset(overrides.keys())
     )
     logger.info(
         "run_dcf_workflow_sync: ticker=%s review_mode=%s fast_path=%s "
         "has_snapshot=%s override_keys=%s",
         ticker, assumption_review_mode, use_fast_path,
-        _has_hitl_snapshot, sorted(overrides.keys()),
+        _has_hitl_snapshot, sorted(raw_overrides.keys()),
     )
     initial_state = _build_initial_state(
         ticker=ticker,
@@ -366,10 +387,12 @@ def run_dcf_workflow_sync(
 
     try:
         if use_fast_path:
-            initial_state["assumptions"] = {k: float(v) for k, v in overrides.items()}
+            initial_state["assumptions"] = {}
             initial_state["assumptions_approved"] = True
             hitl = get_dcf_hitl_payload()
             if hitl:
+                initial_state["assumptions"].update(_canonical_assumptions_from_snapshot(hitl))
+                initial_state["assumptions"].update(overrides)
                 original_assumptions = hitl.get("assumptions") or {}
                 provenance = merge_hitl_provenance(
                     hitl.get("assumption_provenance") or {},
@@ -384,20 +407,57 @@ def run_dcf_workflow_sync(
                     )
                     if reconstructed:
                         initial_state["assumption_memo"] = reconstructed
-            else:
-                initial_state["assumption_provenance"] = {
-                    k: {
-                        "source": "user_provided",
-                        "evidence": "User-provided assumption value.",
-                        "confidence": 1.0,
-                    }
-                    for k in overrides
-                }
+            # Ensure net_debt is present — it's a market data field, not a user
+            # assumption, so it won't be in the overrides. Try KG cache first,
+            # then fall back to the fundamentals snapshot if available.
+            if "net_debt" not in initial_state["assumptions"]:
+                from kg import get_cache  # noqa: PLC0415
+                cache = get_cache()
+                # Try KG-lookup via cache
+                cached = cache.get(
+                    ticker=ticker,
+                    node_type="market_metric_fund",
+                    field="net_debt",
+                )
+                net_debt_val = 0.0
+                if cached and isinstance(cached, dict):
+                    v = cached.get("value")
+                    if isinstance(v, (int, float)):
+                        net_debt_val = float(v)
+                if net_debt_val == 0.0:
+                    # Fallback: try fundamentals snapshot
+                    fundamentals = initial_state.get("fundamentals") or {}
+                    meta = fundamentals.get("net_debt") if isinstance(fundamentals, dict) else None
+                    if isinstance(meta, dict) and isinstance(meta.get("value"), (int, float)):
+                        net_debt_val = float(meta["value"])
+                initial_state["assumptions"]["net_debt"] = net_debt_val
             logger.info(
                 "DCF fast path ticker=%s assumptions=%s",
                 ticker, json.dumps(initial_state["assumptions"], ensure_ascii=False),
             )
-            result = dcf_valuation_app.invoke(initial_state, config=config)
+            # Emit parent workflow terminal BEFORE invoking the valuation
+            # subgraph so BlockStack can link substeps to their parent.
+            # Without this, substeps arrive before the parent and become
+            # orphan roots in the sidebar.
+            parent_step_id = initial_state.get("parent_step_id", "workflow_dcf")
+            from .activity import emit_step, emit_workflow_terminal  # noqa: PLC0415
+            emit_workflow_terminal(
+                parent_step_id=parent_step_id,
+                status="running",
+                payload={"ticker": ticker, "summary_line": f"Running valuation for {ticker}"},
+            )
+            emit_step("valuation_pass", "start", parent_step_id,
+                      {"ticker": ticker, "summary_line": f"Running valuation for {ticker}"})
+            try:
+                result = dcf_valuation_app.invoke(initial_state, config=config)
+            finally:
+                emit_step("valuation_pass", "complete", parent_step_id,
+                          {"ticker": ticker, "summary_line": f"Valuation complete for {ticker}"})
+                emit_workflow_terminal(
+                    parent_step_id=parent_step_id,
+                    status="completed",
+                    payload={"ticker": ticker, "summary_line": f"Valuation complete for {ticker}"},
+                )
         else:
             result = dcf_workflow_app.invoke(initial_state, config=config)
     except GraphInterrupt as gi:

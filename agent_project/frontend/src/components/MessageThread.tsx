@@ -778,35 +778,52 @@ function ArtifactImages({ artifactPaths, threadId }: { artifactPaths: string[]; 
 
 /** Status card shown during research planning/executing (before synthesis). */
 function ResearchStatusCard({ run }: { run: AgentRunState }) {
-  const { status, steps, completed_steps } = run
+  const { status, steps } = run
   const total = steps.length
+  const completed = steps.filter(s => s.status === 'completed').length
   const running = steps.find(s => s.status === 'running')
+  const isExecuting = status === 'executing' || status === 'workflow_running'
 
   let label = ''
-  if (status === 'classifying') label = 'Classifying intent…'
-  else if (status === 'planning') label = 'Building research plan…'
-  else if (status === 'awaiting_approval') label = 'Plan ready — review in the sidebar'
-  else if (status === 'workflow_running') label = 'Running deterministic workflow…'
-  else if (status === 'awaiting_assumptions') label = 'Assumptions ready — review in the sidebar'
-  else if (status === 'awaiting_outline_review') label = 'Deck outline ready — review in the sidebar'
+  let sublabel = ''
+  if (status === 'classifying') { label = 'Classifying intent'; sublabel = 'Determining research approach' }
+  else if (status === 'planning') { label = 'Building research plan'; sublabel = 'Creating step-by-step strategy' }
+  else if (status === 'awaiting_approval') { label = 'Plan ready'; sublabel = 'Review in the sidebar' }
+  else if (status === 'workflow_running') { label = 'Running DCF workflow'; sublabel = `${completed}/${total} steps complete` }
+  else if (status === 'awaiting_assumptions') { label = 'Assumptions ready'; sublabel = 'Review in the sidebar' }
+  else if (status === 'awaiting_outline_review') { label = 'Deck outline ready'; sublabel = 'Review in the sidebar' }
   else if (status === 'executing') {
     label = running
-      ? `Step ${completed_steps + 1}/${total} — ${running.description.length > 55 ? running.description.slice(0, 55) + '…' : running.description}`
-      : `Executing step ${completed_steps + 1}/${total}…`
+      ? (running.description.length > 55 ? running.description.slice(0, 55) + '…' : running.description)
+      : `Executing step ${completed + 1}/${total}`
+    sublabel = `${completed}/${total} steps complete`
   }
 
   return (
     <div className="flex justify-start animate-fade-up">
       <div className="max-w-[85%]">
         <AgentLabel />
-        <div className="pl-1 flex items-center gap-2.5 py-2">
-          <div
-            className={`
-              w-1.5 h-1.5 rounded-full flex-shrink-0
-              ${status === 'awaiting_approval' ? 'bg-amber-500' : 'bg-indigo-500 animate-pulse'}
-            `}
-          />
-          <span className="text-sm text-ink-dim">{label}</span>
+        <div className="flex items-start gap-2.5 py-2">
+          {/* Manus-style 19px bordered circle with checkmark or spinner */}
+          <div className={`w-[19px] h-[19px] rounded-full border flex items-center justify-center flex-shrink-0 mt-0.5 ${
+            isExecuting
+              ? 'border-indigo-500/40 bg-indigo-500/10'
+              : 'border-amber-500/40 bg-amber-500/10'
+          }`}>
+            {isExecuting ? (
+              <svg className="animate-spin" width="10" height="10" viewBox="0 0 12 12" fill="none">
+                <path d="M6 1a5 5 0 0 1 5 5" stroke="#818cf8" strokeWidth="1.5" strokeLinecap="round"/>
+              </svg>
+            ) : (
+              <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+                <path d="M2.5 6L5 8.5L9.5 3.5" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            )}
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <span className="text-[13px] font-medium text-ink-primary leading-snug">{label}</span>
+            <span className="text-[11px] text-ink-muted leading-tight">{sublabel}</span>
+          </div>
         </div>
       </div>
     </div>

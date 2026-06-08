@@ -3,6 +3,7 @@ import type { ConfidenceBreakdown, DcfReviewState, EvidenceItem, StepState, Tool
 import type { ActivityEntry, ActivityScope } from '../lib/activity'
 import { activityStatusToToolStatus } from '../lib/activity'
 import { cleanToolSummary, getToolDisplay, summarizeToolActions } from '../lib/toolLabels'
+import { StepCard, fmtArgsPreview } from './StepCard'
 
 // Re-export for backward compat
 export { activityStatusToToolStatus }
@@ -63,7 +64,12 @@ type RowItem = FlatRow | WorkflowGroup
 
 function groupActivities(entries: ActivityEntry[], scope?: ActivityScope): RowItem[] {
   const safe = Array.isArray(entries) ? entries : []
-  const filtered = scope ? safe.filter(e => !scope || e.scope === scope || e.scope === 'workflow') : safe
+  // Inline chat (scope='chat') shows ONLY the agent's own tool calls — workflow
+  // substeps live in the right-bar BlockStack, so don't duplicate them here.
+  // Research/other scopes still fold in workflow steps (no separate panel).
+  const filtered = scope
+    ? safe.filter(e => e.scope === scope || (scope !== 'chat' && e.scope === 'workflow'))
+    : safe
 
   // Pass 1 — build childrenByParent for ALL parent_activity_ids (two levels)
   const childrenByParent = new Map<string, ActivityEntry[]>()
@@ -1148,6 +1154,30 @@ function AssumptionJourneyDetail({ meta }: { meta: Record<string, unknown> }) {
   )
 }
 
+/** Strip the `workflow:dcf:` prefix → the bare step name the switch matches. */
+export function dcfStepName(name: string): string {
+  return name.includes(':') ? name.split(':').pop()! : name
+}
+
+/** Step names that have a dedicated detail renderer (so the block knows whether
+ *  to show an expand affordance). */
+export const DCF_STEP_DETAIL_NAMES = new Set<string>([
+  'assemble_evidence', 'semantic_synthesis', 'propose_assumptions',
+  'assumption_review', 'project_cashflows', 'compute_valuation',
+  'compute_implied_wacc', 'sensitivity', 'collect_market_data', 'finalize',
+  'formulate_thesis', 'analyze_result', 'refine_assumptions', 'scenario_runner',
+  'scenario_generator', 'compute_market_signals', 'review_subgraph',
+  'review_deep_dive', 'synthesize_adjustments', 'assumption_journey',
+  'cache_check', 'kg_backwrite', 'detect_divergences', 'analysis',
+  'convergence_gate',
+])
+
+export function hasDcfStepDetail(name: string, meta?: Record<string, unknown>): boolean {
+  if (!DCF_STEP_DETAIL_NAMES.has(dcfStepName(name))) return false
+  // Detail renderers need real payload (meta carries >1 key beyond a base id).
+  return !!meta && Object.keys(meta).length > 1
+}
+
 export function DcfStepDetail({ stepName, meta }: { stepName: string; meta: Record<string, unknown> }) {
   switch (stepName) {
     case 'assemble_evidence': return <EvidenceDetail meta={meta} />
@@ -1477,100 +1507,138 @@ function ConvergenceGateDetail({ meta }: { meta: Record<string, unknown> }) {
 
 // ── DcfSubstepRow ─────────────────────────────────────────────────────────────
 
+/** Format seconds into a compact duration string. */
+function fmtDuration(ms: number): string {
+  const s = ms / 1000
+  if (s < 1) return '<1s'
+  if (s < 60) return `${Math.round(s)}s`
+  const m = Math.floor(s / 60)
+  const rs = Math.round(s % 60)
+  return `${m}m ${rs}s`
+}
+
 function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: boolean }) {
   const [open, setOpen] = useState(false)
   const settling = useSettleOn(entry.status, 'completed')
   const display = getToolDisplay(entry.name)
   const stepName = entry.name.includes(':') ? entry.name.split(':').pop()! : entry.name
   const meta = entry.meta
-  // A row is expandable if it has detail data OR it has sub-children
   const subChildren = entry.subChildren ?? []
   const hasDetail = (entry.status === 'completed' && meta && Object.keys(meta).length > 1) || subChildren.length > 0
   const cleaned = cleanToolSummary(entry.summary)
-  // Iteration badge: shown when scenario_runner ran more than once
   const runCount = (meta as Record<string, unknown> | undefined)?.run_count as number | undefined
   const isReRerun = runCount != null && runCount > 1
-  // Fallback-thesis warning badge
   const thesisFallback = (meta as Record<string, unknown> | undefined)?.thesis_quality === 'fallback'
-  // KG cache hit indicator — node skipped because output was cached
   const kgHit = (meta as Record<string, unknown> | undefined)?.kg_status === 'hit'
     || (meta as Record<string, unknown> | undefined)?.thesis_quality === 'cached'
 
-  //── Dot animation: flash-dot on completion (unless last step in group) ──
-  const showFlashDot = entry.status === 'completed' && settling && !isLastStep
+  // Compute duration if timing data is available
+  const timing = meta as Record<string, unknown> | undefined
+  const elapsed = (typeof timing?.elapsed === 'number') ? fmtDuration(timing!.elapsed) : ''
+  const startedAt = typeof timing?.started_at === 'string' ? timing!.started_at : ''
+  const timeDisplay = elapsed || startedAt
+
+  // Timeline connector line color
+  const isCompleted = entry.status === 'completed'
+  const isRunning = entry.status === 'running'
+  const lineColor = isCompleted ? 'bg-emerald-600/40' : isRunning ? 'bg-indigo-400/30' : 'bg-border'
 
   return (
-    <div className="text-[11px] animate-step-reveal animate-row-flash rounded-sm px-0.5 -mx-0.5">
-      <button
-        onClick={() => hasDetail && setOpen(o => !o)}
-        disabled={!hasDetail}
-        className="w-full flex items-center gap-2 text-left text-ink-dim hover:text-ink-muted disabled:hover:text-ink-dim transition-colors"
-      >
-        <span className={`w-1 h-1 rounded-full flex-shrink-0 ${
-          kgHit ? 'bg-teal-400' :
-          thesisFallback ? 'bg-amber-400' :
-          entry.status === 'completed' ? `bg-emerald-500 ${showFlashDot ? 'animate-flash-dot' : ''}` :
-          entry.status === 'error' ? 'bg-red-500' :
-          entry.status === 'skipped' ? 'bg-zinc-700' :
-          'bg-indigo-400 animate-pulse'
-        }`} />
-        <span className={`font-medium ${
-          kgHit ? 'text-teal-300' :
-          thesisFallback ? 'text-amber-400' : 'text-ink-muted'
-        }`}>{display.label}</span>
-        {/* KG cache-hit indicator */}
-        {kgHit && (
-          <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-teal-500/10 text-teal-400 border border-teal-500/20">
-            ⚡ KG
-          </span>
-        )}
-        {/* Fallback thesis warning badge */}
-        {thesisFallback && (
-          <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-amber-500/10 text-amber-400 border border-amber-500/20">
-            ⚠ fallback
-          </span>
-        )}
-        {/* Re-run badge: ×2 when scenario_runner looped after review */}
-        {isReRerun && (
-          <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-indigo-950/60 text-indigo-400">
-            ×{runCount}
-          </span>
-        )}
-        {/* Sub-step count badge for subgroup containers (e.g. review_subgraph) */}
-        {subChildren.length > 0 && (
-          <span className="text-zinc-700 text-[10px] flex-shrink-0">
-            {subChildren.filter(s => s.status === 'completed').length}/{subChildren.length}
-          </span>
-        )}
-        {cleaned && <span className="text-ink-dim truncate min-w-0 flex-1">· {cleaned}</span>}
-        {hasDetail && (
-          <span className="ml-auto text-zinc-700 flex-shrink-0">
-            <svg width="7" height="7" viewBox="0 0 8 8" fill="none"
-              className={`transition-transform duration-150 ${open ? 'rotate-180' : ''}`}>
-              <path d="M1 2.5L4 5.5L7 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-            </svg>
-          </span>
-        )}
-      </button>
+    <div className="relative text-[11px] animate-step-reveal">
+      {/* Vertical timeline line — spans from this dot to the next */}
+      {!isLastStep && (
+        <div className={`absolute left-[8px] top-4 bottom-0 w-px ${lineColor}`} />
+      )}
 
-      {/* Smooth height expand via grid-rows trick */}
-      <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
-        <div className="overflow-hidden">
-          {/* Sub-steps (e.g. review_deep_dive / synthesize_adjustments inside review_subgraph) */}
-          {subChildren.length > 0 && (
-            <div className="ml-3 mt-1 pl-2 border-l border-border space-y-1 pb-1">
-              {subChildren.map((child, i) => (
-                <DcfSubstepRow key={child.activity_id || `sub-${i}`} entry={child} />
-              ))}
-            </div>
+      {/* Row content */}
+      <div className="flex items-start gap-3 py-0.5">
+        {/* Timeline node */}
+        <div className={`relative z-10 flex-shrink-0 mt-[3px] w-[17px] h-[17px] rounded-full flex items-center justify-center border ${
+          kgHit ? 'border-teal-500/50 bg-teal-500/10' :
+          thesisFallback ? 'border-amber-500/50 bg-amber-500/10' :
+          isCompleted ? `border-emerald-500/40 bg-emerald-500/10 ${settling ? 'ring-2 ring-emerald-500/20' : ''}` :
+          entry.status === 'error' ? 'border-red-500/40 bg-red-500/10' :
+          entry.status === 'skipped' ? 'border-zinc-600/40 bg-zinc-800/30' :
+          'border-indigo-400/30 bg-indigo-400/5'
+        }`}>
+          {kgHit ? (
+            <span className="text-teal-400 text-[9px] leading-none">⚡</span>
+          ) : thesisFallback ? (
+            <span className="text-amber-400 text-[9px] leading-none">⚠</span>
+          ) : isCompleted ? (
+            <svg width="9" height="9" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-emerald-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          ) : entry.status === 'error' ? (
+            <span className="text-red-400 text-[9px] leading-none font-bold">!</span>
+          ) : (
+            <div className="w-[5px] h-[5px] rounded-full bg-indigo-400 animate-pulse" />
           )}
-          {/* Step detail panel */}
-          {meta && Object.keys(meta).length > 1 && (
-            <div className="ml-3 mt-1.5 pl-2 border-l border-border-hover pb-1">
-              <DcfStepDetail stepName={stepName} meta={meta as Record<string, unknown>} />
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 min-w-0 pt-[1px]">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className={`font-medium ${
+              kgHit ? 'text-teal-300' :
+              thesisFallback ? 'text-amber-400' :
+              isCompleted ? 'text-ink-muted' :
+              isRunning ? 'text-indigo-300' :
+              'text-ink-dim'
+            }`}>{display.label}</span>
+            {kgHit && (
+              <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-teal-500/10 text-teal-400 border border-teal-500/20">cached</span>
+            )}
+            {thesisFallback && (
+              <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-amber-500/10 text-amber-400 border border-amber-500/20">fallback</span>
+            )}
+            {isReRerun && (
+              <span className="flex-shrink-0 px-1 py-px rounded text-[9px] bg-indigo-950/60 text-indigo-400">×{runCount}</span>
+            )}
+            {subChildren.length > 0 && (
+              <span className="text-ink-dim text-[10px]">
+                {subChildren.filter(s => s.status === 'completed').length}/{subChildren.length}
+              </span>
+            )}
+            {cleaned && <span className="text-ink-dim truncate">· {cleaned}</span>}
+            {/* Expand toggle */}
+            {hasDetail && (
+              <button
+                onClick={() => setOpen(o => !o)}
+                className="text-ink-dim hover:text-ink-muted flex-shrink-0 ml-0.5"
+              >
+                <svg width="6" height="6" viewBox="0 0 8 8" fill="none" className={`transition-transform duration-150 ${open ? 'rotate-180' : ''}`}>
+                  <path d="M1 2.5L4 5.5L7 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+                </svg>
+              </button>
+            )}
+          </div>
+
+          {/* Collapsible detail */}
+          {open && (
+            <div className="mt-1.5 pl-0">
+              {/* Sub-steps */}
+              {subChildren.length > 0 && (
+                <div className="pl-0 space-y-0 pb-1">
+                  {subChildren.map((child, i) => (
+                    <DcfSubstepRow key={child.activity_id || `sub-${i}`} entry={child} isLastStep={i === subChildren.length - 1} />
+                  ))}
+                </div>
+              )}
+              {/* Step detail panel */}
+              {meta && Object.keys(meta).length > 1 && (
+                <div className="pt-0.5 pb-1 pl-2 border-l border-border-hover">
+                  <DcfStepDetail stepName={stepName} meta={meta as Record<string, unknown>} />
+                </div>
+              )}
             </div>
           )}
         </div>
+
+        {/* Duration / timestamp — right-aligned */}
+        {timeDisplay && (
+          <span className="flex-shrink-0 text-[9px] text-ink-dim font-mono pt-[2px]">{timeDisplay}</span>
+        )}
       </div>
     </div>
   )
@@ -2047,9 +2115,23 @@ export function ActivityTrace({
           ? 'w-full flex items-center gap-2 py-1 text-left text-[11px] text-ink-dim hover:text-ink-muted transition-colors'
           : 'w-full flex items-center gap-2 px-3 py-1.5 text-left text-[11px] hover:bg-bg-overlay transition-colors'}
       >
-        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-          running > 0 ? 'bg-indigo-400 animate-pulse' : errors > 0 ? 'bg-red-500' : 'bg-emerald-500'
-        }`} />
+        <div className={`w-[19px] h-[19px] rounded-full border flex items-center justify-center flex-shrink-0 ${
+          running > 0 ? 'border-indigo-500/40 bg-indigo-500/10' : errors > 0 ? 'border-red-500/40 bg-red-500/10' : 'border-emerald-500/30 bg-emerald-500/10'
+        }`}>
+          {running > 0 ? (
+            <svg className="animate-spin" width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M6 1a5 5 0 0 1 5 5" stroke="#818cf8" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+          ) : errors > 0 ? (
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+              <path d="M2 2L6 6M6 2L2 6" stroke="#f87171" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+          ) : (
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-emerald-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          )}
+        </div>
         {!inline && <span className="text-ink-muted font-medium tracking-wide">{label}</span>}
         {!inline && <span className="text-zinc-700">·</span>}
         <span className="text-ink-dim">{summaryText}</span>
@@ -2063,15 +2145,15 @@ export function ActivityTrace({
 
       <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
         <div className="overflow-hidden">
-          <div className={inline ? 'pl-3.5 py-1.5 space-y-1.5' : 'border-t border-border px-3 py-3 space-y-1.5'}>
+          <div className={inline ? 'py-1.5 space-y-1.5' : 'border-t border-border px-3 py-3 space-y-1.5'}>
             {grouped !== null
               ? grouped.map((item, i) =>
                   item.kind === 'group'
                     ? <WorkflowGroupRow key={item.parent.activity_id || `g-${i}`} group={item} />
-                    : <ActivityRow key={item.entry.activity_id || `f-${i}`} tc={entryToRow(item.entry)} />
+                    : <ActivityRow key={item.entry.activity_id || `f-${i}`} tc={entryToRow(item.entry)} isLast={i === grouped.length - 1} />
                 )
               : flatRows.map((tc, i) => (
-                  <ActivityRow key={`${tc.tool_name}-${i}`} tc={tc} />
+                  <ActivityRow key={`${tc.tool_name}-${i}`} tc={tc} isLast={i === flatRows.length - 1} />
                 ))
             }
             {/* DcfHitlSection now rendered exclusively in ExecutionSidebar */}
@@ -2106,11 +2188,25 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-[11px] hover:bg-bg-overlay transition-colors"
       >
-        <span className={`w-1 h-1 rounded-full flex-shrink-0 ${
-          isRunning ? 'bg-indigo-400 animate-pulse' :
-          isError ? 'bg-red-500' :
-          `bg-violet-500 ${settling ? 'animate-settle' : ''}`
-        }`} />
+        <div className={`w-[19px] h-[19px] rounded-full border flex items-center justify-center flex-shrink-0 ${
+          isRunning ? 'border-indigo-500/40 bg-indigo-500/10' :
+          isError ? 'border-red-500/40 bg-red-500/10' :
+          'border-violet-500/30 bg-violet-500/10'
+        }`}>
+          {isRunning ? (
+            <svg className="animate-spin" width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M6 1a5 5 0 0 1 5 5" stroke="#818cf8" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+          ) : isError ? (
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+              <path d="M2 2L6 6M6 2L2 6" stroke="#f87171" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+          ) : (
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-violet-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          )}
+        </div>
         <span className="font-medium text-violet-300">{display.label}</span>
         {children.length > 0 && (
           <span className="text-ink-dim transition-opacity duration-200">{doneCount}/{children.length}</span>
@@ -2153,30 +2249,52 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
 
 // ── ActivityRow ───────────────────────────────────────────────────────────────
 
-function ActivityRow({ tc }: { tc: ToolCall }) {
+function ActivityRow({ tc, isLast }: { tc: ToolCall; isLast?: boolean }) {
   const [open, setOpen] = useState(false)
   const settling = useSettleOn(tc.status, 'done')
   const display = getToolDisplay(tc.tool_name)
   const cleaned = cleanToolSummary(tc.summary)
   const expandable = tc.status !== 'running' && cleaned.length > 0
+  const argsLabel = fmtArgsPreview(tc.args_preview || '')
+  const isDone = tc.status === 'done'
+  const isError = tc.status === 'error'
 
   return (
     <div className="text-[11px]">
+      {/* Vertical connector line between tool rows */}
+      {!isLast && (
+        <div className={`ml-[9px] w-px h-2 ${isDone ? 'bg-emerald-600/20' : 'bg-border'}`} />
+      )}
       <button
         onClick={() => expandable && setOpen(o => !o)}
         disabled={!expandable}
-        className="w-full flex items-center gap-2 text-left text-ink-dim hover:text-ink-muted disabled:hover:text-ink-dim transition-colors"
+        className="w-full flex items-center gap-2 text-left hover:opacity-80 disabled:hover:opacity-100 transition-opacity"
       >
-        <span className={`w-1 h-1 rounded-full flex-shrink-0 ${
-          tc.status === 'done' ? `bg-emerald-500 ${settling ? 'animate-settle' : ''}` :
-          tc.status === 'error' ? 'bg-red-500' :
-          'bg-indigo-400 animate-pulse'
-        }`} />
+        {/* Manus-style 19px bordered circle */}
+        <div className={`flex-shrink-0 w-[19px] h-[19px] rounded-full border flex items-center justify-center ${
+          isDone ? 'border-emerald-500/30 bg-emerald-500/10' :
+          isError ? 'border-red-500/30 bg-red-500/10' :
+          'border-indigo-400/20 bg-indigo-400/5'
+        }`}>
+          {isDone && (
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-emerald-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          )}
+          {tc.status === 'running' && (
+            <div className={`w-[6px] h-[6px] rounded-full bg-indigo-400 ${settling ? 'animate-settle' : 'animate-pulse'}`} />
+          )}
+          {isError && (
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+              <path d="M2 2L6 6M6 2L2 6" stroke="currentColor" className="text-red-400" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+          )}
+        </div>
         <span className={`font-medium ${display.group === 'workflow' ? 'text-violet-300' : 'text-ink-muted'}`}>
           {display.label}
         </span>
-        {tc.args_preview && (
-          <span className="text-ink-dim truncate min-w-0">"{tc.args_preview}"</span>
+        {argsLabel && (
+          <span className="text-ink-dim truncate">{argsLabel}</span>
         )}
         {expandable && (
           <span className="ml-auto text-zinc-700 flex-shrink-0">
@@ -2217,7 +2335,13 @@ export function ResearchStepsTrace({ steps, defaultOpen }: { steps: StepState[];
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[11px] hover:bg-bg-overlay transition-colors"
       >
-        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${failed > 0 ? 'bg-red-500' : 'bg-emerald-500'}`} />
+        <div className={`w-[19px] h-[19px] rounded-full border flex items-center justify-center flex-shrink-0 ${
+          failed > 0 ? 'border-red-500/30 bg-red-500/10' : 'border-emerald-500/30 bg-emerald-500/10'
+        }`}>
+          <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+            <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className={failed > 0 ? 'text-red-400' : 'text-emerald-400'} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </div>
         <span className="text-ink-muted font-medium tracking-wide">Research plan</span>
         <span className="text-zinc-700">·</span>
         <span className="text-ink-dim">
@@ -2232,8 +2356,10 @@ export function ResearchStepsTrace({ steps, defaultOpen }: { steps: StepState[];
       </button>
 
       {open && (
-        <div className="border-t border-border px-3 py-2.5 space-y-2">
-          {safe.map((step, idx) => <PersistedStepRow key={step.id || idx} step={step} index={idx} />)}
+        <div className="border-t border-border px-3 py-2.5">
+          {safe.map((step, idx) => (
+            <StepCard key={step.id || idx} step={step} index={idx} isLast={idx === safe.length - 1} />
+          ))}
         </div>
       )}
     </div>

@@ -244,7 +244,7 @@ def compute_valuation_node(state: dict) -> dict:
     # to prevent runaway compounding.
     terminal_fcf_aggregate = float(projected[-1]["fcff"]) * (1.0 + terminal_growth)
     pre_buyback_terminal_value = terminal_fcf_aggregate / max((wacc - terminal_growth), 1e-6)
-    pre_buyback_terminal_equity = pre_buyback_terminal_value - float(a["net_debt"])
+    pre_buyback_terminal_equity = pre_buyback_terminal_value - float(a.get("net_debt", 0.0))
     fcff_yield_terminal = (
         terminal_fcf_aggregate / pre_buyback_terminal_equity
         if pre_buyback_terminal_equity > 0
@@ -260,7 +260,7 @@ def compute_valuation_node(state: dict) -> dict:
     terminal_value = terminal_fcf_aggregate / max((wacc - effective_terminal_growth), 1e-6)
     terminal_pv = terminal_value / ((1.0 + wacc) ** int(projected[-1]["year"]))
     enterprise_value = pv_sum + terminal_pv
-    equity_value = enterprise_value - float(a["net_debt"])
+    equity_value = enterprise_value - float(a.get("net_debt", 0.0))
 
     implied_share_price = equity_value / max(shares_end, 1e-6)
 
@@ -354,7 +354,7 @@ def compute_implied_wacc_node(state: dict) -> dict:
     a = state["assumptions"]
     spot = float((state.get("market_snapshot") or {}).get("price", 0.0))
     shares_M = float(a["shares_outstanding"])   # millions
-    net_debt_M = float(a["net_debt"])           # millions
+    net_debt_M = float(a.get("net_debt", 0.0))           # millions
     terminal_growth = float(a["terminal_growth"])
     capm_wacc = float(a["wacc"])
     projected = state["projected_fcff"]
@@ -486,7 +486,7 @@ def sensitivity_node(state: dict) -> dict:
     terminal_base = float(state["assumptions"]["terminal_growth"])
     wacc_base = float(state["assumptions"]["wacc"])
     shares_initial = max(float(state["assumptions"]["shares_outstanding"]), 1e-6)
-    net_debt = float(state["assumptions"]["net_debt"])
+    net_debt = float(state["assumptions"].get("net_debt", 0.0))
     buyback_yield = float(state["assumptions"].get("buyback_yield", 0.0) or 0.0)
     horizon = int(projected[-1]["year"]) if projected else int(state.get("horizon_years", 5))
     shares_end = shares_initial * ((1.0 - buyback_yield) ** horizon)

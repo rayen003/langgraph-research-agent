@@ -48,6 +48,11 @@ function fmt(field: string, v: unknown): string {
 function fmtDate(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
+function money(v: unknown): string {
+  const n = num(v)
+  if (n === null) return '—'
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+}
 function runKey(n: KgNode): string { return `${n.ticker}::${n.run_id || n.id}` }
 
 interface RunCol { key: string; runId: string; ticker: string; label: string; updated: number; node: KgNode }
@@ -67,9 +72,42 @@ export function KgCompareRuns({
   // All dcf_run nodes, grouped by ticker, for the picker checklist.
   const allRuns = useMemo(() => {
     const runs = nodes.filter(n => n.node_type === 'dcf_run')
-    runs.sort((a, b) => (a.ticker.localeCompare(b.ticker)) || (a.updated_at - b.updated_at))
+    runs.sort((a, b) => (a.ticker.localeCompare(b.ticker)) || (b.updated_at - a.updated_at))
     return runs
   }, [nodes])
+
+  const runsByTicker = useMemo(() => {
+    const grouped = new Map<string, KgNode[]>()
+    for (const run of allRuns) {
+      const arr = grouped.get(run.ticker) || []
+      arr.push(run)
+      grouped.set(run.ticker, arr)
+    }
+    return Array.from(grouped.entries()).sort(([a], [b]) => a.localeCompare(b))
+  }, [allRuns])
+
+  const metricsByRunKey = useMemo(() => {
+    const m = new Map<string, { implied?: number; spot?: number }>()
+    const runById = new Map(allRuns.map(r => [`${r.ticker}::${r.run_id || r.id}`, r]))
+    for (const [key, run] of runById) {
+      const metrics: { implied?: number; spot?: number } = {}
+      for (const n of nodes) {
+        if (n.ticker !== run.ticker || n.run_id !== run.run_id || n.node_type !== 'run_output') continue
+        if (n.field === 'implied_share_price') metrics.implied = num(n.value) ?? undefined
+        if (n.field === 'current_price') metrics.spot = num(n.value) ?? undefined
+      }
+      m.set(key, metrics)
+    }
+    return m
+  }, [allRuns, nodes])
+
+  const addLatestForTicker = (ticker: string, count = 2) => {
+    const runs = allRuns.filter(r => r.ticker === ticker).slice(0, count)
+    for (const run of runs) {
+      const key = runKey(run)
+      if (!selected.has(key)) onToggleRun(key)
+    }
+  }
 
   // Assembled columns (only selected), sorted oldest→newest.
   const runCols = useMemo<RunCol[]>(() => {
@@ -218,26 +256,71 @@ export function KgCompareRuns({
 
       {/* Run picker */}
       <div className="px-4 py-3 border-b border-edge flex-shrink-0">
-        <div className="text-[11px] uppercase tracking-wide text-ink-dim font-medium mb-2">
-          Add runs <span className="text-ink-dim/70 normal-case tracking-normal">· click nodes, drag here, or toggle</span>
+        <div className="mb-2 flex items-center gap-2">
+          <div className="text-[11px] uppercase tracking-wide text-ink-dim font-medium">
+            Compare set
+          </div>
+          <span className="text-[10px] text-ink-dim">pick 2+ runs</span>
         </div>
-        <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-          {allRuns.map(n => {
-            const key = runKey(n)
-            const on = selected.has(key)
-            return (
+        {runCols.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {runCols.map(rc => (
               <button
-                key={key}
-                onClick={() => onToggleRun(key)}
-                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-mono border transition ${
-                  on ? 'bg-accent-soft text-accent border-accent/50'
-                    : 'text-ink-dim border-edge hover:text-ink hover:border-edge-2'
-                }`}
+                key={rc.key}
+                type="button"
+                onClick={() => onToggleRun(rc.key)}
+                className="flex items-center gap-1 rounded-md border border-accent/40 bg-accent-soft px-2 py-1 text-[11px] text-accent"
+                title="Remove from compare set"
               >
-                {on ? <Check size={11} /> : <Plus size={11} />}{n.ticker} {fmtDate(n.updated_at)}
+                <Check size={11} /> {rc.label} <X size={10} />
               </button>
-            )
-          })}
+            ))}
+          </div>
+        )}
+        <div className="max-h-44 space-y-2 overflow-y-auto pr-1">
+          {runsByTicker.map(([ticker, runs]) => (
+            <div key={ticker} className="rounded-md border border-edge bg-surface">
+              <div className="flex items-center gap-2 border-b border-edge px-2 py-1.5">
+                <span className="text-[11px] font-medium text-ink">{ticker}</span>
+                <span className="text-[10px] text-ink-dim tabular-nums">{runs.length} runs</span>
+                <button
+                  type="button"
+                  onClick={() => addLatestForTicker(ticker, 2)}
+                  className="ml-auto rounded border border-edge px-2 py-0.5 text-[10px] text-ink-muted hover:bg-surface-2 hover:text-ink"
+                >
+                  Add latest 2
+                </button>
+              </div>
+              <div className="divide-y divide-edge/70">
+                {runs.map(n => {
+                  const key = runKey(n)
+                  const on = selected.has(key)
+                  const m = metricsByRunKey.get(key)
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => onToggleRun(key)}
+                      className={`grid w-full grid-cols-[18px_1fr_64px] items-center gap-2 px-2 py-1.5 text-left transition ${
+                        on ? 'bg-accent-soft' : 'hover:bg-surface-2'
+                      }`}
+                    >
+                      <span className={`flex h-4 w-4 items-center justify-center rounded border ${
+                        on ? 'border-accent bg-accent text-white' : 'border-edge text-ink-dim'
+                      }`}>
+                        {on ? <Check size={11} /> : <Plus size={11} />}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block truncate text-[11px] text-ink-muted">{fmtDate(n.updated_at)}</span>
+                        <span className="block truncate font-mono text-[9px] text-ink-dim">{n.run_id || n.id}</span>
+                      </span>
+                      <span className="text-right font-mono text-[10px] text-ink-dim">{money(m?.implied)}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          ))}
           {allRuns.length === 0 && <span className="text-ink-dim text-[11px]">No DCF runs yet.</span>}
         </div>
       </div>

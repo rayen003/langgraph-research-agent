@@ -7,7 +7,11 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-placeholder")
 
-from agent_project.graphs.workflows.dcf.graph import _build_initial_state
+from agent_project.graphs.workflows.dcf.graph import (
+    _build_initial_state,
+    _canonical_assumptions_from_snapshot,
+)
+from agent_project.graphs.workflows.dcf.state import filter_user_assumption_overrides
 
 
 def _make(**kwargs):
@@ -82,6 +86,46 @@ def test_assumption_overrides_stored():
     overrides = {"wacc": 0.10, "terminal_growth": 0.025}
     s = _make(assumption_overrides=overrides)
     assert s["assumption_overrides"] == overrides
+
+
+def test_user_assumption_overrides_drop_canonical_facts():
+    overrides = {
+        "base_revenue": 215_938.0,
+        "shares_outstanding": 24_432.0,
+        "net_debt": 807.0,
+        "revenue_growth": 0.06,
+        "fcff_margin": 0.22,
+        "terminal_growth": 0.025,
+        "tax_rate": 0.16,
+        "wacc": 0.087,
+    }
+
+    assert filter_user_assumption_overrides(overrides) == {
+        "revenue_growth": 0.06,
+        "fcff_margin": 0.22,
+        "terminal_growth": 0.025,
+        "tax_rate": 0.16,
+        "wacc": 0.087,
+    }
+
+
+def test_canonical_assumptions_from_hitl_snapshot_keep_locked_facts():
+    snapshot = {
+        "assumptions": {
+            "base_revenue": 416_161.0,
+            "shares_outstanding": 15_004.7,
+            "revenue_growth": 0.06,
+        },
+        "fundamentals": {
+            "net_debt": {"value": 23_631.0, "source": "fmp"},
+        },
+    }
+
+    assert _canonical_assumptions_from_snapshot(snapshot) == {
+        "base_revenue": 416_161.0,
+        "shares_outstanding": 15_004.7,
+        "net_debt": 23_631.0,
+    }
 
 
 def test_session_id_propagated():

@@ -34,6 +34,7 @@ from .state import (
     _ASSUMPTION_FIELDS,
     _TIER_A_FIELDS,
     clip_to_field_range,
+    filter_user_assumption_overrides,
 )
 from .wacc import resolve_wacc_from_features
 
@@ -584,6 +585,23 @@ def propose_assumptions_node(state: dict) -> dict:
                     "confidence": meta.get("confidence", 0.9),
                 }
 
+    # Safety net for downstream nodes: a missing Tier A field (e.g. JPM and
+    # other banks where `net_debt` is meaningless and fundamentals omit it)
+    # would crash compute_valuation / scenario_runner with KeyError. Default
+    # the optional ones to 0 with a synthetic provenance so the math degrades
+    # gracefully rather than aborting the whole run before finalize.
+    for field, default in (("net_debt", 0.0),):
+        if field not in assumptions:
+            assumptions[field] = default
+            provenance.setdefault(field, {
+                "source": "default_zero",
+                "evidence": (
+                    f"{field} unavailable from canonical fundamentals "
+                    "(common for financial-sector tickers); defaulted to 0."
+                ),
+                "confidence": 0.4,
+            })
+
     canonical_for_prompt = {
         field: assumptions.get(field)
         for field in _TIER_A_FIELDS
@@ -731,9 +749,7 @@ def propose_assumptions_node(state: dict) -> dict:
     )
 
     # ── Step 4: Apply user overrides ────────────────────────────────────────
-    for key, value in overrides.items():
-        if key not in _ASSUMPTION_FIELDS:
-            continue
+    for key, value in filter_user_assumption_overrides(overrides).items():
         normalized = clip_to_field_range(key, float(value))
         if normalized is None:
             logger.warning(

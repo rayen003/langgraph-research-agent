@@ -284,8 +284,10 @@ def _fetch_fundamentals_fmp(ticker: str) -> dict[str, dict[str, Any]]:
     ltd = balance.get("longTermDebt")
     std = balance.get("shortTermDebt")
     if isinstance(ltd, (int, float)) or isinstance(std, (int, float)):
-        debt_raw = (float(ltd) if isinstance(ltd, (int, float)) else 0.0
-                    + float(std) if isinstance(std, (int, float)) else 0.0)
+        debt_raw = (
+            (float(ltd) if isinstance(ltd, (int, float)) else 0.0)
+            + (float(std) if isinstance(std, (int, float)) else 0.0)
+        )
         debt_field = "longTermDebt + shortTermDebt"
     else:
         debt_raw = balance.get("totalDebt")

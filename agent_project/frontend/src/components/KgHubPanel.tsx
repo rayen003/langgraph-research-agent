@@ -33,6 +33,7 @@ const TYPE_LABEL: Record<string, string> = {
   theme: 'Theme',
   user_belief: 'User belief',
   news_item: 'News',
+  dcf_run: 'DCF run',
 }
 
 // Muted left-stripe per type — slate family, one accent. No rainbow.
@@ -45,6 +46,7 @@ const TYPE_ACCENT: Record<string, string> = {
   filing: 'border-l-slate-500/40',
   driver: 'border-l-slate-400/40',
   news_item: 'border-l-accent/40',
+  dcf_run: 'border-l-indigo-400/40',
 }
 
 /**

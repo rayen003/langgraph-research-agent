@@ -88,6 +88,7 @@ KG ingestion, rendering, and audit hardening — driven by real upload/DCF sessi
 - **Audit was always returning 0** — every check called the missing `cache.query`, crashed, and was swallowed by a per-check `except`. Now functional.
 - **Cross-source check rewritten.** Excludes run-scoped nodes (per-run by design), uses ticker-keyed grouping (no cross-company false positives), and correct distinct-value logic (the old code flagged *identical* values). Auto-fix wired (`cache.delete`), staleness handles float epoch timestamps.
 - **Audit ticker selection** — choose which tickers to audit via chips (backend accepts a `tickers` list).
+- **Chat latency optimization (2026-06-07/08)** — KG state injection, ToolNode parallel execution, prompt updates. Documented in `agent_project/docs/CHAT_LATENCY_CHANGES.md`. Known regression: output quality drop from over-trusting stale KG data.
 
 ---
 
@@ -187,7 +188,13 @@ Tool results stored on disk (`runs/<thread_id>/tool_results/`) as JSON; pointer 
 
 ### Chat workflow (`graphs/conversational.py`)
 
-Streaming ReAct loop. Can call any tool including `run_dcf_workflow`. DCF HITL detected via `⛔ STOP` sentinel in tool output → loop breaks → server injects `[DCF_APPROVED]` on resume → new `ainvoke`. When a DCF run completes, the chat path returns the **verbatim markdown report** from `summarize_dcf_payload()` — the LLM does not rewrite it.
+Streaming ReAct loop (`gpt-4o-mini`). Can call any tool including `run_dcf_workflow`. DCF HITL detected via `⛔ STOP` sentinel in tool output → loop breaks → server injects `[DCF_APPROVED]` on resume → new `ainvoke`. When a DCF run completes, the chat path returns the **verbatim markdown report** from `summarize_dcf_payload()` — the LLM does not rewrite it.
+
+**Token streaming** — the final synthesis is streamed token-by-token via `_stream_final_answer()` (emits `chat_token` events). ThinkingDots persist until the first token because no `chat_token` is emitted during tool-routing rounds — only at genuine answer generation. Falls back to a single non-streaming `invoke` on stream error.
+
+**Date anchor** — `_build_today_anchor()` injects today's date + fiscal-year guidance into the system prompt every turn. Without it the model is date-blind: "this year" / "financials for the year" has no referent and the agent falls back to whatever (stale) year the KG cached. The anchor resolves "the year" → current calendar year, "latest reported annual" → FY(year−1).
+
+**KG as a freshness-checked cache, not the answer** — the prompt frames the Knowledge Graph as a fast cache to *verify against*, not the terminal source. The pre-turn injection (`_build_kg_state_injection`) lists cached data as a **hint with ⚠ stale flags** (news >24h, financials period), and a hard rule forces `search_web` whenever the KG is stale/empty or `query_knowledge_graph` returns `needs_external` (see [KG querying](#kg-querying-is-temporally-aware)). This fixed a regression where the agent answered "no recent news" + stale FY financials straight from the KG without ever web-searching.
 
 ### DCF workflow (`graphs/workflows/dcf/`)
 
@@ -255,6 +262,7 @@ All tool definitions live in `tools.py` — **shared by all subgraphs**, no dupl
 | `execute_python` | Run Python locally with `yfinance`/`matplotlib`/`pandas`/`requests` |
 | `run_dcf_workflow` | Deterministic DCF with scenarios, thesis, review loop |
 | `run_deck_workflow` | Slide-deck compiler from DCF output + other sources |
+| `query_knowledge_graph` | Multi-hop reasoning over the agent's own KG (`kg/deep_research.py`). Returns a synthesized answer + `needs_external` staleness flag (see [KG querying](#kg-querying-is-temporally-aware)) |
 
 ### Entity-aware RAG (`documents.py`)
 
@@ -277,6 +285,17 @@ Document uploads now trigger automatic entity extraction (`gpt-4o-mini`), identi
 **Coloured terminal logging** — The RAG pipeline emits coloured `rich` console output at each stage: 📤 upload, 📄 entity extraction, ✅ ready, 🔍 hybrid search, ⚡ dense candidates, 🔀 RRF fusion, 🚦 gate verdict (green/yellow/red for relevant/partial/mismatch), ⚡ gate skipped.
 
 **Database** — Entity metadata columns (`company`, `ticker`, `doc_type`, `fiscal_period`, `subjects`, `stage`) added to `documents` table with auto-migration for existing databases.
+
+### KG querying is temporally aware
+
+`query_knowledge_graph` runs the multi-hop engine in `kg/deep_research.py`: seed the ticker's subgraph, then loop `hop → LLM decides (answer | expand | escalate)` up to `MAX_HOPS`, expanding along chosen relations.
+
+The data model already keeps a **time-series** — a metric's period is folded into its node id (`revenue::Q2 2026`), so different periods coexist as separate nodes instead of overwriting, and every node carries `as_of` / `period` / `updated_at`. The querying layer surfaces that:
+
+- **`recency` column in serialization** — `_serialize` / `_serialize_subgraph` render `id | type | field | value | recency | source conf`, where `recency = as_of=<period> age=<m/h/d>` (`_fmt_temporal`). The reasoning LLM now *sees* when each datapoint is from instead of treating every value as current.
+- **`needs_external` escalation** — `HopDecision` carries `needs_external` + `external_reason`. The planner is told the KG is a **means**, not the goal: if the question asks for "latest / current / this year" data but the relevant nodes report an old `as_of`, it sets `needs_external=true`, still gives the best (clearly dated) stale answer, and the chat agent supplements with `search_web`. An empty subgraph escalates automatically.
+
+This closed a class of bugs where the agent reported stale KG data (e.g. FY2023 financials, "no recent news") as current because the serialized subgraph was temporally blind.
 
 ---
 

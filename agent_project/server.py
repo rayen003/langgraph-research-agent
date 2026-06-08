@@ -449,7 +449,13 @@ def _make_event_bridge(rs: RunState):
     return bridge
 
 
-async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str = "") -> None:
+async def _run_agent_task(
+    thread_id: str,
+    query: str,
+    mode: str,
+    session_id: str = "",
+    user_settings: dict[str, Any] | None = None,
+) -> None:
     from file import app as agent_graph  # noqa: PLC0415
     from langchain_core.messages import HumanMessage  # noqa: PLC0415
     from lg_compat import Command  # noqa: PLC0415
@@ -471,6 +477,7 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
                 "resolved_intent": None,
                 "session_id": session_id,
                 "session_memory": session_memory,
+                "user_settings": user_settings or {},
             },
             config=config,
         )
@@ -487,37 +494,35 @@ async def _run_agent_task(thread_id: str, query: str, mode: str, session_id: str
                 rs.event_queue.put_nowait(None)
                 return
 
-            # User approved — restore HITL context, then re-invoke for fast-path valuation.
-            from graphs.workflows.dcf.hitl_snapshot import build_hitl_snapshot  # noqa: PLC0415
-            from utils import set_dcf_hitl_payload  # noqa: PLC0415
+            # User approved — resume the interrupted DCF graph natively.
+            # Do not inject a hidden [DCF_APPROVED] chat turn or run the
+            # valuation-only graph; the interrupted graph already has the full
+            # state, including net_debt, scenarios, evidence, and provenance.
+            from tools import resume_dcf_workflow_after_hitl  # noqa: PLC0415
+            from utils import list_artifact_paths  # noqa: PLC0415
 
-            merged_assumptions = overrides or dcf_data.get("assumptions", {})
-            hitl_snapshot = build_hitl_snapshot({
-                **dcf_data,
-                "assumptions": merged_assumptions,
-            })
-            set_dcf_hitl_payload(hitl_snapshot)
-
+            resume_payload = {"action": "approve"}
+            if overrides:
+                resume_payload = {"action": "edit", "assumptions": overrides}
             rs.status = "chat_responding"
             update_job(thread_id, status=rs.status)
-            approval_payload = {
-                "ticker": dcf_data.get("ticker", "?"),
-                "horizon_years": dcf_data.get("horizon_years", 5),
-                "all_assumptions": merged_assumptions,
-                "hitl_snapshot": hitl_snapshot,
-            }
-            approval_message = f"[DCF_APPROVED]:{json.dumps(approval_payload)}"
-
-            await agent_graph.ainvoke(
-                {
-                    "messages": [HumanMessage(content=approval_message)],
-                    "mode": mode,
-                    "resolved_intent": "chat",
-                    "session_id": session_id,
-                    "session_memory": session_memory,
-                },
-                config=config,
+            _payload, _pointer, report = await rs.loop.run_in_executor(
+                None,
+                lambda: resume_dcf_workflow_after_hitl(
+                    resume_payload=resume_payload,
+                    thread_id=thread_id,
+                    args={
+                        "ticker": dcf_data.get("ticker", "?"),
+                        "horizon_years": dcf_data.get("horizon_years", 5),
+                        "resume_payload": resume_payload,
+                    },
+                ),
             )
+            complete_event: dict = {"type": "chat_complete", "content": report}
+            artifact_paths = list_artifact_paths()
+            if artifact_paths:
+                complete_event["artifact_paths"] = artifact_paths
+            _send_event(rs, complete_event)
             update_job(thread_id, status="complete")
             _send_event(rs, {"type": "run_complete"})
             rs.event_queue.put_nowait(None)
@@ -948,6 +953,7 @@ class RunRequest(BaseModel):
     mode: str = "auto"
     thread_id: str | None = None       # optional: reuse thread for multi-turn chat
     session_id: str | None = None      # used to scope RAG document search
+    user_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunCreatedResponse(BaseModel):
@@ -1104,7 +1110,13 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
         status=rs.status,
         session_id=session_id,
     )
-    asyncio.create_task(_run_agent_task(thread_id, body.query, body.mode, session_id))
+    asyncio.create_task(_run_agent_task(
+        thread_id,
+        body.query,
+        body.mode,
+        session_id,
+        body.user_settings,
+    ))
     return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
 
 

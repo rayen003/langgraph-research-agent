@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Calculator, RotateCw, RotateCcw, Copy, Lock, FileText } from 'lucide-react'
+import { ArrowLeft, Calculator, RotateCw, RotateCcw, Copy, Lock, FileText } from 'lucide-react'
 import type { KgNode } from '../hooks/useKnowledgeGraph'
 import { Panel, Caption } from './kg/Panel'
 
@@ -50,6 +50,8 @@ interface Props {
   rerunBusy: boolean
   /** raw node ids matched by a query → glow those assumption/output rows. */
   highlightIds?: Set<string>
+  onBack?: () => void
+  backLabel?: string
 }
 
 function fmtNum(v: unknown): string {
@@ -76,7 +78,16 @@ function ageStr(ts: number): string {
   return `${Math.round(age / 86400)}d ago`
 }
 
-export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy, highlightIds }: Props) {
+export function KgRunInspector({
+  runNode,
+  allNodes,
+  onClose,
+  onRerun,
+  rerunBusy,
+  highlightIds,
+  onBack,
+  backLabel = 'Back',
+}: Props) {
   // ── Extract this run's assumptions + outputs ────────────────────────────
   const runId = runNode.run_id || ''
   const ticker = runNode.ticker
@@ -162,17 +173,30 @@ export function KgRunInspector({ runNode, allNodes, onClose, onRerun, rerunBusy,
       title={`${ticker} · DCF Run · ${horizonYears}y`}
       subtitle={`${runId.slice(0, 24)}… · ${ageStr(runNode.updated_at)}`}
       onClose={onClose}
-      actions={reportUrl ? (
-        <a
-          href={reportUrl}
-          target="_blank"
-          rel="noreferrer"
-          title="Open the full DCF report (PDF) in a new tab"
-          className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-accent border border-accent/40 bg-accent-soft hover:bg-accent/20 transition"
-        >
-          <FileText size={12} /> Report ↗
-        </a>
-      ) : undefined}
+      actions={(
+        <div className="flex items-center gap-1.5">
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-ink-muted border border-edge hover:bg-surface-2 hover:text-ink transition"
+            >
+              <ArrowLeft size={12} /> {backLabel}
+            </button>
+          )}
+          {reportUrl && (
+            <a
+              href={reportUrl}
+              target="_blank"
+              rel="noreferrer"
+              title="Open the full DCF report (PDF) in a new tab"
+              className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-accent border border-accent/40 bg-accent-soft hover:bg-accent/20 transition"
+            >
+              <FileText size={12} /> Report ↗
+            </a>
+          )}
+        </div>
+      )}
       footer={
         <div className="flex gap-2">
           <button

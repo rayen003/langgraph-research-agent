@@ -48,6 +48,8 @@ class AgentState(TypedDict):
     session_memory: str
     # RAG session scope — used to filter uploaded documents
     session_id: str
+    # User workflow preferences (validation gates, workflow-specific HITL)
+    user_settings: dict
 
 
 # ---------------------------------------------------------------------------

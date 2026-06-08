@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from utils import get_run_dir
 
-from .activity import emit_step, emit_progress
+from .activity import emit_step
 from .state import DCFState
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,10 @@ def scenario_runner_node(state: DCFState) -> dict:
 
     for sc in scenarios:
         name = sc["name"]
-        emit_progress(f"\n### {name.title()} scenario…")
+        # NOTE: per-scenario progress is surfaced as a workflow substep
+        # (emit_step "scenario_runner" → right-bar BlockStack). Do NOT emit it
+        # as a chat_token — that leaks "### Bear/Base/Bull scenario…" markdown
+        # headings into the streaming chat bubble (junk above the final report).
 
         sc_state = {
             "ticker": state["ticker"],

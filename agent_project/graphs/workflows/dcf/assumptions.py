@@ -17,6 +17,7 @@ from .state import (
     _PROVENANCE_PASSTHROUGH_KEYS,
     _TIER_A_FIELDS,
     clip_to_field_range,
+    filter_user_assumption_overrides,
     normalize_assumption_value,
 )
 from .wacc import resolve_wacc_from_features
@@ -261,7 +262,7 @@ def _apply_overrides(
     overrides: dict[str, float],
 ) -> None:
     """Apply user-provided assumption overrides, with range validation."""
-    for key, value in overrides.items():
+    for key, value in filter_user_assumption_overrides(overrides).items():
         if key not in assumptions:
             continue
         normalized = clip_to_field_range(key, float(value))

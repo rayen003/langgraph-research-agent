@@ -10,7 +10,8 @@ import type { KgNode, KgEdge } from '../hooks/useKnowledgeGraph'
  *     ticker (company)
  *        ├── News         (1, synthetic)   → all news_item
  *        ├── Financials   (1, synthetic)   → synthesis + metrics + thesis + …
- *        └── DCF Run      (N, real)        → assumptions/outputs table + decks
+ *        ├── DCF Run      (latest, real)   → assumptions/outputs table + decks
+ *        └── DCF History  (1, synthetic)   → older runs, opened in side panel
  *
  * The canvas renders ONLY hubs. Detail (individual fields, news, metrics, run
  * tables) lives in side panels keyed by hub. No DB change — purely derived.
@@ -18,6 +19,7 @@ import type { KgNode, KgEdge } from '../hooks/useKnowledgeGraph'
 
 export const HUB_NEWS = '__hub_news__'
 export const HUB_FINANCIALS = '__hub_financials__'
+export const HUB_DCF_HISTORY = '__hub_dcf_history__'
 
 // Raw node_types that roll up into the Financials hub, grouped into category
 // sub-hubs. Each distinct category becomes a child node under Financials when
@@ -91,7 +93,7 @@ const RUN_LEAF_TYPES = new Set(['run_assumption', 'run_output', 'run_scenario'])
 const DECK_TYPES = new Set(['deck_run', 'deck_slide'])
 
 export interface KgViewModel {
-  /** Hub nodes to render on the canvas (company + synthetic News/Financials + dcf_run). */
+  /** Hub nodes to render on the canvas (company + synthetic News/Financials + latest dcf_run/history). */
   hubNodes: KgNode[]
   /** Edges between hubs (company→hub, company→run, run→run handled as members). */
   hubEdges: KgEdge[]
@@ -265,18 +267,41 @@ export function buildKgViewModel(nodes: KgNode[], edges: KgEdge[]): KgViewModel 
     }
   }
 
-  // ── DCF run hubs (real dcf_run nodes) ─────────────────────────────────────
+  // ── DCF run hubs ─────────────────────────────────────────────────────────
+  // Render only the latest run on-canvas. Older runs collapse into one
+  // synthetic "DCF History" hub per ticker so repeated work stays readable.
+  const runsByTicker = new Map<string, KgNode[]>()
   for (const run of dcfRuns) {
-    hubNodes.push(run)
-    const members = runMembers.get(run.id) || []
-    membersByHub.set(run.id, members)
-    for (const m of members) hubForRaw.set(m.id, run.id)
-    // dcf_run itself maps to its own hub (so a matched run node glows it).
-    hubForRaw.set(run.id, run.id)
+    const arr = runsByTicker.get(run.ticker) || []
+    arr.push(run)
+    runsByTicker.set(run.ticker, arr)
+  }
 
-    // Edge company → dcf_run (reuse existing HAS_RUN if present, else synth).
-    const company = companyByTicker.get(run.ticker)
-    if (company) hubEdges.push(mkEdge(company.id, run.id, 'HAS_RUN'))
+  for (const [ticker, runs] of runsByTicker) {
+    runs.sort((a, b) => b.updated_at - a.updated_at)
+    const [latest, ...older] = runs
+    const company = companyByTicker.get(ticker)
+
+    if (latest) {
+      hubNodes.push(latest)
+      const members = runMembers.get(latest.id) || []
+      membersByHub.set(latest.id, members)
+      for (const m of members) hubForRaw.set(m.id, latest.id)
+      hubForRaw.set(latest.id, latest.id)
+      if (company) hubEdges.push(mkEdge(company.id, latest.id, 'HAS_RUN'))
+    }
+
+    if (older.length) {
+      const historyHub = syntheticHub(ticker, HUB_DCF_HISTORY, 'dcf_history_hub', older)
+      historyHub.value = { member_count: older.length, label: 'DCF History' }
+      hubNodes.push(historyHub)
+      membersByHub.set(historyHub.id, older)
+      for (const run of older) {
+        hubForRaw.set(run.id, historyHub.id)
+        for (const member of runMembers.get(run.id) || []) hubForRaw.set(member.id, historyHub.id)
+      }
+      if (company) hubEdges.push(mkEdge(company.id, historyHub.id, 'HAS_RUN_HISTORY'))
+    }
   }
 
   // company nodes map to themselves

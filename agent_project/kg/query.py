@@ -88,6 +88,19 @@ Layer 2 — DCF run artifacts (immutable per run, keyed by run_id):
 Layer 3 — Evidence (provenance for Layer 1):
   • news_item, filing, market_metric_fund, market_metric_price, company_lifecycle.
 
+TEMPORAL METADATA (shown in the `recency` column of every node):
+  • as_of   = the reporting period the value describes (e.g. FY2023, "Q2 2026").
+              A metric's period is also folded into its field key
+              ("revenue::Q2 2026"), so DIFFERENT periods coexist as SEPARATE
+              nodes — the KG keeps a time-series, it does not overwrite.
+  • age     = how long ago the node was last written (m/h/d). A small age means
+              the fact was ingested recently; it does NOT mean the underlying
+              period is current (a 2h-old node can still report FY2023).
+  Judge BOTH: use `as_of` to know which period a value describes, and `age`
+  to know how fresh the ingest is. For "latest / current / today" questions a
+  value whose `as_of` is an old period (or older than its freshness window) is
+  STALE — it cannot answer a current-events question on its own.
+
 RELATIONS: company -HAS_RUN-> dcf_run; dcf_run -PRODUCES-> run_output;
 dcf_run -LOCKED_ASSUMPTION-> run_assumption; company -HAS_SYNTHESIS-> synthesis;
 company -HAS_THESIS-> thesis; company -HAS_DRIVER-> driver; dcf_run -HAS_DECK->
@@ -445,6 +458,44 @@ def _fmt_value(value: Any, limit: int = 120) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
+def _fmt_temporal(node: dict, now: float | None = None) -> str:
+    """Compact recency tag so the reasoning LLM can judge freshness.
+
+    Surfaces the reporting period (``as_of`` / ``period`` / ``fiscal_period``)
+    and the last-write age (``updated_at`` / ``created_at``). Without this the
+    serialized subgraph is temporally blind — every datapoint reads as "current",
+    so a stale FY2023 figure gets answered as if it were this year's.
+    """
+    import time as _time
+
+    now = now if now is not None else _time.time()
+    period = str(
+        node.get("as_of") or node.get("period") or node.get("fiscal_period") or ""
+    ).strip()
+
+    ts = node.get("updated_at") or node.get("created_at") or 0
+    try:
+        ts_f = float(ts)
+    except (TypeError, ValueError):
+        ts_f = 0.0
+
+    age_str = ""
+    if ts_f > 0:
+        age_s = max(0.0, now - ts_f)
+        if age_s < 3600:
+            age_str = f"{age_s / 60:.0f}m"
+        elif age_s < 86400:
+            age_str = f"{age_s / 3600:.0f}h"
+        else:
+            age_str = f"{age_s / 86400:.0f}d"
+
+    parts: list[str] = []
+    if period:
+        parts.append(f"as_of={period}")
+    parts.append(f"age={age_str}" if age_str else "age=?")
+    return " ".join(parts)
+
+
 def _subgraph_nodes(cache, ticker: str) -> list[KGNode]:
     """Nodes in scope: the ticker's nodes (or all if no ticker)."""
     out = []
@@ -457,11 +508,12 @@ def _subgraph_nodes(cache, ticker: str) -> list[KGNode]:
 
 def _serialize_subgraph(nodes: list[KGNode], cache) -> str:
     """Render nodes + their edges as a compact text block for the LLM."""
-    lines = ["NODES (id | type | field | value | source conf):"]
+    lines = ["NODES (id | type | field | value | recency | source conf):"]
     for n in nodes:
         lines.append(
             f"  {n.get('id')} | {n.get('node_type')} | {n.get('field')} | "
-            f"{_fmt_value(n.get('value'))} | {n.get('source')} {n.get('confidence')}"
+            f"{_fmt_value(n.get('value'))} | {_fmt_temporal(n)} | "
+            f"{n.get('source')} {n.get('confidence')}"
         )
     ids = {n.get("id") for n in nodes}
     edge_lines: list[str] = []

@@ -7,6 +7,7 @@ import { KgQueryPanel } from './KgQueryPanel'
 import { KgRunInspector } from './KgRunInspector'
 import { KgRerunPicker } from './KgRerunPicker'
 import { KgHubPanel } from './KgHubPanel'
+import { KgDcfHistoryPanel } from './KgDcfHistoryPanel'
 import { KgFinancialsPanel } from './KgFinancialsPanel'
 import { KgCompareRuns } from './KgCompareRuns'
 import { KgTimeline } from './KgTimeline'
@@ -81,6 +82,7 @@ export function KnowledgePanel({
   const [pendingRerun, setPendingRerun] = useState<PendingRerun | null>(null)
   const [compareOpen, setCompareOpen] = useState(false)
   const [auditOpen, setAuditOpen] = useState(false)
+  const [historyReturnNode, setHistoryReturnNode] = useState<KgNode | null>(null)
   // Assembled comparison set — composite `ticker::run_id` keys.
   const [selectedRunKeys, setSelectedRunKeys] = useState<string[]>([])
 
@@ -107,6 +109,7 @@ export function KnowledgePanel({
     if (n.node_type === 'company') { setSelectedNode(null); return }
     // Financials hub (and any hub with categories) opens the tabbed dock panel
     // instead of spawning category sub-hubs on the canvas.
+    setHistoryReturnNode(null)
     setSelectedNode(n)
   }, [compareOpen, toggleRunKey])
 
@@ -292,7 +295,8 @@ export function KnowledgePanel({
   const isRunNode = selectedNode?.node_type === 'dcf_run'
   const isNewsHub = selectedNode?.node_type === 'news_hub'
   const isFinancialsHub = selectedNode?.node_type === 'financials_hub'
-  const hubMembers = selectedNode && isNewsHub
+  const isDcfHistoryHub = selectedNode?.node_type === 'dcf_history_hub'
+  const hubMembers = selectedNode && (isNewsHub || isDcfHistoryHub)
     ? (viewModel.membersByHub.get(selectedNode.id) || [])
     : []
   // Financials hub → tabbed category panel (replaces on-canvas sub-hubs).
@@ -312,7 +316,7 @@ export function KnowledgePanel({
   const openQuery = () => { setQueryOpen(true); setCompareOpen(false); setAuditOpen(false); setSelectedNode(null) }
   const openCompare = () => { setCompareOpen(true); setQueryOpen(false); setAuditOpen(false); setSelectedNode(null) }
   const openAudit = () => { setAuditOpen(true); setQueryOpen(false); setCompareOpen(false); setSelectedNode(null) }
-  const closeDock = () => { setQueryOpen(false); setCompareOpen(false); setAuditOpen(false); setSelectedNode(null) }
+  const closeDock = () => { setQueryOpen(false); setCompareOpen(false); setAuditOpen(false); setSelectedNode(null); setHistoryReturnNode(null) }
 
   return (
     <div className="fixed inset-0 z-50 bg-bg flex flex-col text-ink">
@@ -464,6 +468,8 @@ export function KnowledgePanel({
                 onRerun={handleRerunRequested}
                 rerunBusy={rerunBusy || isRunActive || pendingRerun !== null}
                 highlightIds={matchedMemberIds}
+                onBack={historyReturnNode ? () => setSelectedNode(historyReturnNode) : undefined}
+                backLabel="History"
               />
             )}
             {auditOpen && (
@@ -480,6 +486,16 @@ export function KnowledgePanel({
                 members={hubMembers}
                 highlightIds={matchedMemberIds}
                 onClose={closeDock}
+              />
+            )}
+            {selectedNode && isDcfHistoryHub && (
+              <KgDcfHistoryPanel
+                ticker={selectedNode.ticker}
+                runs={hubMembers}
+                allNodes={kg.nodes}
+                highlightIds={matchedMemberIds}
+                onClose={closeDock}
+                onSelectRun={run => { setHistoryReturnNode(selectedNode); setSelectedNode(run) }}
               />
             )}
             {selectedNode && isFinancialsHub && (

@@ -56,6 +56,23 @@ def _approval_payload() -> str:
     })
 
 
+def _approval_payload_with_locked_facts() -> str:
+    return "[DCF_APPROVED]:" + json.dumps({
+        "ticker": "AAPL",
+        "horizon_years": 5,
+        "all_assumptions": {
+            "base_revenue": 215_938.0,
+            "shares_outstanding": 24_432.0,
+            "net_debt": 807.0,
+            "revenue_growth": 0.06,
+            "fcff_margin": 0.20,
+            "terminal_growth": 0.025,
+            "tax_rate": 0.15,
+            "wacc": 0.087,
+        },
+    })
+
+
 def test_approved_rerun_runs_workflow_once_no_review(monkeypatch, tmp_path):
     """Approval turn → one workflow call with review_mode=False, report emitted."""
     events: list[dict] = []
@@ -85,6 +102,31 @@ def test_approved_rerun_runs_workflow_once_no_review(monkeypatch, tmp_path):
     assert result["messages"][-1].content == report
     complete = [e for e in events if e.get("type") == "chat_complete"]
     assert complete and complete[-1]["content"] == report
+
+
+def test_approved_rerun_drops_locked_facts_from_overrides(monkeypatch, tmp_path):
+    events: list[dict] = []
+    report = "# DCF Valuation: AAPL\n\n## Executive Summary\n\n- Model validity: VALID"
+    tool = _RecordingDcfTool(report)
+
+    monkeypatch.setattr(conversational, "chat_agent_llm", _ExplodingLLM())
+    monkeypatch.setattr(conversational, "CHAT_TOOLS_BY_NAME", {"run_dcf_workflow": tool})
+    monkeypatch.setattr(conversational, "emit_ui_event", lambda event: events.append(dict(event)))
+    monkeypatch.setattr(conversational.agent_log, "chat_start", lambda: 0.0)
+    monkeypatch.setattr(conversational.agent_log, "chat_done", lambda *_a, **_k: None)
+
+    set_thread_id(f"test-dcf-rerun-filter-{tmp_path.name}")
+    conversational._chat_node_inner({
+        "messages": [HumanMessage(content=_approval_payload_with_locked_facts())],
+        "session_id": "test-session",
+    })
+
+    assert len(tool.calls) == 1
+    sent = tool.calls[0]["assumption_overrides"]
+    assert "base_revenue" not in sent
+    assert "shares_outstanding" not in sent
+    assert "net_debt" not in sent
+    assert sent["wacc"] == 0.087
 
 
 def test_approved_rerun_extracts_report_through_real_tool(monkeypatch, tmp_path):

@@ -406,37 +406,53 @@ function FilingCard({ v }: { v: Record<string, unknown> }) {
   const period = typeof v.fiscal_period === 'string' ? v.fiscal_period
     : typeof v.as_of === 'string' ? v.as_of : ''
   const filename = typeof v.filename === 'string' ? v.filename : ''
+  const source = typeof v.source === 'string' ? v.source
+    : typeof v.source_name === 'string' ? v.source_name
+      : typeof v.url === 'string' ? 'SEC EDGAR' : ''
+  const filedAt = typeof v.filed_at === 'string' ? v.filed_at
+    : typeof v.date === 'string' ? v.date
+      : typeof v.created_at === 'string' ? v.created_at : ''
   const chunks = typeof v.chunk_count === 'number' ? v.chunk_count : null
   const pages = typeof v.page_count === 'number' ? v.page_count : null
   const text = typeof v.text === 'string' ? v.text : ''
+  const excerpt = text.replace(/\s+/g, ' ').trim()
   const docId = typeof v.source_doc_id === 'string' ? v.source_doc_id : ''
   // SEC-fetched filings carry a public url; uploaded filings carry source_doc_id
   // → open via the document file endpoint.
   const url = typeof v.url === 'string' && v.url
     ? v.url
     : docId ? `/documents/${encodeURIComponent(docId)}/file` : ''
-  const typeLabel: Record<string, string> = { sec_filing: 'SEC Filing', annual_report: 'Annual Report' }
+  const typeLabel: Record<string, string> = {
+    sec_filing: 'SEC Filing',
+    annual_report: 'Annual Report',
+    '10-k': '10-K',
+    '10-q': '10-Q',
+    '8-k': '8-K',
+  }
   return (
-    <div className="rounded border border-indigo-500/25 bg-indigo-500/[0.06] px-2.5 py-2">
-      <div className="flex items-center gap-2">
-        <span className="text-[9px] uppercase tracking-wider text-indigo-400 font-medium">📄 {typeLabel[ftype] || ftype}</span>
-        {period && <span className="text-[9px] text-ink-dim bg-surface border border-edge rounded px-1">{period}</span>}
-      </div>
-      {filename && <div className="text-ink-muted text-[10px] mt-1 truncate">{filename}</div>}
-      {/* Short lead snippet so the card isn't empty; full content is one click away. */}
-      {text && (
-        <div className="mt-1.5 text-ink-dim text-[10px] leading-snug max-h-20 overflow-hidden border-l-2 border-l-indigo-500/40 pl-2">
-          {text}
-        </div>
-      )}
-      <div className="flex items-center gap-3 mt-1.5 text-[9px] text-ink-dim">
-        {chunks !== null && <span>{chunks} chunk{chunks !== 1 ? 's' : ''}</span>}
-        {pages !== null && <span>{pages} page{pages !== 1 ? 's' : ''}</span>}
+    <div className="rounded-md border border-edge bg-surface px-2.5 py-2 transition hover:border-edge-2 hover:bg-surface-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="shrink-0 rounded border border-indigo-500/30 bg-indigo-500/10 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-indigo-300">
+          {typeLabel[ftype.toLowerCase()] || ftype.replace(/_/g, ' ')}
+        </span>
+        {period && <span className="shrink-0 rounded border border-edge bg-surface-2 px-1.5 py-0.5 text-[9px] text-ink-dim">{period}</span>}
+        {filedAt && <span className="shrink-0 text-[9px] text-ink-dim">{filedAt}</span>}
+        {source && <span className="min-w-0 truncate text-[9px] text-ink-dim">{source}</span>}
         {url && (
-          <a href={url} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline ml-auto font-medium">
-            Open document ↗
+          <a href={url} target="_blank" rel="noreferrer" className="ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-sky-400 hover:bg-surface-2 hover:text-sky-300">
+            Open ↗
           </a>
         )}
+      </div>
+      {(filename || excerpt) && (
+        <div className="mt-1.5 min-w-0">
+          {filename && <div className="truncate text-[10px] text-ink-muted">{filename}</div>}
+          {excerpt && <div className="truncate text-[10px] leading-snug text-ink-dim">{excerpt}</div>}
+        </div>
+      )}
+      <div className="mt-1.5 flex items-center gap-2 text-[9px] text-ink-dim">
+        {chunks !== null && <span>{chunks} chunks</span>}
+        {pages !== null && <span>{pages} pages</span>}
       </div>
     </div>
   )

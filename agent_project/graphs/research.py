@@ -232,6 +232,25 @@ def _format_context_stack(context_stack: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_user_settings(user_settings: dict | None) -> str:
+    validation = user_settings.get("validation") if isinstance(user_settings, dict) else {}
+    if not isinstance(validation, dict):
+        validation = {}
+    require_hitl = bool(validation.get("requireHitl", True))
+    dcf_hitl = bool(validation.get("dcfHitl", True)) and require_hitl
+    deck_hitl = str(validation.get("deckHitlMode") or "partial").lower()
+    if not require_hitl:
+        deck_hitl = "disabled"
+    if deck_hitl not in {"disabled", "partial", "full"}:
+        deck_hitl = "partial"
+    return (
+        "## User validation settings\n"
+        f"- DCF: call run_dcf_workflow with assumption_review_mode={str(dcf_hitl)}.\n"
+        f"- Decks: call run_deck_workflow with brief.hitl_mode='{deck_hitl}'.\n"
+        "- These settings override generic workflow defaults.\n\n"
+    )
+
+
 def build_step_message(
     objective: str,
     step: dict,
@@ -240,6 +259,7 @@ def build_step_message(
     previous_step: str,
     next_step: str,
     context_stack_formatted: str,
+    user_settings: dict | None = None,
 ) -> str:
     deps = step.get("depends_on", [])
     dep_text = ", ".join(deps) if deps else "none"
@@ -259,6 +279,7 @@ def build_step_message(
         f"Dependencies:  {dep_text}\n\n"
         f"## Context stack (prior step summaries)\n"
         f"{context_stack_formatted}\n\n"
+        f"{_format_user_settings(user_settings)}"
         f"{fb_line}"
         f"{dep_instruction}"
         f"Execute the current step: {step['description']}"
@@ -274,11 +295,13 @@ def execute_step(
     previous_step: str,
     next_step: str,
     context_stack: list[dict],
+    user_settings: dict | None = None,
 ) -> tuple[str, list[str]]:
     context_stack_formatted = _format_context_stack(context_stack)
     step_message = build_step_message(
         objective, step, review_feedback,
         plan_trajectory, previous_step, next_step, context_stack_formatted,
+        user_settings,
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=STATIC_SYSTEM_PROMPT),
@@ -641,6 +664,7 @@ def execute_one_step_node(state: dict) -> dict:
             previous_step="none",
             next_step="none",
             context_stack=context_stack,
+            user_settings=state.get("user_settings") or {},
         )
         result_text = _clean_step_output(result_text)
 
@@ -722,6 +746,7 @@ def execute_one_step_node(state: dict) -> dict:
         previous_step=previous_step,
         next_step=next_step,
         context_stack=context_stack,
+        user_settings=state.get("user_settings") or {},
     )
     result_text = _clean_step_output(result_text)
 

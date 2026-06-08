@@ -50,6 +50,7 @@ const NODE_COLORS: Record<string, string> = {
   financials_hub: '#0d9488', // muted teal
   fin_category: '#5b6b8c',   // dim slate-blue
   dcf_run: '#6366f1',        // indigo (single, not violet+purple+magenta)
+  dcf_history_hub: '#4f46e5', // muted indigo archive
   // Legacy raw types (rarely rendered in hub model) — kept muted:
   thesis: '#6366f1',
   company_synthesis: '#5b6b8c',
@@ -75,6 +76,7 @@ export const HUB_LEGEND: { color: string; label: string }[] = [
   { color: '#64748b', label: 'News' },
   { color: '#0d9488', label: 'Financials' },
   { color: '#6366f1', label: 'DCF Run' },
+  { color: '#4f46e5', label: 'DCF History' },
   { color: ACCENT, label: 'Latest / selected' },
 ]
 
@@ -87,6 +89,7 @@ export function colorForNode(node: KgNode): string {
 // accent tint. No candy colors competing with the nodes.
 const EDGE_COLORS: Record<string, string> = {
   HAS_RUN: '#3b82f6',
+  HAS_RUN_HISTORY: '#334155',
   HAS_NEWS: '#3f4654',
   HAS_FINANCIALS: '#3f4654',
   HAS_CATEGORY: '#363c47',
@@ -121,7 +124,7 @@ const SHARED_KNOWLEDGE_TYPES = new Set([
 
 type NodeRole = 'company' | 'run' | 'run_leaf' | 'shared' | 'other'
 
-const HUB_TYPES = new Set(['news_hub', 'financials_hub'])
+const HUB_TYPES = new Set(['news_hub', 'financials_hub', 'dcf_history_hub'])
 
 function nodeRole(n: KgNode): NodeRole {
   if (n.node_type === 'company') return 'company'

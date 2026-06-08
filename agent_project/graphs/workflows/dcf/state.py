@@ -151,6 +151,26 @@ _TIER_A_FIELDS: frozenset[str] = frozenset({
 })
 
 
+def filter_user_assumption_overrides(overrides: dict | None) -> dict[str, float]:
+    """Return user-editable DCF overrides only.
+
+    Tier A fields are canonical facts from filings/structured fundamentals.
+    Keep them out of approval/rerun override payloads so stale run history cannot
+    overwrite current facts.
+    """
+    if not overrides:
+        return {}
+    filtered: dict[str, float] = {}
+    for key, value in overrides.items():
+        if key in _TIER_A_FIELDS or key not in _ASSUMPTION_FIELDS:
+            continue
+        try:
+            filtered[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Assumption field definitions
 # ---------------------------------------------------------------------------

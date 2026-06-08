@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useTheme } from '../hooks/useTheme'
+import { loadUserSettings, saveUserSettings, type DeckHitlMode } from '../lib/userSettings'
 
 export function SettingsButton() {
   const [open, setOpen] = useState(false)
@@ -82,6 +83,19 @@ export function SettingsButton() {
 
 function SettingsContent() {
   const { theme, toggle } = useTheme()
+  const [settings, setSettings] = useState(() => loadUserSettings())
+
+  const updateValidation = (patch: Partial<typeof settings.validation>) => {
+    setSettings(prev => {
+      const next = { ...prev, validation: { ...prev.validation, ...patch } }
+      saveUserSettings(next)
+      return next
+    })
+  }
+
+  const deckMode = settings.validation.requireHitl
+    ? settings.validation.deckHitlMode
+    : 'disabled'
 
   return (
     <div className="px-4 pb-2 space-y-3">
@@ -121,6 +135,68 @@ function SettingsContent() {
 
       <div className="text-xs text-ink-dim">
         {theme === 'dark' ? 'Dark' : 'Light'} mode
+      </div>
+
+      <div className="h-px bg-border-subtle" />
+
+      <div className="space-y-2.5">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm text-ink-muted">User validation</div>
+            <div className="text-[10px] text-ink-disabled">Approval gates before deterministic workflows.</div>
+          </div>
+          <button
+            type="button"
+            onClick={() => updateValidation({ requireHitl: !settings.validation.requireHitl })}
+            className={`
+              relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200
+              ${settings.validation.requireHitl ? 'bg-accent' : 'bg-surface-3'}
+            `}
+            title="Toggle user validation"
+          >
+            <span
+              className={`
+                inline-block h-4 w-4 rounded-full bg-white transition-transform duration-200
+                ${settings.validation.requireHitl ? 'translate-x-6' : 'translate-x-1'}
+              `}
+            />
+          </button>
+        </div>
+
+        <details className="rounded-lg border border-border-subtle bg-bg px-3 py-2">
+          <summary className="cursor-pointer text-xs text-ink-muted">DCF workflow</summary>
+          <label className="mt-2 flex items-center justify-between gap-3 text-xs text-ink-dim">
+            <span>Assumption review</span>
+            <input
+              type="checkbox"
+              checked={settings.validation.requireHitl && settings.validation.dcfHitl}
+              disabled={!settings.validation.requireHitl}
+              onChange={e => updateValidation({ dcfHitl: e.target.checked })}
+            />
+          </label>
+        </details>
+
+        <details className="rounded-lg border border-border-subtle bg-bg px-3 py-2">
+          <summary className="cursor-pointer text-xs text-ink-muted">Deck workflow</summary>
+          <div className="mt-2 grid grid-cols-3 gap-1">
+            {(['disabled', 'partial', 'full'] as DeckHitlMode[]).map(mode => (
+              <button
+                key={mode}
+                type="button"
+                disabled={!settings.validation.requireHitl && mode !== 'disabled'}
+                onClick={() => updateValidation({ deckHitlMode: mode })}
+                className={`
+                  rounded-md border px-2 py-1 text-[10px] capitalize transition-colors
+                  ${deckMode === mode
+                    ? 'border-accent bg-accent/15 text-ink'
+                    : 'border-border-subtle text-ink-dim hover:text-ink-muted'}
+                `}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+        </details>
       </div>
     </div>
   )

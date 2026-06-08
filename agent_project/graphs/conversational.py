@@ -4,11 +4,13 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import ToolNode
 
 from documents import search_documents, _session_ctx
 from tools import (
@@ -22,6 +24,7 @@ from tools import (
     search_web,
 )
 import agent_log
+from graphs.workflows.dcf.state import filter_user_assumption_overrides
 from utils import console, emit_ui_event, get_run_dir, list_artifact_paths, list_deck_artifact_paths, relative_run_path, set_dcf_hitl_payload, track_tool
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,8 @@ CHAT_TOOLS = [
     run_deck_workflow,
 ]
 CHAT_TOOLS_BY_NAME = {t.name: t for t in CHAT_TOOLS}
+# ToolNode for native parallel execution — replaces the manual for-loop
+chat_tool_node = ToolNode(CHAT_TOOLS)
 chat_agent_llm = llm.bind_tools(CHAT_TOOLS)
 
 # ---------------------------------------------------------------------------
@@ -71,16 +76,24 @@ _CHAT_SYSTEM = (
     "* status='gate_skipped': passed skip_gate=True — `chunks` array has full text + metadata, evaluate relevance yourself.\n"
     "* status='none': no docs or no matches → proceed with search_web.\n"
     "Pass skip_gate=True when you already know the docs from prior turns — saves ~1-2s latency.\n"
-    "- query_knowledge_graph: query YOUR OWN memory — the Knowledge Graph of everything you've already analyzed (prior DCF runs + assumptions + outputs, investment theses, company synthesis, drivers, fundamentals like revenue/margins/wacc, SEC filings, uploaded-doc facts). Multi-hop reasoning. **Consult this FIRST** for any ticker you've analyzed before answering — it's cheaper and more grounded than the web. Use for analytical/chained questions ('which assumptions drove the implied price and do they match the thesis?', 'compare wacc across runs', 'how did the growth assumption change?'). Returns a synthesized answer inline + a tool_result_id for the traversal trail.\n"
+    "- query_knowledge_graph: your OWN memory — the Knowledge Graph of everything you've already analyzed (prior DCF runs + assumptions + outputs, investment theses, company synthesis, drivers, fundamentals like revenue/margins/wacc, SEC filings, uploaded-doc facts, and saved news). "
+    "It is a fast CACHE, a MEANS to an answer — not the answer itself, and never the fallback-of-last-resort for current events. "
+    "For company questions it's worth a quick check: if it returns data that is RECENT ENOUGH for the question (judge from the as_of period + age it reports), answer from it (zero latency, zero cost). "
+    "The tool returns **`needs_external: true`** plus an `external_reason` when its data is too STALE or MISSING to answer alone — the `answer` it gives in that case is the best from cached (possibly stale) data. "
+    "When you see `needs_external: true`, you MUST call search_web to supplement, and you MUST present cached figures with their period (e.g. 'As of FY2023 …'), never as current. "
+    "Hard rule: for any 'latest / current / today / this year' question, if the KG news is >24h old, the financials are not current-year, or `needs_external` is set → you MUST search_web. "
+    "Never answer 'no recent news' from the KG alone — an empty/stale KG means the KG is stale, NOT that no news exists.\n"
     "- fetch_sec_filing: fetch 10-K/10-Q filings from SEC EDGAR. Use for company risks, MD&A, or business overview — prefer over search_web for company fundamentals.\n"
-    "- search_web: look up current news, prices, filings, or factual information NOT found in the KG or uploaded documents. "
+    "- search_web: look up current news, prices, or information that the KG/uploaded docs don't hold FRESH. "
+    "Reach for it whenever the question is time-sensitive ('latest/current/today/this year') and the KG lacks current-enough data, "
+    "or for any company you've never analyzed — don't force a stale KG answer when a web search is what the question needs. "
     "Returns a tool_result_id pointer + one-line summary — you MUST call retrieve_tool_result to read the full content.\n"
     "- retrieve_tool_result: read the full content of any tool result by its tool_result_id (search_web, execute_python, etc.)\n"
     "- calculator: evaluate mathematical expressions\n"
     "- execute_python: run code for data analysis, computations, or quick charts\n\n"
     "- run_dcf_workflow: deterministic DCF valuation for explicit intrinsic-value requests. "
-    "**Always call with assumption_review_mode=True first.** "
-    "This presents an interactive assumption review card to the user before computing valuation. "
+    "Use the current User validation settings to decide assumption_review_mode. "
+    "When assumption_review_mode=True, this presents an interactive assumption review card to the user before computing valuation. "
     "After the user reviews and approves (or edits) the assumptions, call again with assumption_review_mode=False "
     "and any assumption_overrides the user specified. "
     "The tool returns a full markdown report — present it **verbatim** to the user (do NOT rewrite as a summary). "
@@ -89,19 +102,20 @@ _CHAT_SYSTEM = (
     "After a completed DCF, call with **only** ``brief`` (title, audience, must_cover) — "
     "sources are auto-loaded from dcf_output.json; do NOT pass payload_inline or placeholder strings. "
     "Never invent slide outlines in chat when this tool is available. "
-    "Set ``hitl_mode`` to ``partial`` (default) for sidebar outline review.\n\n"
+    "Set ``hitl_mode`` from the current User validation settings.\n\n"
     "## Behaviour\n"
+    "- **This is chat mode** — handle most queries here. Research mode is reserved for deep multi-step research only.\n"
     "- Use tools when the question requires current data or computation — don't guess.\n"
     "- For pure conceptual questions (e.g. 'what is DCF?'), answer directly without tools.\n"
-    "- For DCF/valuation requests: call run_dcf_workflow with assumption_review_mode=True first. "
-    "Wait for user to review the assumptions card. Then call again with assumption_review_mode=False "
+    "- For DCF/valuation requests: call run_dcf_workflow with assumption_review_mode from User validation settings. "
+    "If assumption_review_mode=True, wait for user to review the assumptions card. Then call again with assumption_review_mode=False "
     "and assumption_overrides from user edits. Do NOT search_web for beta, shares outstanding, "
     "WACC, or other DCF inputs — the workflow handles all of that.\n"
     "- When user message starts with [DCF_APPROVED], parse the JSON after the colon. "
     "Immediately call run_dcf_workflow with: ticker, horizon_years from the JSON, "
-    "assumption_review_mode=False, and assumption_overrides set to the 'all_assumptions' dict from the JSON "
-    "(pass ALL fields — this enables the fast valuation path that skips re-running evidence collection). "
-    "Do NOT output any text before calling the tool. Do NOT ask for confirmation. Do NOT modify the assumptions.\n"
+    "assumption_review_mode=False, and assumption_overrides set only to editable model assumptions from the JSON "
+    "(do not pass base_revenue, shares_outstanding, or net_debt; those are canonical facts). "
+    "Do NOT output any text before calling the tool. Do NOT ask for confirmation.\n"
     "- For deck/presentation requests (slides, PPTX, pitch deck, IC deck, 'build a deck from this DCF'): "
     "**always call run_deck_workflow** — never write a fake slide-by-slide outline in chat. "
     "If a completed DCF exists in this thread, pass it as a `dcf_output` source (see tool doc). "
@@ -117,6 +131,11 @@ _CHAT_SYSTEM = (
     "- Do not offer follow-up questions or say 'let me know if you need more'.\n"
     "- Do not end with optional next steps or 'If you want'.\n"
     "- Do not say you cannot access real-time data — you can, via search_web.\n"
+     "- **Never call the same tool more than once for the same ticker in a single turn** — a single fetch_sec_filing/search_web call returns all available data. Duplicate calls waste latency with zero new information.\n"
+    "- **For financial metrics when the KG is empty**: use search_web with queries like 'AMZN revenue net income FY2025 earnings' rather than fetch_sec_filing. SEC filings return raw legal text that's hard to parse into numbers; web search returns articles with pre-extracted metrics. Only use fetch_sec_filing for risks, MD&A narrative, or business overview.\n"
+    "- **Tool batching**: When you need multiple independent sources (e.g., KG + web, or multiple search_web calls for different topics), call them all in a SINGLE turn. "
+    "Do NOT call one tool, wait for the result, then call another — that wastes 5-10s per turn. "
+    "Independent tools that don't depend on each other's output should always be batched.\n"
     "- After search_web returns results, answer from those results. Do not repeat similar web searches unless the first result set is clearly irrelevant.\n"
     "- If you reference prior conversation context, be explicit about what you're building on."
 )
@@ -157,7 +176,20 @@ def _extract_dcf_payload_from_history(history: list) -> dict | None:
     return _load_persisted_dcf_payload()
 
 
-def _build_deck_workflow_nudge(history: list) -> str | None:
+def _deck_hitl_mode_from_settings(user_settings: dict | None) -> str:
+    validation = user_settings.get("validation") if isinstance(user_settings, dict) else {}
+    if not isinstance(validation, dict):
+        validation = {}
+    require_hitl = bool(validation.get("requireHitl", True))
+    deck_hitl = str(validation.get("deckHitlMode") or "partial").lower()
+    if not require_hitl:
+        deck_hitl = "disabled"
+    if deck_hitl not in {"disabled", "partial", "full"}:
+        deck_hitl = "partial"
+    return deck_hitl
+
+
+def _build_deck_workflow_nudge(history: list, user_settings: dict | None = None) -> str | None:
     """Inject exact run_deck_workflow args when user wants a deck and DCF exists."""
     if not _user_wants_deck(history):
         return None
@@ -176,7 +208,7 @@ def _build_deck_workflow_nudge(history: list) -> str | None:
     brief = {
         "title": f"{ticker} — DCF Investment Case",
         "audience": "ic",
-        "hitl_mode": "partial",
+        "hitl_mode": _deck_hitl_mode_from_settings(user_settings),
         "slide_count_target": 10,
         "must_cover": [
             "executive summary",
@@ -399,11 +431,15 @@ def _direct_dcf_approval(messages: list) -> dict | None:
     if not ticker or not isinstance(overrides, dict) or not overrides:
         return None
 
+    filtered_overrides = filter_user_assumption_overrides(overrides)
+    if not filtered_overrides:
+        return None
+
     args = {
         "ticker": ticker,
         "horizon_years": horizon_years,
         "assumption_review_mode": False,
-        "assumption_overrides": {k: v for k, v in overrides.items()},
+        "assumption_overrides": filtered_overrides,
     }
     # Lineage: when the approval came from rerunning an existing KG run, link
     # the new run to its parent so the KG records the derivation chain.
@@ -500,6 +536,182 @@ def _build_doc_inventory(session_id: str) -> str:
     return "\n".join(lines)
 
 
+def _build_user_settings_prompt(user_settings: dict) -> str:
+    validation = user_settings.get("validation") if isinstance(user_settings, dict) else {}
+    if not isinstance(validation, dict):
+        validation = {}
+    require_hitl = bool(validation.get("requireHitl", True))
+    dcf_hitl = bool(validation.get("dcfHitl", True)) and require_hitl
+    deck_hitl = _deck_hitl_mode_from_settings(user_settings)
+    return (
+        "\n\n## User validation settings\n"
+        f"- DCF: call run_dcf_workflow with assumption_review_mode={str(dcf_hitl)}.\n"
+        f"- Decks: call run_deck_workflow with brief.hitl_mode='{deck_hitl}'.\n"
+        "- These settings override generic workflow defaults.\n"
+    )
+
+
+def _build_kg_state_injection(query: str) -> str:
+    """Build a compact KG state summary for tickers mentioned in the query.
+
+    Injects into the first user message so the LLM knows on turn 1 what data
+    the KG already has — no tool calls wasted on discovery.
+    """
+    try:
+        import storage  # noqa: PLC0415
+        from collections import Counter
+
+        # Get all known tickers from KG
+        all_nodes = storage.list_kg_nodes()
+        known_tickers: set[str] = set()
+        for n in all_nodes:
+            t = (n.get("ticker") or "").upper().strip()
+            if t:
+                known_tickers.add(t)
+        if not known_tickers:
+            return ""
+
+        # Find which known tickers appear as whole words in the query
+        query_upper = query.upper()
+        mentioned: set[str] = set()
+        for t in known_tickers:
+            # Match as whole word (preceded/followed by non-alpha or boundary)
+            import re
+            if re.search(rf'\b{re.escape(t)}\b', query_upper):
+                mentioned.add(t)
+
+        if not mentioned:
+            return ""
+
+        # Build summary per ticker
+        lines: list[str] = []
+        now = __import__("time").time()
+        for ticker in sorted(mentioned):
+            nodes = [n for n in all_nodes if (n.get("ticker") or "").upper() == ticker]
+            type_counts: Counter[str] = Counter()
+            latest_ts: dict[str, float] = {}
+            for n in nodes:
+                nt = n.get("node_type", "?")
+                type_counts[nt] += 1
+                ts = n.get("updated_at") or n.get("created_at") or 0
+                if nt not in latest_ts or float(ts) > latest_ts[nt]:
+                    latest_ts[nt] = float(ts)
+
+            parts: list[str] = [ticker]
+
+            # News recency — flag staleness so the agent doesn't read "we have
+            # news" as "we have the answer". News older than 24h cannot satisfy
+            # a "latest/current" question on its own.
+            news_count = type_counts.get("news_item", 0)
+            if news_count > 0:
+                latest_news = latest_ts.get("news_item", 0)
+                age_h = (now - latest_news) / 3600 if latest_news else 999
+                age_str = f"{age_h:.0f}h ago" if age_h < 48 else f"{age_h / 24:.0f}d ago"
+                flag = " ⚠ stale for current-events" if age_h > 24 else ""
+                parts.append(f"{news_count} news, latest {age_str}{flag}")
+
+            # Filings
+            filing_count = type_counts.get("filing", 0)
+            if filing_count > 0:
+                parts.append(f"{filing_count} filings")
+
+            # Financial metrics (structured_fundamental or financials_hub). Always
+            # flag the period — a cached FY2023 figure must not be presented as
+            # current-year without verification.
+            fin_count = type_counts.get("structured_fundamental", 0)
+            hub = [n for n in nodes if n.get("node_type") == "financials_hub"]
+            if hub:
+                hub_val = hub[0].get("val") if isinstance(hub[0], dict) else None
+                as_of = (hub_val or {}).get("as_of", "") if isinstance(hub_val, dict) else ""
+                parts.append(
+                    f"financials as_of {as_of} ⚠ verify if current-year needed"
+                    if as_of else "financials cached ⚠ verify period"
+                )
+            elif fin_count > 0:
+                parts.append(f"{fin_count} financial metrics ⚠ verify period")
+            else:
+                parts.append("no financials cached")
+
+            # Prior DCF runs
+            dcf_runs = type_counts.get("dcf_run", 0)
+            if dcf_runs > 0:
+                parts.append(f"{dcf_runs} prior DCF runs")
+
+            lines.append(" · ".join(parts))
+
+        if not lines:
+            return ""
+
+        return (
+            "\n## Background — cached KG data (a HINT, not the answer)\n"
+            "You MAY already hold the data points below. They are a fast cache, not "
+            "ground truth: check the freshness flags before trusting them, and "
+            "web-search to fill anything stale (⚠) or missing. Do NOT answer a "
+            "current-events question from a ⚠ item alone.\n"
+            + "\n".join(lines) + "\n"
+        )
+    except Exception:
+        return ""  # Never let KG pre-fetch crash the chat
+
+
+def _build_today_anchor() -> str:
+    """Anchor the agent in real time.
+
+    Without a current-date anchor the model cannot resolve "this year" / "the
+    year" / "current", so prompt rules about "current-year financials" are
+    meaningless and it falls back to whatever (stale) year the KG cache names —
+    e.g. answering "financials for the year" with FY2023 in 2026.
+    """
+    import datetime  # noqa: PLC0415
+
+    today = datetime.date.today()
+    y = today.year
+    return (
+        "\n\n## Today\n"
+        f"Today's date is {today:%Y-%m-%d}. The current calendar year is {y}.\n"
+        f"- 'this year' / 'the year' / 'current' / 'latest' refer to {y}.\n"
+        f"- The most recent COMPLETED and reported fiscal year is normally FY{y - 1}. "
+        f"When a question asks for financials 'for the year' without naming one, use "
+        f"FY{y - 1} (latest reported annual), or {y} year-to-date quarterly if asked.\n"
+        f"- NEVER answer with a fiscal year more than ~1 year stale (e.g. FY{y - 3}) "
+        f"just because the KG cached it — that is STALE. Resolve the year from today's "
+        f"date and web-search the current figures.\n"
+    )
+
+
+def _stream_final_answer(history: list) -> str:
+    """Stream the final synthesis token-by-token via ``chat_token`` and return
+    the full text.
+
+    The chat answer is otherwise generated with ``llm.invoke`` and dumped whole
+    via ``chat_complete`` after ~10s — all dead air. Streaming here makes the
+    answer appear live. ThinkingDots persist until the first token because
+    ``chat_start`` fired earlier and NO ``chat_token`` is emitted during the
+    tool-routing rounds (only here, at genuine answer generation).
+
+    Falls back to a single non-streaming ``invoke`` if streaming raises before
+    any token was emitted, so a transient stream error never drops the answer.
+    """
+    parts: list[str] = []
+    try:
+        for chunk in llm.stream(history):
+            text = chunk.content
+            if isinstance(text, str) and text:
+                parts.append(text)
+                emit_ui_event({"type": "chat_token", "token": text})
+    except Exception:  # noqa: BLE001
+        if parts:
+            # Already streamed some tokens — keep them; the loop will reconcile
+            # the full text via chat_complete.
+            return "".join(parts)
+        resp = llm.invoke(history)
+        full = resp.content if isinstance(resp.content, str) else ""
+        if full:
+            emit_ui_event({"type": "chat_token", "token": full})
+        return full
+    return "".join(parts)
+
+
 def _chat_node_inner(state: dict) -> dict:
     messages = state.get("messages", [])
     session_memory = state.get("session_memory") or ""
@@ -514,16 +726,31 @@ def _chat_node_inner(state: dict) -> dict:
         return direct
 
     system_content = _CHAT_SYSTEM
+    system_content += _build_today_anchor()
+    system_content += _build_user_settings_prompt(state.get("user_settings") or {})
     doc_inventory = _build_doc_inventory(state.get("session_id") or "")
     if doc_inventory:
         system_content += doc_inventory
     if session_memory:
         system_content += f"\n\n## Prior research in this session\n{session_memory}"
-    deck_nudge = _build_deck_workflow_nudge(messages)
+    deck_nudge = _build_deck_workflow_nudge(messages, state.get("user_settings") or {})
     if deck_nudge:
         system_content += deck_nudge
 
-    history = [SystemMessage(content=system_content)] + messages[-20:]
+    # ── KG state injection: tell the LLM what data it already has ────────
+    # Injected into the first user message (not the system prompt) to preserve
+    # KV-cache stability for the system prefix across different queries.
+    messages_list = list(messages)
+    if messages_list:
+        last_user_msg = next(
+            (m for m in reversed(messages_list) if isinstance(m, HumanMessage)), None
+        )
+        if last_user_msg is not None and isinstance(last_user_msg.content, str):
+            kg_state = _build_kg_state_injection(last_user_msg.content)
+            if kg_state:
+                last_user_msg.content = kg_state + "\n" + last_user_msg.content
+
+    history = [SystemMessage(content=system_content)] + messages_list[-20:]
 
     _chat_t = agent_log.chat_start()
     emit_ui_event({"type": "chat_start"})
@@ -550,77 +777,74 @@ def _chat_node_inner(state: dict) -> dict:
             # Final answer reached
             break
 
-        # Process tool calls
-        for tc in response.tool_calls:
+        # Process tool calls via ToolNode (native parallel execution)
+        if response.tool_calls:
             used_tools = True
-            tool_fn = CHAT_TOOLS_BY_NAME.get(tc["name"])
-            args = _normalize_args(tc.get("args", {}))
-
-            if tc["name"] == "run_deck_workflow":
-                from graphs.workflows.deck.inputs import resolve_deck_workflow_inputs  # noqa: PLC0415
-
-                dcf_payload = _extract_dcf_payload_from_history(history)
-                try:
-                    resolved_sources, resolved_brief = resolve_deck_workflow_inputs(
-                        args.get("sources"),
-                        args.get("brief"),
-                        dcf_payload=dcf_payload,
-                    )
-                    args = {
-                        **args,
-                        "sources": resolved_sources,
-                        "brief": resolved_brief,
-                    }
-                except ValueError as exc:
-                    result = json.dumps({"error": str(exc), "tool_name": tc["name"]})
-                    history.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-                    continue
-
-            args_preview = json.dumps(args, ensure_ascii=False)[:120]
-            # Run the tool inside a track_tool span — the only event emitter
-            # for chat-mode tool telemetry now that the legacy
-            # `tool_call_start/end/error` events have been removed. The span
-            # is allowed to swallow exceptions because original behaviour
-            # was to fold tool errors into the result payload.
-            result: str
-            try:
-                with track_tool(
-                    name=tc["name"],
-                    scope="chat",
-                    step_id="chat",
-                    args_preview=args_preview,
-                ) as span:
-                    if not tool_fn:
-                        raise RuntimeError(f"unknown tool: {tc['name']}")
-                    result = tool_fn.invoke(args)
+            # Pre-process: resolve deck workflow inputs inline so ToolNode
+            # can execute them alongside other tools in parallel
+            for tc in response.tool_calls:
+                if tc["name"] == "run_deck_workflow":
+                    from graphs.workflows.deck.inputs import resolve_deck_workflow_inputs  # noqa: PLC0415
+                    dcf_payload = _extract_dcf_payload_from_history(history)
+                    args = _normalize_args(tc.get("args", {}))
                     try:
-                        parsed = json.loads(result)
-                        if isinstance(parsed, dict):
-                            span["summary"] = parsed.get("summary", "")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-            except Exception as e:
-                result = json.dumps({"error": str(e)})
+                        resolved_sources, resolved_brief = resolve_deck_workflow_inputs(
+                            args.get("sources"),
+                            args.get("brief"),
+                            dcf_payload=dcf_payload,
+                        )
+                        tc["args"] = {**args, "sources": resolved_sources, "brief": resolved_brief}
+                    except ValueError:
+                        tc["args"] = args  # let the tool fail with a clear error
 
-            history.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            # Execute all tool calls via ToolNode (parallel), with activity
+            # telemetry matching the old per-tool track_tool pattern.
+            tool_spans = []
+            for tc in response.tool_calls:
+                args_preview = json.dumps(_normalize_args(tc.get("args", {})), ensure_ascii=False)[:120]
+                span_ctx = track_tool(
+                    name=tc["name"], scope="chat", step_id="chat",
+                    args_preview=args_preview,
+                )
+                span = span_ctx.__enter__()
+                tool_spans.append((tc, span, span_ctx))
+            try:
+                tool_result = chat_tool_node.invoke({"messages": [response]})
+                tool_messages = tool_result.get("messages", [])
+                history.extend(tool_messages)
+                # Populate span summaries from tool results
+                for tc, span, _span_ctx in tool_spans:
+                    for tm in tool_messages:
+                        if isinstance(tm, ToolMessage) and tm.tool_call_id == tc.get("id"):
+                            try:
+                                parsed = json.loads(str(tm.content))
+                                if isinstance(parsed, dict):
+                                    span["summary"] = parsed.get("summary", "")
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            break
+            except Exception:
+                raise
+            finally:
+                for _tc, _span, span_ctx in reversed(tool_spans):
+                    span_ctx.__exit__(None, None, None)
 
-            # Completed DCF reports should be shown verbatim. Do not ask the
-            # chat LLM for another round; that extra call can timeout after the
-            # expensive deterministic workflow has already succeeded.
-            if _extract_dcf_report(history):
-                break
-
-            # HITL: deck outline or DCF assumptions — stop the ReAct loop.
-            result_str = str(result)
-            if "Draft Deck Outline" in result_str:
-                break
-            if "DCF Assumptions for" in result_str or (
-                "⛔ STOP" in result_str and "assumption" in result_str.lower()
-            ):
-                break
-        else:
-            continue
-        break  # outer break — exit the for-loop over tool calls, then exit the round loop
+            # Post-process: check for DCF reports or HITL
+            hitl_found = False
+            for tm in tool_messages:
+                if not isinstance(tm, ToolMessage):
+                    continue
+                result_str = str(tm.content)
+                if "Draft Deck Outline" in result_str:
+                    hitl_found = True
+                    break
+                if "DCF Assumptions for" in result_str or (
+                    "⛔ STOP" in result_str and "assumption" in result_str.lower()
+                ):
+                    hitl_found = True
+                    break
+            if hitl_found or _extract_dcf_report(history):
+                break  # HITL or DCF report found → exit the round loop
 
     # ── Emit final response ───────────────────────────────────────────────────
     last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
@@ -673,13 +897,13 @@ def _chat_node_inner(state: dict) -> dict:
             "Do not call more tools. Do not list raw sources or links. "
             "Synthesize what happened, why it matters, and cite source names inline."
         )))
-        response = llm.invoke(history)
-        final_text = response.content if isinstance(response.content, str) else final_text
+        streamed = _stream_final_answer(history)
+        final_text = streamed if streamed.strip() else final_text
 
     if not final_text.strip():
         history.append(HumanMessage(content="Use the available tool results above to produce the final answer now. Do not call more tools."))
-        response = llm.invoke(history)
-        final_text = response.content if isinstance(response.content, str) else ""
+        streamed = _stream_final_answer(history)
+        final_text = streamed if isinstance(streamed, str) else ""
     if not final_text.strip():
         final_text = _fallback_answer_from_tool_results(history)
     if not final_text.strip():

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useAgentRun } from './hooks/useAgentRun'
+import type { ActivityEntry } from './lib/activity'
 import { useSessionManager } from './hooks/useSessionManager'
 import { useJobs } from './hooks/useJobs'
 import { useDocuments } from './hooks/useDocuments'
@@ -16,6 +17,7 @@ import { ResizablePanel } from './components/ResizablePanel'
 import { usePanelHidden } from './hooks/usePanelHidden'
 import { RerunToast, type RerunToastState } from './components/RerunToast'
 import { SettingsButton } from './components/SettingsPanel'
+import { loadUserSettings } from './lib/userSettings'
 import type { JobSummary, Mode } from './types'
 
 let _msgCounter = 0
@@ -249,6 +251,7 @@ export default function App() {
         selectedMode,
         resolvedIsChat ? activeSession.chatThreadId : undefined,
         activeSession.id,
+        loadUserSettings(),
       )
     },
     [activeSession, state.resolved_intent, startRun, addMessage, composerDocs],
@@ -273,17 +276,35 @@ export default function App() {
 
   const isRunActive = !['idle', 'complete', 'error', 'rejected'].includes(state.status)
 
-  // Execution panel: show ONLY for workflow runs (DCF, deck, research plan-then-execute).
+  // Execution panel: show for workflow runs (DCF, deck, research plan-then-execute).
   // Chat-only runs (web search, ReAct) should NOT trigger the sidebar — the activity
   // trace is already embedded inline in the chat thread.
-  const hasWorkflowActivity = state.activity.some(
+  //
+  // PERSISTENCE: ~150ms after a run completes, `reset` wipes live state.activity
+  // and flips status to idle (see the effect above). To let the user keep
+  // inspecting DCF substeps post-run, fall back to the activity persisted on the
+  // most recent run message. A fresh run repopulates live state; a new session
+  // (empty messages) clears it.
+  const lastRunMsg = [...(activeSession?.messages ?? [])]
+    .reverse()
+    .find((m: any) => m.type === 'research_report' || m.type === 'chat_response') as
+    { activity?: ActivityEntry[] } | undefined
+  const persistedActivity = lastRunMsg?.activity
+  const panelActivity: ActivityEntry[] =
+    state.activity.length ? state.activity : (persistedActivity ?? [])
+  const hasWorkflowActivity = panelActivity.some(
     (a: any) => a?.kind === 'workflow' || a?.name?.startsWith('workflow:')
   )
-  const showExecutionPanel = isRunActive && (
+  const showExecutionPanel = (
+    isRunActive || state.status === 'complete' || hasWorkflowActivity
+  ) && (
     hasWorkflowActivity ||
     state.dcf_review != null ||
     state.deck_review != null
   )
+  // When live state has reset but we're showing persisted activity, present the
+  // panel as a finished run so the BlockStack collapses to completed headers.
+  const panelStatus = state.activity.length ? state.status : 'complete'
 
   const selectedDoc = docs.find(d => d.doc_id === selectedDocId) ?? null
   // Priority: doc preview > execution sidebar.  KG now opens as a full-screen
@@ -380,11 +401,11 @@ export default function App() {
           )}
           {rightPanel === 'execution' && (
             <ExecutionSidebar
-              status={state.status}
+              status={panelStatus}
               steps={state.steps}
               completedSteps={state.completed_steps}
               error={state.error}
-              activity={state.activity}
+              activity={panelActivity}
               dcfReview={state.dcf_review ?? undefined}
               deckReview={state.deck_review ?? undefined}
               threadId={state.thread_id}

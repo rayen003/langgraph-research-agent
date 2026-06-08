@@ -45,6 +45,15 @@ _ui_event_handler_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar(
     default=None,
 )
 
+# Process-wide fallback. ContextVars do NOT propagate into threads spawned by
+# ``loop.run_in_executor`` or LangGraph's internal sync-node executor, so when a
+# nested invocation (e.g. the post-HITL fast path inside ``_direct_dcf_approval``
+# called via ``agent_graph.ainvoke`` → threadpool) reads the ctx, it gets
+# ``None`` and every ``emit_ui_event`` is silently dropped. This caused workflow
+# substeps to vanish from the right sidebar after HITL approval. The fallback
+# mirrors the most-recently-registered handler so any thread can still emit.
+_ui_event_handler_fallback: Any = None
+
 _dcf_hitl_payload_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "dcf_hitl_payload",
     default=None,
@@ -57,8 +66,23 @@ _deck_hitl_payload_ctx: contextvars.ContextVar[dict | None] = contextvars.Contex
 
 
 def set_ui_event_handler(handler: Any) -> None:
-    """Register a callback that receives fine-grained execution events."""
+    """Register a callback that receives fine-grained execution events.
+
+    Sets BOTH the contextvar (for normal async-only paths) AND the process-wide
+    fallback (so nested invocations dispatched through executor threads — where
+    contextvars do not propagate — still find the active handler).
+
+    Passing ``None`` clears the contextvar always; it clears the fallback only
+    when it matches the previously-registered handler (avoiding a concurrent
+    SSE stream wiping another stream's handler on its own ``finally``).
+    """
+    global _ui_event_handler_fallback
+    prev = _ui_event_handler_ctx.get()
     _ui_event_handler_ctx.set(handler)
+    if handler is not None:
+        _ui_event_handler_fallback = handler
+    elif _ui_event_handler_fallback is prev:
+        _ui_event_handler_fallback = None
 
 
 def set_dcf_hitl_payload(payload: dict | None) -> None:
@@ -82,8 +106,13 @@ def get_deck_hitl_payload() -> dict | None:
 
 
 def emit_ui_event(event: dict) -> None:
-    """Fire an event to the registered UI handler, if any."""
-    handler = _ui_event_handler_ctx.get()
+    """Fire an event to the registered UI handler, if any.
+
+    Falls back to the process-wide handler when the contextvar is None — the
+    common case for nested sync nodes inside ``agent_graph.ainvoke`` and any
+    work pushed through ``loop.run_in_executor``.
+    """
+    handler = _ui_event_handler_ctx.get() or _ui_event_handler_fallback
     if handler is not None:
         try:
             handler(event)
