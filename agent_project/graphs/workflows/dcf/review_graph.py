@@ -52,6 +52,33 @@ _MAX_DELTA: dict[str, float] = {
     "wacc": 0.010,
 }
 
+# Issue #6: severity weights for true-convergence tracking. A review iteration's
+# severity score = Σ weight(severity)·confidence over all findings. Convergence
+# is then measured by the DROP in severity across iterations, not merely "no more
+# edits were generated".
+_SEVERITY_WEIGHT: dict[str, float] = {"high": 3.0, "medium": 2.0, "low": 1.0}
+# Stop when residual severity is trivially small …
+_SEVERITY_FLOOR: float = 2.0
+# … or when an extra pass barely reduces it (diminishing returns).
+_MIN_SEVERITY_IMPROVEMENT: float = 1.5
+
+
+def _severity_score(findings: "ReviewFindings | None") -> float:
+    """Aggregate finding severity (weight × confidence). 0.0 when no findings."""
+    if findings is None:
+        return 0.0
+    all_f = (
+        findings.evidence_memo_findings
+        + findings.thesis_assumption_findings
+        + findings.consistency_findings
+        + findings.scenario_distinguishability_findings
+    )
+    return round(
+        sum(_SEVERITY_WEIGHT.get(f.severity, 1.0) * float(f.confidence) for f in all_f),
+        3,
+    )
+
+
 # Hard clamps — absolute floor/ceiling regardless of adjustments.
 _FIELD_CLAMP: dict[str, tuple[float, float]] = {
     "revenue_growth":  (-0.50, 0.75),
@@ -507,12 +534,40 @@ Only include findings with confidence ≥ 0.40. Omit trivial issues.
             "should_stop": True,
         })
 
-    return {"findings": findings}
+    return {"findings": findings, "severity_score": _severity_score(findings)}
 
 
 # ---------------------------------------------------------------------------
 # Node 2 — synthesize_adjustments_node  (pure Python, deterministic)
 # ---------------------------------------------------------------------------
+
+
+# Issue #3: deterministic valuation-direction of each assumption move, so every
+# adjustment states its expected effect on the implied price.
+_EFFECT_DIRECTION: dict[str, str] = {
+    "revenue_growth": "raises",
+    "fcff_margin": "raises",
+    "terminal_growth": "raises",
+    "wacc": "lowers",      # higher discount rate → lower PV
+    "tax_rate": "lowers",  # higher tax → lower after-tax FCFF
+}
+
+
+def _expected_effect(field: str, direction: str) -> str:
+    """One-line expected effect of moving *field* in *direction* on implied price."""
+    base = _EFFECT_DIRECTION.get(field, "changes")
+    # If the assumption moves down, invert the price direction.
+    price_dir = base
+    if direction == "lower" and base in ("raises", "lowers"):
+        price_dir = "lowers" if base == "raises" else "raises"
+    why = {
+        "revenue_growth": "explicit-horizon FCFF",
+        "fcff_margin": "FCFF at every year",
+        "terminal_growth": "terminal value",
+        "wacc": "discounted present value of all cash flows",
+        "tax_rate": "after-tax FCFF",
+    }.get(field, "the valuation")
+    return f"{direction.capitalize()} {field} {price_dir} implied price via {why}."
 
 
 def _all_findings(findings: ReviewFindings) -> list[ScenarioFinding]:
@@ -596,6 +651,9 @@ def synthesize_adjustments_node(state: ReviewState) -> dict:
     # --- Aggregate qualifying findings per (scenario, field) ---
     # direction votes: {"higher": count, "lower": count}
     votes: dict[tuple[str, str], dict[str, int]] = {}
+    # Issue #3: keep the findings behind each (scenario, field) so the applied
+    # adjustment can cite the specific finding that caused it.
+    findings_by_key: dict[tuple[str, str], list[ScenarioFinding]] = {}
 
     for finding in _all_findings(findings):
         if finding.severity != "high":
@@ -608,11 +666,13 @@ def synthesize_adjustments_node(state: ReviewState) -> dict:
             key = (sc, finding.field)
             if key not in votes:
                 votes[key] = {"higher": 0, "lower": 0}
+            findings_by_key.setdefault(key, []).append(finding)
             if finding.direction in ("higher", "lower"):
                 votes[key][finding.direction] += 1
 
     # --- Convert votes to deltas ---
     adjustments: dict[str, dict[str, float]] = {sc: {} for sc in scenario_names}
+    change_records: list[dict[str, Any]] = []  # Issue #3
     meaningful_count = 0
 
     for (sc, field), vote_counts in votes.items():
@@ -650,6 +710,26 @@ def synthesize_adjustments_node(state: ReviewState) -> dict:
         if abs(delta_clamped) >= _MIN_MEANINGFUL_DELTA:
             adjustments[sc][field] = delta_clamped
             meaningful_count += 1
+            # Issue #3: record finding → adjustment → reasoning → expected effect.
+            driving = sorted(
+                findings_by_key.get((sc, field), []),
+                key=lambda f: float(f.confidence), reverse=True,
+            )
+            driver_finding = next(
+                (f for f in driving if f.direction == direction), driving[0] if driving else None,
+            )
+            change_records.append({
+                "scenario": sc,
+                "field": field,
+                "delta": delta_clamped,
+                "direction": direction,
+                "finding": driver_finding.reasoning if driver_finding else "",
+                "reasoning": (
+                    f"{field} moved {direction} by {abs(delta_clamped):.4g} to address: "
+                    f"{driver_finding.reasoning if driver_finding else 'review finding'}"
+                ),
+                "expected_effect": _expected_effect(field, direction),
+            })
 
     # --- Determine should_stop ---
     should_stop = meaningful_count == 0
@@ -705,6 +785,8 @@ def synthesize_adjustments_node(state: ReviewState) -> dict:
         "suggested_adjustments": adjustments,
         "review_summary": review_summary,
         "should_stop": should_stop,
+        "change_records": change_records,
+        "severity_score": state.get("severity_score", 0.0),
     }
 
 

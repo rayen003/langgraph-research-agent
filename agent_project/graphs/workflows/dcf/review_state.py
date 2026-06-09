@@ -139,3 +139,7 @@ class ReviewState(TypedDict):
     suggested_adjustments: dict[str, dict[str, float]] | None
     review_summary: str
     should_stop: bool
+    # Issue #6: aggregate finding severity (weight × confidence) for this pass.
+    severity_score: float
+    # Issue #3: finding → adjustment → reasoning → expected_effect per change.
+    change_records: list[dict[str, Any]]

@@ -152,11 +152,40 @@ def run_review_subgraph(state: DCFState) -> dict:
     adjustments: dict[str, dict[str, float]] = result.get("suggested_adjustments") or {}
     review_summary: str = result.get("review_summary", "")
     findings = result.get("findings")
+    severity_score: float = float(result.get("severity_score", 0.0) or 0.0)
+    change_records: list[dict[str, Any]] = result.get("change_records") or []
+
+    # Issue #6: TRUE convergence — measure whether finding severity actually
+    # dropped, not just whether the LLM stopped emitting edits. Compare this
+    # pass's severity to the previous iteration's.
+    from .review_graph import _MIN_SEVERITY_IMPROVEMENT, _SEVERITY_FLOOR  # noqa: PLC0415
+
+    history = state.get("assumption_history") or []
+    prev_severity = (
+        float(history[-1].get("severity_score", 0.0) or 0.0) if history else None
+    )
+    severity_history = [
+        float(h.get("severity_score", 0.0) or 0.0) for h in history
+    ] + [severity_score]
+    severity_converged = severity_score < _SEVERITY_FLOOR or (
+        prev_severity is not None
+        and iteration > 0
+        and (prev_severity - severity_score) < _MIN_SEVERITY_IMPROVEMENT
+    )
+    if severity_converged and not should_stop:
+        should_stop = True
+        review_summary = (
+            (review_summary + " ") if review_summary else ""
+        ) + (
+            f"Converged on severity: {' → '.join(f'{s:.1f}' for s in severity_history)} "
+            f"(floor {_SEVERITY_FLOOR}, min improvement {_MIN_SEVERITY_IMPROVEMENT})."
+        )
 
     logger.info(
-        "DCF run_review_subgraph ticker=%s iteration=%d should_stop=%s "
-        "adjustments=%s",
-        ticker, iteration, should_stop,
+        "DCF run_review_subgraph ticker=%s iteration=%d should_stop=%s severity=%.2f "
+        "trajectory=%s adjustments=%s",
+        ticker, iteration, should_stop, severity_score,
+        [round(s, 1) for s in severity_history],
         json.dumps({sc: list(f.keys()) for sc, f in adjustments.items() if f}, ensure_ascii=False),
     )
 
@@ -227,6 +256,7 @@ def run_review_subgraph(state: DCFState) -> dict:
         "adjustments": adjustments,
         "findings_summary": review_summary,
         "changes": changes,
+        "severity_score": severity_score,
     }
     new_history = list(state.get("assumption_history") or []) + [history_record]
 
@@ -243,6 +273,11 @@ def run_review_subgraph(state: DCFState) -> dict:
         "review_summary": review_summary,
         "findings": all_findings_list,
         "changes": changes,
+        # Issue #3: structured finding → adjustment → reasoning → expected_effect.
+        "change_records": change_records,
+        # Issue #6: severity trajectory for true-convergence display.
+        "severity_score": severity_score,
+        "severity_history": severity_history,
         "should_refine": not should_stop,
         "stop_reason": "" if not should_stop else review_summary,
     }

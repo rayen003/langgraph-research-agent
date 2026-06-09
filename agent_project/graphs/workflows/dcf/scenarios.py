@@ -27,6 +27,23 @@ _MONOTONIC_FIELDS = ("revenue_growth", "fcff_margin", "terminal_growth")
 
 class ScenarioVariant(BaseModel):
     probability: float = Field(description="Probability weight, 0.0-1.0")
+    driver: str = Field(
+        default="",
+        description=(
+            "The single CATALYST that defines this scenario — a concrete business/"
+            "macro event, not an outcome. E.g. 'Hyperscaler capex slowdown', "
+            "'AI demand acceleration', 'Antitrust remedy forces AWS divestiture'. "
+            "NOT 'lower growth' (that is the consequence, not the driver)."
+        ),
+    )
+    transmission: str = Field(
+        default="",
+        description=(
+            "How the driver propagates to the assumption changes — the mechanism. "
+            "E.g. 'capex cut → slower AWS capacity → revenue growth -8%, "
+            "margin -2% as fixed costs deleverage'."
+        ),
+    )
     revenue_growth: float = Field(description="Annual revenue growth rate")
     fcff_margin: float = Field(description="FCFF margin")
     terminal_growth: float = Field(description="Terminal growth rate")
@@ -80,10 +97,15 @@ def scenario_generator_node(state: DCFState) -> dict:
         f"## Base case assumptions\n{json.dumps(base_assumptions, ensure_ascii=False)}\n\n"
         f"## Investment thesis\n{json.dumps(thesis, ensure_ascii=False)}\n\n"
         "## Instructions\n"
+        "Build each scenario DRIVER-FIRST: start from a concrete catalyst, trace "
+        "how it propagates to the assumptions, THEN set the numbers. Do not pick "
+        "numbers and back-fill a story.\n"
         "From the base case, derive BEAR and BULL scenarios. Output valid JSON ONLY — no markdown:\n\n"
         "{\n"
         '  "bear": {\n'
         '    "probability": 0.25,\n'
+        '    "driver": "The catalyst (e.g. Hyperscaler capex slowdown) — an EVENT, not an outcome",\n'
+        '    "transmission": "driver → mechanism → which assumptions move and why",\n'
         '    "revenue_growth": 0.05,     // more pessimistic\n'
         '    "fcff_margin": 0.20,        // lower margin\n'
         '    "terminal_growth": 0.02,    // more conservative\n'
@@ -92,6 +114,8 @@ def scenario_generator_node(state: DCFState) -> dict:
         "  },\n"
         '  "bull": {\n'
         '    "probability": 0.25,\n'
+        '    "driver": "The catalyst (e.g. AI demand acceleration) — an EVENT, not an outcome",\n'
+        '    "transmission": "driver → mechanism → which assumptions move and why",\n'
         '    "revenue_growth": 0.18,     // more optimistic\n'
         '    "fcff_margin": 0.28,        // higher margin\n'
         '    "terminal_growth": 0.035,   // stronger terminal\n'
@@ -126,12 +150,16 @@ def scenario_generator_node(state: DCFState) -> dict:
                 "tax_rate": bear.get("tax_rate", base_assumptions.get("tax_rate", 0.30)),
             },
             "rationale": bear.get("rationale", "Mechanically derived bear case."),
+            "driver": bear.get("driver", ""),
+            "transmission": bear.get("transmission", ""),
         },
         {
             "name": "base",
             "probability": base_assumptions.get("probability", 0.50),
             "assumptions": dict(base_assumptions),
             "rationale": "Base case from proposed assumptions.",
+            "driver": "Thesis plays out as expected",
+            "transmission": "Base assumptions hold — no catalyst shifts the trajectory.",
         },
         {
             "name": "bull",
@@ -144,6 +172,8 @@ def scenario_generator_node(state: DCFState) -> dict:
                 "tax_rate": bull.get("tax_rate", base_assumptions.get("tax_rate", 0.28)),
             },
             "rationale": bull.get("rationale", "Mechanically derived bull case."),
+            "driver": bull.get("driver", ""),
+            "transmission": bull.get("transmission", ""),
         },
     ]
 

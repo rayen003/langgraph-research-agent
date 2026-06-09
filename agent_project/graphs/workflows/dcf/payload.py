@@ -597,6 +597,28 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
                 lines.append(f"\n**Expected value:** ${expected:.2f}")
                 lines.append(f"**Range:** ${min(prices):.2f} – ${max(prices):.2f}")
             lines.append("")
+
+            # Issue #5: driver-based scenarios — show the catalyst + transmission
+            # so each scenario reads as caused, not hand-picked numbers.
+            scen_meta = {
+                s.get("name"): s for s in (payload.get("scenarios") or [])
+            }
+            driver_rows = [
+                (r.get("name", "?"), scen_meta.get(r.get("name"), {}))
+                for r in scenario_results
+            ]
+            if any((m.get("driver") or m.get("transmission")) for _, m in driver_rows):
+                lines.append("**Scenario drivers**")
+                for name, meta in driver_rows:
+                    drv = str(meta.get("driver") or "").strip()
+                    txn = str(meta.get("transmission") or "").strip()
+                    if not drv and not txn:
+                        continue
+                    head = f"- **{str(name).title()}** — {drv}" if drv else f"- **{str(name).title()}**"
+                    lines.append(head)
+                    if txn:
+                        lines.append(f"  _Transmission:_ {txn}")
+                lines.append("")
     elif not has_executive_summary or not for_display:
         if is_invalid:
             lines.append("Point estimate withheld — model invalid.")
@@ -662,7 +684,29 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
         if findings:
             high = sum(1 for f in findings if str(f.get("severity", "")).lower() == "high")
             lines.append(f"Adversarial review: {len(findings)} finding(s) ({high} high-severity).")
-        if changes:
+        # Issue #6: severity trajectory — shows convergence is real (severity
+        # actually fell), not merely that edits stopped.
+        sev_hist = critique.get("severity_history") or []
+        if len(sev_hist) >= 2:
+            traj = " → ".join(f"{float(s):.1f}" for s in sev_hist)
+            lines.append(f"Finding severity by iteration: {traj}.")
+        # Issue #3: each adjustment with its finding + expected effect.
+        change_records = critique.get("change_records") or []
+        if change_records:
+            lines.append("**Review adjustments (finding → change → expected effect):**")
+            for cr in change_records[:12]:
+                sc = cr.get("scenario", "?")
+                fld = cr.get("field", "?")
+                dlt = cr.get("delta", 0.0)
+                arrow = "↑" if (isinstance(dlt, (int, float)) and dlt > 0) else "↓"
+                lines.append(
+                    f"  - **{sc}.{fld} {arrow}{abs(float(dlt)):.4g}** — "
+                    f"finding: {str(cr.get('finding') or 'n/a')[:140]}"
+                )
+                eff = str(cr.get("expected_effect") or "").strip()
+                if eff:
+                    lines.append(f"    _Expected effect:_ {eff}")
+        elif changes:
             lines.append("**Assumption changes from review:**")
             for change in changes[:12]:
                 lines.append(f"  - {change}")
