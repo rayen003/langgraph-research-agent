@@ -110,6 +110,21 @@ class AssumptionProposal(BaseModel):
     evidence_refs: list[str] = Field(
         description="Evidence IDs supporting this proposal (must exist in evidence pack)"
     )
+    causal_chain: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The multi-step BUSINESS LOGIC that leads to this value — driver → "
+            "transmission mechanism → metric → this assumption. Each item is one "
+            "link. Ground the value in causes, not just a recent observation. "
+            "Example for revenue_growth: ['AI infrastructure buildout', "
+            "'hyperscaler capex +30%', 'custom-silicon demand rises', "
+            "'company is a key ASIC supplier', '→ revenue growth 28%']. "
+            "REQUIRED for revenue_growth, fcff_margin, terminal_growth "
+            "(3-5 links); optional for fact-like fields (tax_rate, sbc). Avoid "
+            "one-hop chains like ['historical margin 1.3%', '→ assume 1.3%'] — "
+            "that is recency anchoring, not reasoning."
+        ),
+    )
     confidence: float = Field(
         description=(
             "0.0-1.0. How confident are you in this specific value? "
@@ -338,6 +353,14 @@ def _build_memo_user_message(
         "For each proposal, provide:",
         "- **value**: your best estimate as a decimal (e.g. 0.08 for 8%)",
         "- **rationale**: 2-4 sentences grounded in evidence",
+        "- **causal_chain**: the business logic as discrete links — "
+        "driver → transmission mechanism → metric → this value. "
+        "REQUIRED for revenue_growth, fcff_margin, terminal_growth (3-5 links). "
+        "Reason from business drivers, NOT from a single recent observation. "
+        "A one-hop chain ('historical X% → assume X%') is recency anchoring and "
+        "will be rejected. For fcff_margin specifically, reason through the "
+        "operating-margin → reinvestment/capex → SBC → free-cash-flow path "
+        "rather than copying a noisy single-year FCF figure.",
         "- **evidence_refs**: list of evidence_ids from the pack above",
         "- **confidence**: 0.0-1.0 per the guidelines",
         "- **range_low / range_high**: optional, if you want to express uncertainty",
@@ -839,11 +862,26 @@ def propose_assumptions_node(state: dict) -> dict:
         },
     )
 
+    # Issue #7: validate the (clamped) assumptions against the observed peer
+    # range. Best-effort + non-blocking — emits warn flags, never clamps.
+    from .peers import validate_assumptions_against_peers  # noqa: PLC0415
+
+    peer_validation = validate_assumptions_against_peers(ticker, assumptions)
+    peer_flags = peer_validation.get("flags") or []
+    if peer_flags:
+        assumption_flags = list(assumption_flags) + peer_flags
+        for flag in peer_flags:
+            logger.warning(
+                "DCF peer flag field=%s value=%s %s",
+                flag.get("field"), flag.get("value"), flag.get("message"),
+            )
+
     result: dict[str, Any] = {
         "assumptions": assumptions,
         "assumption_provenance": provenance,
         "assumption_flags": assumption_flags,
         "wacc_components": wacc_components,
+        "peer_validation": peer_validation,
     }
     if memo_dict is not None:
         result["assumption_memo"] = memo_dict

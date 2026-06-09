@@ -721,6 +721,28 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
             lines.append(f"| {field} | {val_str} | {basis} | {refs} |")
         lines.append("")
 
+    # Issue #7: peer validation — assumptions vs observed peer range.
+    peer_val = payload.get("peer_validation") or {}
+    peer_rows = peer_val.get("rows") or []
+    if peer_rows:
+        peers = peer_val.get("peers") or []
+        lines.append("## Peer Validation")
+        if peers:
+            lines.append(f"_Peers: {', '.join(str(p) for p in peers)}_")
+        lines.append("")
+        lines.append("| Metric | Model | Peer range | Peer median | Status |")
+        lines.append("|--------|-------|-----------|-------------|--------|")
+        for row in peer_rows:
+            badge = "✓" if row.get("status") == "within range" else "⚠"
+            lines.append(
+                f"| {row.get('label', row.get('metric'))} "
+                f"| {float(row.get('model', 0))*100:.1f}% "
+                f"| {float(row.get('peer_min', 0))*100:.1f}%–{float(row.get('peer_max', 0))*100:.1f}% "
+                f"| {float(row.get('peer_median', 0))*100:.1f}% "
+                f"| {badge} {row.get('status', '?')} |"
+            )
+        lines.append("")
+
     wacc_comp = payload.get("wacc_components") or {}
     features = payload.get("features") or {}
     if wacc_comp:
@@ -863,6 +885,11 @@ def summarize_dcf_payload(payload: dict[str, Any], *, for_display: bool = True) 
                 f"**{field}** (evidence: {conf:.0%} · forecast: {fc:.0%}) {ref_markers}"
             )
             lines.append(f"  {rationale}")
+            # Issue #2: show the business-logic chain so the value reads as
+            # reasoned (driver → mechanism → metric) rather than a one-hop guess.
+            chain = prop.get("causal_chain") or []
+            if isinstance(chain, list) and len(chain) >= 2:
+                lines.append(f"  _Causal chain:_ {' → '.join(str(c) for c in chain)}")
             lines.append("")
         overall = memo.get("overall_narrative", "")
         if overall:

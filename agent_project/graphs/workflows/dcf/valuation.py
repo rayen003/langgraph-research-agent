@@ -727,6 +727,8 @@ def finalize_node(state: dict) -> dict:
         "assumption_conflicts": state.get("assumption_conflicts", []),
         "assumption_flags": state.get("assumption_flags", []),
         "valuation_flags": state.get("valuation_flags", []),
+        # Peer-based validation of assumptions (Issue #7).
+        "peer_validation": state.get("peer_validation") or {},
         "market_snapshot": state["market_snapshot"],
         "valuation": state["valuation"],
         # Explicit per-year forecast (Issue #8) — exposes the FCFF build so the
