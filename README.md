@@ -1,4 +1,4 @@
-# Agent Project
+# LangGraph Financial Research Agent
 
 > **Single source of truth.** Architecture, design decisions, features, testing, roadmap.
 > Update this file whenever a feature ships or a decision changes.
@@ -22,15 +22,18 @@
 13. [Configuration](#configuration)
 14. [Design decisions](#design-decisions)
 15. [What works](#what-works)
-16. [Known limitations](#known-limitations)
-17. [Future work](#future-work)
-18. [Development](#development)
+16. [Product assessment](#product-assessment)
+17. [Known limitations](#known-limitations)
+18. [Future work](#future-work)
+19. [Development](#development)
 
 ---
 
 ## What this is
 
-LangGraph-based research agent for financial analysis. Core capability: **deterministic DCF valuation with LLM-assisted assumption derivation, scenario modelling, and adversarial self-review**. Wrapped in a plan-then-execute orchestration layer with multi-turn chat, human-in-the-loop approval, and a React frontend.
+LangGraph-based finance research workspace. Its most developed workflow is **DCF valuation**: Python performs valuation math while LLM steps help gather evidence, derive assumptions, build scenarios, and review the result. The surrounding agent supports chat, research plans, multi-step case delegation, persistent memory, and a React UI. This is a personal research project, not investment advice or a production valuation system.
+
+**Verified locally (24 Sep 2026):** 551 unit tests passed with `uv run pytest agent_project/tests/unit/ -q`. This verifies tested code contracts; it does not establish valuation accuracy or evaluate live LLM behavior and external data providers.
 
 **Three guiding principles:**
 
@@ -56,7 +59,8 @@ LangGraph-based research agent for financial analysis. Core capability: **determ
 
 ---
 
-## Recent changes (2026-06)
+<details>
+<summary>Historical implementation notes (June 2026)</summary>
 
 **Multi-hop KG deep research + tool consolidation (`kg/deep_research.py`)**
 - The KG is now the agent's **own memory, queryable as a tool**. `query_knowledge_graph(question, ticker?)` is in the shared tool set → both chat *and* research subgraphs consult prior DCF runs, theses, fundamentals, drivers, and filings *before* hitting the web. Precedence: **KG → documents (RAG) → web**.
@@ -90,6 +94,8 @@ KG ingestion, rendering, and audit hardening — driven by real upload/DCF sessi
 - **Audit ticker selection** — choose which tickers to audit via chips (backend accepts a `tickers` list).
 - **Chat latency optimization (2026-06-07/08)** — KG state injection, ToolNode parallel execution, prompt updates. Documented in `agent_project/docs/CHAT_LATENCY_CHANGES.md`. Known regression: output quality drop from over-trusting stale KG data.
 
+</details>
+
 ---
 
 ## Quick start
@@ -118,32 +124,35 @@ print(result["valuation"]["implied_share_price"])
 ## Architecture overview
 
 ```
-START → intent
-          │
-      route_intent
-        ↙         ↘
-     chat        plan
-      │            │
-     END       review_plan (HITL interrupt)
-                  │
-            route_after_review
-               ↙            ↘
-       execute_one_step     END (rejected)
-              │
-        route_after_step
-         ↙              ↘
-  execute_one_step   synthesize
-  (more pending)          │
-                     update_memory → END
+START
+  → snapshot turn context → retrieve relevant workspace memory/evidence
+  → semantic router → playbook + execution policy
+       ├─ answer/direct tool → chat → persist turn objects
+       ├─ research plan → human review → execute steps → synthesize → update memory
+       ├─ named workflow setup → chat dispatches selected workflow/tool
+       └─ multi-step case → plan DAG → validate → dispatch ready tasks
+                                  → collect results → dispatch dependents
+                                  → synthesize case result
 ```
 
-Parent graph (`agent_project/file.py`) routes between **chat** and **research** subgraphs based on intent classification. Research mode runs plan-then-execute with HITL plan approval. Each `execute_one_step` is a real LangGraph node invocation → per-step checkpointing, streaming, interrupt support.
+**Routing.** The parent graph builds turn context, retrieves memory, then routes requests by scope. Simple questions stay in chat; bounded research uses plan/review/execute; workflow requests receive setup and approval; complex requests can enter case planning. The routing policy aims to use the least orchestration needed for the task.
 
-Subgraphs:
-- `research.py` — plan → HITL review → execute → synthesize → memory
-- `conversational.py` — ReAct loop with streaming (`gpt-4o-mini` chat model)
-- `workflows/dcf/` — DCF valuation subgraph (see [DCF deep dive](#dcf-workflow-deep-dive))
-- `workflows/deck/` — slide-deck compiler (see [Deck workflow](#deck-workflow))
+**Delegation.** Case planner creates a dependency graph from registered capabilities. DAG validation checks task IDs and dependencies; independent ready tasks fan out as LangGraph workers. Each worker receives a bounded `TaskPacket` with its objective, dependency results, evidence, and allowed tools. Workers return typed `TaskResult` records; collector joins results before dependent tasks or final synthesis.
+
+**Memory and evidence.** Turn context is a compact snapshot, not a second chat history. Retrieval selects relevant workspace objects and expands their dependencies; evidence retrieval can combine document chunks (dense + BM25), versioned facts, and Knowledge Graph references. The KG is a queryable projection/cache; source and output versions remain the durable records. Research completion and chat turns write memory/artifacts for later turns.
+
+**State and persistence.** LangGraph state carries the active turn, route, playbook/policy, selected memory/evidence, workflow or case plan, task statuses/results, and response. Pydantic contracts define case plans, task packets, and task results. The runtime compiles the parent graph with SQLite-backed LangGraph checkpoints; workspace objects and their versions persist separately.
+
+| Concern | Main implementation |
+|---|---|
+| Parent routing + graph wiring | `agent_project/file.py`, `agent_project/routing.py` |
+| Research plan/execute loop | `agent_project/graphs/research.py` |
+| Case planning, task dispatch, result join | `agent_project/case_orchestration.py`, `agent_project/domain/execution.py` |
+| Turn/memory context | `agent_project/turn_context.py`, `agent_project/memory_context.py` |
+| Durable checkpoints | `agent_project/checkpointing.py` |
+| Conversational/tool workflow | `agent_project/graphs/conversational.py`, `agent_project/tool_runtime.py` |
+| DCF workflow | `agent_project/graphs/workflows/dcf/` — see [DCF deep dive](#dcf-workflow-deep-dive) |
+| Deck workflow | `agent_project/graphs/workflows/deck/` — see [Deck workflow](#deck-workflow) |
 
 ---
 
@@ -195,6 +204,30 @@ Streaming ReAct loop (`gpt-4o-mini`). Can call any tool including `run_dcf_workf
 **Date anchor** — `_build_today_anchor()` injects today's date + fiscal-year guidance into the system prompt every turn. Without it the model is date-blind: "this year" / "financials for the year" has no referent and the agent falls back to whatever (stale) year the KG cached. The anchor resolves "the year" → current calendar year, "latest reported annual" → FY(year−1).
 
 **KG as a freshness-checked cache, not the answer** — the prompt frames the Knowledge Graph as a fast cache to *verify against*, not the terminal source. The pre-turn injection (`_build_kg_state_injection`) lists cached data as a **hint with ⚠ stale flags** (news >24h, financials period), and a hard rule forces `search_web` whenever the KG is stale/empty or `query_knowledge_graph` returns `needs_external` (see [KG querying](#kg-querying-is-temporally-aware)). This fixed a regression where the agent answered "no recent news" + stale FY financials straight from the KG without ever web-searching.
+
+### Workflow context setup
+
+Chat remains the default entry point, but workflow-like requests are intercepted before execution by a native LangGraph `interrupt()` setup gate. This is intentionally **not** a second compiled graph. The parent graph routes:
+
+```
+intent → workflow_context_review → chat
+```
+
+The setup payload is a thin `WorkflowContext`, not another memory store:
+
+- identity: `workflow_id`, `session_id`, `triggering_message_id`, `triggering_text`
+- user scope: `user_intent`, `focus_areas`, `primary_entity`
+- selected sources: `selected_doc_ids`, `selected_artifact_ids`, `selected_kg_node_ids`
+- output shape: `output_requirements.audience`, `format`, `depth`
+- optional constraints: source policy, citation requirement, latency budget
+
+Deliberate exclusions:
+
+- No duplicate chat history. Chat state remains source of conversational memory.
+- No duplicate KG. Context stores selected node IDs only.
+- No generic valuation assumptions. DCF assumptions stay inside the DCF workflow and its later HITL assumption review.
+
+Current trigger coverage: `dcf`, `document_analysis`, `memo`, `deck`, `comparison`. DCF receives company/horizon setup. Document analysis receives uploaded document selection and citation constraints. Memo/deck/comparison receive source-object, audience, depth, and format setup before chat dispatches the relevant tool or response pattern.
 
 ### DCF workflow (`graphs/workflows/dcf/`)
 
@@ -675,6 +708,7 @@ Vite + React + TypeScript + Tailwind. Single-page app with two main views:
 
 ```
 agent_project/
+├── domain/                # Shared object/case/task/valuation contracts
 ├── file.py                # Parent graph: intent routing, state, compilation
 ├── tools.py               # Canonical tool definitions (shared by all subgraphs)
 ├── plan_store.py          # Single seam for plan persistence (disk + SQLite)
@@ -818,7 +852,7 @@ Hand-curated DCF records with full provenance. Each record encodes:
 ### Running tests
 
 ```bash
-uv run pytest agent_project/tests/ -v       # all 407
+uv run pytest agent_project/tests/ -v       # full suite (unit + golden + e2e contracts)
 uv run pytest agent_project/tests/unit/ -q  # unit only
 uv run pytest agent_project/tests/golden/   # golden only
 uv run pytest -k aapl                       # filter
@@ -958,12 +992,68 @@ DECK_MODEL_DEFAULT=gpt-4o-mini
 
 ---
 
+## Product assessment
+
+Current product is technically ambitious and has several real institutional-agent building blocks: multi-turn chat, plan-based research, DCF workflow, document RAG, KG memory, source citations, HITL approval, deck generation, and a custom activity UI. The main gap is not raw capability. The main gap is **product coherence**.
+
+### Honest read
+
+| Area | Assessment | Why it matters |
+|------|------------|----------------|
+| Core value | Strong but uneven | DCF + document Q&A can produce useful analyst work, but quality varies by path. |
+| UX | Improving, still too system-shaped | UI exposes too much pipeline state and not enough user-level task state. Some panels feel like debug tools. |
+| Golden path | Missing | A first-time analyst does not have a clear "upload → ask → verify → export" path with confidence checkpoints. |
+| Feature depth | Several half-finished surfaces | KG, decks, RAG, jobs, DCF, report export all exist, but not all are integrated into one polished workflow. |
+| Trust | Better than baseline, not bank-grade yet | Citations and source drawers exist, but RAG evals, citation precision metrics, and source-quality scores are still missing. |
+| Latency | Still a product risk | Long DCF/research runs are acceptable only if background jobs, progress, and partial results feel reliable. |
+| Financial rigor | Directionally good, needs hardening | DCF has deterministic math and review loops, but assumptions still need peer grounding, explicit forecast tables, and stronger evidence linkage. |
+| Enterprise readiness | Prototype-plus | Architecture has serious pieces, but reliability, auditability, permissions, evals, and workflow polish need another layer. |
+
+### Product diagnosis
+
+The app currently behaves like a powerful agent workbench. It should become an **analyst workspace**.
+
+Analyst workspace means:
+- User starts from a concrete task: analyze uploaded document, build DCF, draft memo, prepare deck, compare companies.
+- System chooses or suggests workflow, but user always sees where they are.
+- Evidence is first-class: every important answer can be clicked into source.
+- Outputs become durable objects: report, deck, DCF run, document analysis, comparison.
+- Background work stays visible and resumable.
+- Chat remains the command layer, not the only place where results live.
+
+### North-star workflows
+
+| Workflow | Target user outcome | Current status | Gap |
+|----------|---------------------|----------------|-----|
+| Upload document → ask questions | Analyst gets cited answers from long filings, decks, transcripts | Works | Needs citation metrics, page preview, table extraction evals, better source ranking |
+| Upload docs → draft memo | Analyst gets structured investment memo with citations | Partial | Needs memo schema, source coverage checks, editable output |
+| Run DCF → review assumptions → export | Analyst gets auditable valuation report | Works | Needs explicit forecast table, peer validation, better assumption grounding |
+| DCF → deck | Analyst gets first-pass IC-style deck | Partial | Needs template-quality layouts and stronger source-to-slide trace |
+| Ask follow-up during background research | Analyst keeps working while long jobs run | Partial | Needs latent job UX, notifications, job-to-chat handoff |
+| Compare companies/runs | Analyst understands deltas and drivers | Partial | Needs saved comparison objects and side-chat over comparison |
+
+### Product principles going forward
+
+1. **One visible golden path per workflow.** Each major workflow needs a clear start, progress state, review point, and saved output.
+2. **Evidence before elegance.** Any polished answer without clickable evidence is not trusted.
+3. **Durable artifacts, not transient chats.** Reports, DCF runs, decks, document analyses, and comparisons should be first-class objects.
+4. **Progressive disclosure.** Hide internal chunks, node IDs, tool payloads, and raw graph state unless user asks for diagnostics.
+5. **Latency must feel managed.** Long work is acceptable when progress, partial output, cancellation, and background continuation work.
+6. **Financial workflows need deterministic rails.** LLMs propose; validators, calculators, and schemas decide.
+
+---
+
 ## Known limitations
 
+- **No single golden path.** Users can chat, upload documents, run DCF, inspect KG, and build decks, but the app does not yet guide them through a complete analyst workflow end-to-end.
+- **Some UI still exposes implementation detail.** Activity traces, KG panels, and source drawers are improving, but product language still leaks graph/workflow concepts in places.
+- **Artifacts are fragmented.** Reports, decks, KG nodes, uploads, jobs, and chat messages are stored/rendered through separate surfaces instead of one workspace object model.
+- **RAG quality is not measured.** No RAGAS/DeepEval benchmark yet for faithfulness, context precision, citation precision, table QA, or long-document retrieval.
+- **Document understanding is early.** Structured table extraction exists, but complex financial PDFs with merged cells, chart images, footnotes, and multi-page tables still need better parsing and evals.
 - **Deck content gaps.** Scenario/sensitivity slides can render as title-only `section_header` when DCF payload lacks `scenario_results` or `sensitivity_chart` path (PNG may exist under `artifacts/` but not linked). Outline repair still allows empty section slides for `must_cover` topics without backing blocks.
 - **Deck formatting is programmatic only.** No master `.pptx` template library yet; visual polish lives in `assemble.py` renderers + `DeckTheme`.
 - **No DOCX or XLSX export.** DCF PDF/MD and deck PPTX are supported; other office formats are not.
-- **Standalone DCF endpoint (`POST /workflows/dcf/runs`) HITL resume is broken.** The dedicated HTTP endpoint's `Command(resume=...)` path may not find saved interrupt state in MemorySaver. The agent-tool path (chat + research) works correctly.
+- **Standalone DCF endpoint HITL needs restart testing.** `Command(resume=...)` now uses durable SQLite checkpoints; process-restart coverage remains pending.
 - **Completed job report opens in new tab.** Clicking a completed job in `JobsPanel` opens a Blob URL; not loaded into main research view.
 - **Worker model is single-process.** No DB claim lock / multi-worker coordination.
 - **Document ingestion does not resume.** Uploads interrupted mid-embedding may stay `processing` / `err`; no retry queue.
@@ -975,6 +1065,222 @@ DECK_MODEL_DEFAULT=gpt-4o-mini
 ---
 
 ## Future work
+
+Collaboration and UI contract: [`agent_project/docs/COLLABORATIVE_WORKSPACE_UI.md`](agent_project/docs/COLLABORATIVE_WORKSPACE_UI.md).
+
+### Strategic north star — case-based finance workflow platform
+
+Current plateau: the product is too centered on DCF. Real analyst workflows start with mandate/context, source gathering, data-room organization, company/industry work, market sizing, risk/legal review, and only then valuation. DCF should remain a strong method implementation, but the product spine should become a durable **ResearchCase** / **Engagement** object that owns entities, source registry, tasks, artifacts, assumptions, valuation methods, and final deliverables.
+
+#### Product model
+
+- **ResearchCase / Engagement** becomes the root workspace object: mandate, target company/security, listed/private status, transaction/research purpose, audience, deadline, scope, and constraints.
+- **Entities and securities** are explicit: company, ticker/ISIN, exchange, country, sector, currency, private-company identifier, parent/subsidiary relationships.
+- **Source registry** tracks filings, uploaded documents, APIs, web sources, analyst notes, KG nodes, and source quality.
+- **Task graph** tracks work products: data request list, company profile, KPI extraction, market/TAM model, competitor set, valuation runs, memo, deck, NDA/prospectus drafts, diligence questions.
+- **Artifacts** stay durable workspace objects, not chat-only output: `research_case`, `data_room`, `tam_model`, `valuation_run`, `memo`, `deck`, `prospectus_draft`, `nda_draft`, `comparison`, `risk_register`.
+
+#### Workflow families
+
+- **Intake / scoping**: decide listed vs non-listed, research vs transaction, target output, audience, source policy, disclosure constraints, and valuation methods likely applicable.
+- **Data-room and connectors**: ingest files, fetch market/fundamental/macro/private-market data, normalize periods/currency/units, and expose missing-data gaps.
+- **Business analysis**: company profile, revenue segments, unit economics, margin bridge, KPI trends, capital structure, ownership, management, risks.
+- **Market / TAM**: market definition, sizing method, penetration bridge, competitor map, growth drivers, regulatory or macro sensitivities.
+- **Valuation**: method selection and execution near the end, after evidence and business work are available.
+- **Documents and outputs**: IC memo, equity research note, board/client deck, prospectus/S-1 style draft, NDA draft, diligence tracker, appendix.
+- **QA / audit**: source coverage, citation quality, assumption provenance, stale-data checks, model math checks, cross-method triangulation.
+
+#### Valuation method registry
+
+Valuation should route by company type, capital structure, data availability, and purpose:
+
+- **DCF / FCFF**: operating companies with usable cash-flow forecasts.
+- **FCFE**: financial institutions or capital-structure-specific equity cash-flow cases where FCFF is less natural.
+- **DDM**: mature dividend-paying companies, banks, insurers, and cases where distributable capital is primary.
+- **Residual income / excess return**: banks, insurers, and book-value-driven businesses.
+- **Trading comps**: listed companies where peer multiples are central.
+- **Precedent transactions**: M&A / control-premium context.
+- **SOTP**: conglomerates, multi-segment businesses, holdcos.
+- **NAV**: asset-heavy, real estate, infrastructure, natural resources, funds.
+- **LBO**: sponsor/private-equity lens with leverage, exit multiple, IRR/MOIC.
+- **VC / scorecard / probability-weighted**: early-stage or no-current-cash-flow businesses.
+
+Method selection must be explicit in state, UI, and output. Do not add DDM/private-company logic inside `DCFState`; add a method-agnostic valuation layer above method implementations.
+
+#### Data connector strategy
+
+Add a `DataConnector` interface before adding more ad hoc APIs:
+
+- connector metadata: provider, dataset, entity coverage, asset classes, region, update frequency, license status, credential source.
+- normalized fetch contracts: company profile, financial statements, estimates, prices, peers, transactions, ownership, macro series, industry data.
+- provenance contract: every normalized field keeps provider, endpoint/file, period, retrieval time, currency/unit, confidence, and raw payload pointer.
+- license gate: institutional sources from the HEC account must be checked for API access, redistribution limits, and automation/scraping rights before integration.
+
+Candidate sources to audit through HEC access: Bloomberg, FactSet, LSEG/Refinitiv, S&P Capital IQ, WRDS/Compustat/CRSP, Orbis/Bureau van Dijk, PitchBook, Preqin, Mergermarket, Dealogic, Haver, CEIC, OECD, World Bank, ECB, FRED, SEC EDGAR, Companies House, and exchange feeds. Start with licensed APIs or sanctioned downloads only; no brittle browser automation for restricted terminals.
+
+#### Orchestrator + subagent harness
+
+Current research flow is sequential plan-execute. Future architecture should introduce a top-level orchestrator that decomposes a ResearchCase into typed subagent tasks, runs independent work in parallel, and writes append-only results into the case context stack.
+
+Target subagents:
+
+- **Data agent**: connector fetches, document ingestion, period/currency normalization, missing-data log.
+- **Filings/document agent**: filings, annual reports, transcripts, presentations, broker PDFs, citations.
+- **Business-analysis agent**: model, segments, KPIs, margins, capital structure, risks.
+- **Market/TAM agent**: market definition, sizing, peers, growth drivers.
+- **Macro/industry agent**: rates, inflation, FX, regulation, sector data.
+- **Valuation agent**: method selection, method execution, cross-method triangulation.
+- **Legal/document agent**: NDA, prospectus-style sections, risk factors, disclosure gaps.
+- **Presentation agent**: memo/deck generation from typed artifacts.
+- **QA/audit agent**: source checks, math checks, stale data, contradictions, citation coverage.
+
+Subagent output uses canonical `TaskResult`: `task_id`, `case_id`, `capability_id`, `status`, `summary`, `output_object_version_ids`, `source_refs`, `discovered_requirements`, `warnings`, and `metrics`. This preserves append-only context while keeping large payloads behind references.
+
+#### Fit with current codebase
+
+- `agent_project/file.py` is the current parent graph and workflow setup gate. It should evolve from regex workflow detection into case intake/routing, but keep `WorkflowContext` thin.
+- `agent_project/graphs/research.py` already has append-only `context_stack`; extend this into typed case task results before adding parallelism.
+- `agent_project/graphs/conversational.py` should stay command/chat layer over cases and artifacts, not own business logic.
+- `agent_project/tools.py` is the shared action registry. Add connector and workflow tools here only after domain contracts exist; avoid one-off provider tools.
+- `agent_project/graphs/workflows/dcf/` should become one valuation method implementation under a method registry. Keep DCF-specific assumptions in `DCFState`.
+- `agent_project/graphs/workflows/deck/` already uses typed source adapters (`dcf_output`, `document`, `manual_text`, `kg_subgraph`, `chart_artifact`); reuse this source-adapter pattern for valuation, memo, TAM, and diligence workflows.
+- `agent_project/documents.py` remains the data-room ingestion layer. Add richer table/chart extraction, source-quality metrics, and case-scoped document registries.
+- `agent_project/kg/*` remains memory/cache/audit. Anchor KG writes by case, entity, source, and run so facts can be reused without polluting separate engagements.
+- `agent_project/storage.py` can prototype `research_case` and `case_task` using `workspace_objects.payload`; normalize into dedicated `cases`, `case_tasks`, and `case_artifacts` tables once access patterns stabilize.
+- `agent_project/server.py` should grow from `/runs` + `/workspace/objects` toward `/cases`, `/cases/{case_id}/tasks`, `/cases/{case_id}/artifacts`, and generalized `/workflows/{workflow_id}/runs`.
+- `agent_project/frontend/src/components/MessageThread.tsx`, `WorkspaceObjectsRail.tsx`, and `App.tsx` are the first UI integration points: add case workspace, task progress, method picker, source registry, and artifact reuse here.
+
+#### Implementation sequence
+
+Design contracts before runtime changes:
+
+1. **Routing Escalation Policy**: distinguish direct answer, tool, small task, workflow, and case so simple questions do not trigger heavy orchestration. Draft: `agent_project/docs/ROUTING_ESCALATION_POLICY.md`.
+2. **Playbook Contract**: define micro/task/workflow/case playbook frontmatter, allowed tools, budgets, validators, output schemas, and runtime access model. Draft: `agent_project/docs/PLAYBOOK_CONTRACT.md`; first artifact: `agent_project/playbooks/micro/latest_company_news.md`.
+3. **Source Acquisition Contract**: define data requirements, source acquisition results, source objects, extracted facts, provenance, freshness, and license state.
+4. **Case Orchestrator Contract**: define task DAG, subagent assignment, parallel scheduling, context delegation, merge/reducer behavior, and HITL locks.
+
+Implementation order after contracts:
+
+1. **P0 — Case schema without behavior churn**: typed `ResearchCase`, `TaskSpec`, `TaskPacket`, `TaskResult`, and `ValuationMethodSpec` contracts exist in `agent_project/domain/`; prototype cases persist as workspace objects.
+2. **P1 — Router contract implementation**: typed router output, local playbook registry, graph-level playbook load/policy nodes, micro-playbook route support, route telemetry, and dynamic chat tool binding are implemented; UI mode caps, confirmation policy, and validators remain.
+3. **P2 — Method registry wrapper**: route DCF through a method registry while keeping existing DCF workflow unchanged; add method-selection UI fields.
+4. **P3 — First non-DCF methods**: add DDM and trading-comps skeletons with strict inputs/outputs, even if initial data coverage is narrow.
+5. **P4 — Connector audit**: document HEC-accessible sources, API/license terms, auth flow, rate limits, and useful datasets; implement only approved connectors.
+6. **P5 — Orchestrator harness**: orchestrator emits parallel `TaskPacket`s and appends typed `TaskResult`s to case context.
+7. **P6 — Real workflow expansion**: TAM, memo, prospectus draft, NDA draft, diligence tracker, and cross-method valuation package.
+8. **P7 — Evaluation and controls**: case-level eval harness for retrieval faithfulness, valuation math, source coverage, artifact quality, routing accuracy, and latency.
+
+### Priority roadmap
+
+#### P0 — Golden path + workspace coherence
+
+Goal: make the product intuitive before adding more surfaces.
+
+- Define primary workflows in UI: **Document Q&A**, **DCF**, **Memo**, **Deck**, **Compare**. *(Partial: launcher cards exist; memo/compare still need dedicated workflow engines.)*
+- Add a task launcher or guided command palette that maps user intent to these workflows. *(Partial: launcher opens chat-backed setup gates; deeper input cards still needed per workflow.)*
+- Convert outputs into durable workspace objects: `document_analysis`, `dcf_run`, `memo`, `deck`, `comparison`. *(Partial: uploaded documents, DCF runs, and decks are visible as objects; memo/comparison objects pending.)*
+- Add an artifact rail or workspace sidebar where user can reopen saved outputs without searching chat history. *(Partial: Objects rail exists and opens documents, DCF PDFs, and decks.)*
+- Make chat a command layer over these objects, not the only output container.
+- Replace internal terms in user-facing UI (`chunk`, raw node IDs, graph jargon) with analyst terms (`source`, `page`, `evidence`, `run`, `assumption`).
+
+#### P1 — RAG quality + source trust
+
+Goal: make uploaded-document answers defensible for long finance documents.
+
+- Add RAG eval suite using RAGAS or DeepEval:
+  - faithfulness
+  - answer relevance
+  - context precision/recall
+  - citation precision
+  - table QA exactness
+  - long-document retrieval recall
+- Build a golden document set:
+  - investor presentation
+  - 10-K / 10-Q
+  - earnings transcript
+  - broker report
+  - multi-page table-heavy PDF
+- Add structured ingestion metrics:
+  - pages parsed
+  - tables extracted
+  - table rejection reasons
+  - OCR/text coverage
+  - embedding count
+- Improve citation drawer:
+  - direct page preview
+  - highlight cited passage/table
+  - copy citation
+  - open PDF at page when browser supports it
+- Move toward agentic RAG:
+  - route query type (`lookup`, `compare`, `calculate`, `summarize`, `extract table`)
+  - retrieve iteratively
+  - rerank with source quality + recency
+  - verify answer against retrieved chunks before final response
+
+#### P2 — DCF trust layer
+
+Goal: make valuation output auditable enough for an investment analyst.
+
+- Expose explicit forecast model:
+  - Year
+  - Revenue
+  - Growth
+  - FCFF margin
+  - FCFF
+  - terminal bridge
+- Split confidence into:
+  - `evidence_confidence`
+  - `forecast_confidence`
+- Add WACC bridge:
+  - CAPM WACC
+  - adjusted WACC
+  - adjustment reason
+  - profile band
+- Add peer validation:
+  - revenue growth range
+  - gross/operating/FCFF margin range
+  - WACC range
+  - valuation multiple range
+- Make scenarios driver-based:
+  - driver
+  - transmission mechanism
+  - assumption changes
+  - valuation impact
+- Track review-loop convergence by severity reduction, not just "no more edits".
+
+#### P3 — Decks and document generation
+
+Goal: make outputs reusable by bankers/investment teams.
+
+- Add master `.pptx` templates and placeholder mapping.
+- Improve slide source trace: every key chart/bullet links to DCF output, document chunk, or KG node.
+- Add memo generator with fixed schema:
+  - executive summary
+  - key debate
+  - evidence table
+  - valuation
+  - risks
+  - appendix
+- Add DOCX export for memo.
+- Add XLSX export for DCF forecast tables.
+
+#### P4 — Latency + background agents
+
+Goal: make slow workflows feel controlled.
+
+- Persist background jobs in SQLite with resume/cancel/retry.
+- Show job progress in workspace rail and chat.
+- Stream partial outputs:
+  - gathered sources
+  - extracted facts
+  - draft assumptions
+  - draft outline
+- Add latency budget per workflow:
+  - target first useful output <10s
+  - target document answer <20s
+  - target DCF first review <60s
+- Add per-node telemetry into run output and UI.
+- Cache embeddings, parsed documents, KG lookups, and source fetches aggressively.
 
 ### Deck workflow
 

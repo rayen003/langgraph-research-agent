@@ -182,6 +182,108 @@ def fetch_latest_reported_period(ticker: str) -> str | None:
     return None
 
 
+def fetch_company_financial_history(
+    ticker: str,
+    *,
+    period: str = "annual",
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Expose DCF's FMP client as reusable multi-period statement history."""
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("ticker is required")
+    period_aliases = {
+        "annual": "annual",
+        "annually": "annual",
+        "yearly": "annual",
+        "year": "annual",
+        "quarter": "quarter",
+        "quarterly": "quarter",
+    }
+    normalized_period = period_aliases.get(str(period or "").strip().lower())
+    if normalized_period is None:
+        raise ValueError("period must be annual or quarterly")
+    period = normalized_period
+    limit = max(1, min(int(limit), 12))
+    api_key = os.getenv("FMP_API_KEY") or os.getenv("FINANCIAL_MODELING_PREP_API_KEY")
+    if not api_key:
+        raise RuntimeError("FMP API key is not configured")
+
+    income_rows = _fmp_get_json(
+        f"income-statement?symbol={ticker}&period={period}&limit={limit}",
+        api_key,
+    )
+    cash_rows = _fmp_get_json(
+        f"cash-flow-statement?symbol={ticker}&period={period}&limit={limit}",
+        api_key,
+    )
+    if not income_rows:
+        raise RuntimeError(f"No FMP financial statements returned for {ticker}")
+
+    cash_by_date = {
+        str(row.get("date") or ""): row
+        for row in cash_rows
+        if isinstance(row, dict) and row.get("date")
+    }
+    field_map = {
+        "revenue": "revenue",
+        "netIncome": "net_income",
+        "operatingIncome": "operating_income",
+        "grossProfit": "gross_profit",
+        "epsDiluted": "diluted_eps",
+    }
+    cash_field_map = {
+        "freeCashFlow": "free_cash_flow",
+        "operatingCashFlow": "operating_cash_flow",
+        "capitalExpenditure": "capital_expenditure",
+    }
+    series: list[dict[str, Any]] = []
+    coverage: set[str] = set()
+    currency = "USD"
+    for income in income_rows:
+        if not isinstance(income, dict):
+            continue
+        date = str(income.get("date") or "")
+        cash = cash_by_date.get(date, {})
+        row: dict[str, Any] = {
+            "date": date,
+            "fiscal_year": str(income.get("calendarYear") or date[:4]),
+            "period": str(income.get("period") or ("FY" if period == "annual" else "")),
+        }
+        currency = str(income.get("reportedCurrency") or currency)
+        for source_field, output_field in field_map.items():
+            value = income.get(source_field)
+            if isinstance(value, (int, float)):
+                row[output_field] = float(value)
+                coverage.add(output_field)
+        for source_field, output_field in cash_field_map.items():
+            value = cash.get(source_field)
+            if isinstance(value, (int, float)):
+                row[output_field] = float(value)
+                coverage.add(output_field)
+        series.append(row)
+    series.sort(key=lambda row: str(row.get("date") or ""))
+    latest_period = series[-1].get("date") if series else None
+    return {
+        "provider": "fmp",
+        "ticker": ticker,
+        "period": period,
+        "currency": currency,
+        "unit": "reported_currency",
+        "coverage": coverage,
+        "series": series,
+        "source_refs": [
+            {
+                "source_id": f"fmp:{ticker}:financial-statements:{period}",
+                "source_type": "api",
+                "title": f"FMP {ticker} financial statements",
+                "provider": "FMP",
+                "period": str(latest_period or period),
+            }
+        ],
+    }
+
+
 def _fetch_fundamentals_fmp(ticker: str) -> dict[str, dict[str, Any]]:
     """Pull canonical fundamentals from FMP, normalized to millions."""
     api_key = (

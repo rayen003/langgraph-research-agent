@@ -1,10 +1,13 @@
-import type { RunStatus, StepState, DcfReviewState, DeckReviewState } from '../types'
+import type { RunStatus, StepState, DcfReviewState, DeckReviewState, MemoReviewState } from '../types'
 import type { ActivityEntry } from '../lib/activity'
+import type { TraceSpan } from '../lib/tracing'
 import { StepCard } from './StepCard'
 import { DcfHitlSection, DcfStepDetail, dcfStepName, hasDcfStepDetail } from './ActivityTrace'
 import { BlockStack } from './activity/BlockStack'
 import { DeckOutlineReview } from './DeckOutlineReview'
+import { MemoDraftReview } from './MemoDraftReview'
 import { PanelHideButton } from './PanelHideButton'
+import { RunTraceOverview } from './RunTraceOverview'
 
 interface Props {
   status: RunStatus
@@ -12,8 +15,11 @@ interface Props {
   completedSteps: number
   error: string | null
   activity?: ActivityEntry[]
+  executionTrace?: import('../types').ExecutionTraceStep[]
+  traceSpans?: TraceSpan[]
   dcfReview?: DcfReviewState
   deckReview?: DeckReviewState
+  memoReview?: MemoReviewState
   onApprove: () => void
   onReject: () => void
   threadId?: string | null
@@ -26,8 +32,11 @@ export function ExecutionSidebar({
   completedSteps,
   error,
   activity,
+  executionTrace = [],
+  traceSpans = [],
   dcfReview,
   deckReview,
+  memoReview,
   onApprove,
   onReject,
   threadId,
@@ -52,7 +61,8 @@ export function ExecutionSidebar({
   const isAwaitingPlan = status === 'awaiting_approval'
   const isAwaitingAssumptions = status === 'awaiting_assumptions'
   const isAwaitingOutlineReview = status === 'awaiting_outline_review'
-  const isAwaiting = isAwaitingPlan || isAwaitingAssumptions || isAwaitingOutlineReview
+  const isAwaitingMemoReview = status === 'awaiting_memo_review'
+  const isAwaiting = isAwaitingPlan || isAwaitingAssumptions || isAwaitingOutlineReview || isAwaitingMemoReview
   const isSynthesizing = status === 'synthesizing'
   const isComplete = status === 'complete'
   const isError = status === 'error'
@@ -105,6 +115,8 @@ export function ExecutionSidebar({
 
       {/* ── Step list ────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+
+        <RunTraceOverview trace={executionTrace} spans={traceSpans} />
 
         {/* Degraded banner (Phase 2) */}
         {isDegraded && (
@@ -194,7 +206,10 @@ export function ExecutionSidebar({
           {isAwaitingOutlineReview && deckReview && threadId && (
             <DeckOutlineReview review={deckReview} threadId={threadId} onApprove={onApprove} onReject={onReject} />
           )}
-          {!isAwaitingAssumptions && !isAwaitingOutlineReview && (
+          {isAwaitingMemoReview && memoReview && threadId && (
+            <MemoDraftReview review={memoReview} threadId={threadId} onApprove={onApprove} onReject={onReject} />
+          )}
+          {!isAwaitingAssumptions && !isAwaitingOutlineReview && !isAwaitingMemoReview && (
             <>
               <p className="text-[11px] text-ink-dim leading-relaxed">
                 {isAwaitingPlan
@@ -239,6 +254,9 @@ function CurrentStepLabel({
   }
   if (status === 'awaiting_outline_review') {
     return <p className="text-[11px] text-amber-500">Awaiting deck outline review</p>
+  }
+  if (status === 'awaiting_memo_review') {
+    return <p className="text-[11px] text-amber-500">Awaiting memo draft review</p>
   }
   if (status === 'awaiting_approval') {
     return <p className="text-[11px] text-zinc-700">Awaiting your approval</p>

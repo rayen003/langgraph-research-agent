@@ -27,18 +27,25 @@ except ImportError:  # LangGraph >=1.0 style
         raise Interrupt(payload)
 from pydantic import BaseModel, Field
 
-from documents import search_documents, _session_ctx, list_docs
+from documents import _session_ctx, list_docs
+from memory_context import format_memory_context_prompt
+from evidence_memory import format_evidence_pack_prompt
 from plan_store import save_plan as save_plan_to_store, update_step as store_update_step, save_report as store_save_report
 from storage import set_session_memory
 from tools import (
+    ALL_TOOLS,
     calculator,
     execute_python,
     fetch_sec_filing,
     query_knowledge_graph,
+    retrieve_context,
     retrieve_tool_result,
     run_dcf_workflow,
     search_web,
 )
+from capability_dispatch import get_capability_dispatcher
+from tool_catalog import select_capability_tools
+from tool_runtime import unwrap_tool_result_message
 import agent_log
 from utils import (
     console,
@@ -49,7 +56,6 @@ from utils import (
     get_dcf_hitl_payload,
     get_run_dir,
     list_artifact_paths,
-    track_tool,
 )
 
 dotenv.load_dotenv()
@@ -90,56 +96,12 @@ class PlanDraft(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Tools (canonical definitions in tools.py; research-only tools here)
+# Tools
 # ---------------------------------------------------------------------------
-
-from langchain_core.tools import tool as _tool
-
-
-@_tool
-def retrieve_context(step_id: str) -> str:
-    """Retrieve a prior step's summary and tool-result pointers from the saved plan."""
-    plans_dir = get_run_dir() / "plans"
-    if not plans_dir.exists():
-        return json.dumps({"step_id": step_id, "matches": []})
-    plan_files = sorted(plans_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for plan_file in plan_files:
-        try:
-            payload = json.loads(plan_file.read_text())
-        except json.JSONDecodeError:
-            continue
-        for step in payload.get("steps", []):
-            if step.get("id") == step_id:
-                return json.dumps(
-                    {
-                        "step_id": step_id,
-                        "matches": [
-                            {
-                                "step_id": step.get("id"),
-                                "description": step.get("description"),
-                                "status": step.get("status"),
-                                "result": step.get("result"),
-                                "tool_result_ids": step.get("tool_result_ids", []),
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                )
-    return json.dumps({"step_id": step_id, "matches": []}, ensure_ascii=False)
-
-
-TOOLS = [
-    calculator,
-    search_web,
-    retrieve_context,
-    retrieve_tool_result,
-    execute_python,
-    run_dcf_workflow,
-    search_documents,
-    fetch_sec_filing,
-    query_knowledge_graph,
-]
+TOOLS = select_capability_tools("research", ALL_TOOLS)
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+_CANONICAL_RESEARCH_TOOLS_BY_NAME = dict(TOOLS_BY_NAME)
+_CAPABILITY_DISPATCHER = get_capability_dispatcher()
 agent_llm = llm.bind_tools(TOOLS)
 
 
@@ -159,10 +121,12 @@ STATIC_SYSTEM_PROMPT = (
     "\n"
     "## Tool rules\n"
     "- query_knowledge_graph: your OWN structured memory — prior DCF runs (assumptions, outputs, scenarios), theses, company synthesis, drivers, fundamentals, filings, uploaded-doc facts. Multi-hop reasoning. For any ticker you've analyzed, query the KG FIRST (before search_web) for analytical/chained questions; it's cheaper and grounded in your own work. Returns a synthesized answer + a tool_result_id for the traversal trail.\n"
-    "- search_documents returns a RELEVANCE VERDICT, not raw text chunks:\n"
-    "  {\"status\": \"relevant\"|\"partial\"|\"mismatch\"|\"none\", \"covered\": [...], \"missing\": [...], \"chunk_ids\": [...]}\n"
-    "  * status='relevant': docs cover everything needed. Fetch chunks with retrieve_tool_result(chunk_id).\n"
-    "  * status='partial': docs cover SOME of what was asked. Fetch relevant chunks, then use search_web for the missing topics.\n"
+    "- search_documents returns a RELEVANCE VERDICT with relevant passages INLINE:\n"
+    "  {\"status\": \"relevant\"|\"partial\"|\"mismatch\"|\"none\", \"covered\": [...], \"missing\": [...], \"chunks\": [{\"text\": \"...\", \"citation_id\": \"doc:...\", \"citation_label\": \"...\"}]}\n"
+    "  The chunks array already contains full passage text. There is NO separate fetch step and NO retrieve_tool_result(chunk_id).\n"
+    "  When any claim comes from uploaded documents, cite it inline with the exact citation_id, e.g. [doc:doc_abc:p12:c4].\n"
+    "  * status='relevant': docs cover everything needed. Answer directly from chunks with citation_id markers.\n"
+    "  * status='partial': docs cover SOME of what was asked. Use chunks with citation_id markers, then use search_web for missing topics.\n"
     "  * status='mismatch': docs are about DIFFERENT entities than the query. STOP and tell the user:\n"
     "    'The uploaded documents appear to be about [company from docs], but you asked about [user's company]. Which should I analyze?'\n"
     "    Do NOT silently fall back to search_web. Ask the user.\n"
@@ -260,6 +224,8 @@ def build_step_message(
     next_step: str,
     context_stack_formatted: str,
     user_settings: dict | None = None,
+    memory_context: dict | None = None,
+    evidence_pack: dict | None = None,
 ) -> str:
     deps = step.get("depends_on", [])
     dep_text = ", ".join(deps) if deps else "none"
@@ -279,6 +245,8 @@ def build_step_message(
         f"Dependencies:  {dep_text}\n\n"
         f"## Context stack (prior step summaries)\n"
         f"{context_stack_formatted}\n\n"
+        f"{format_memory_context_prompt(memory_context)}"
+        f"{format_evidence_pack_prompt(evidence_pack)}"
         f"{_format_user_settings(user_settings)}"
         f"{fb_line}"
         f"{dep_instruction}"
@@ -296,12 +264,16 @@ def execute_step(
     next_step: str,
     context_stack: list[dict],
     user_settings: dict | None = None,
+    memory_context: dict | None = None,
+    evidence_pack: dict | None = None,
 ) -> tuple[str, list[str]]:
     context_stack_formatted = _format_context_stack(context_stack)
     step_message = build_step_message(
         objective, step, review_feedback,
         plan_trajectory, previous_step, next_step, context_stack_formatted,
         user_settings,
+        memory_context,
+        evidence_pack,
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=STATIC_SYSTEM_PROMPT),
@@ -342,8 +314,8 @@ def execute_step(
         if not response.tool_calls:
             break
 
+        dispatch_calls: list[dict] = []
         for tc in response.tool_calls:
-            tool_fn = TOOLS_BY_NAME.get(tc["name"])
             args = _normalize_tool_args(tc.get("args", {}))
             if tc["name"] == "run_dcf_workflow":
                 args.setdefault("parent_step_id", step["id"])
@@ -356,50 +328,44 @@ def execute_step(
                 format_tool_error(tc["name"], f"budget exhausted ({search_count}/{MAX_SEARCHES_PER_STEP})")
                 messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
                 continue
-
-            args_preview = json.dumps(args, ensure_ascii=False)[:150]
             format_tool_call(tc["name"], args)
-            if not tool_fn:
-                result = json.dumps({"error": f"unknown tool: {tc['name']}"})
-                format_tool_error(tc["name"], "unknown tool")
-                # Emit a started+error span so the unknown tool still
-                # appears in the activity log.
-                try:
-                    with track_tool(
-                        name=tc["name"],
-                        scope="research",
-                        step_id=step["id"],
-                        args_preview=args_preview,
-                    ):
-                        raise RuntimeError("unknown tool")
-                except RuntimeError:
-                    pass
+            dispatch_calls.append({
+                **tc,
+                "args": args,
+                "type": "tool_call",
+            })
+
+        overrides = {
+            name: tool
+            for name, tool in TOOLS_BY_NAME.items()
+            if tool is not _CANONICAL_RESEARCH_TOOLS_BY_NAME.get(name)
+        }
+        dispatched = _CAPABILITY_DISPATCHER.invoke(
+            dispatch_calls,
+            surface="research",
+            context={
+                "session_id": _session_ctx.get(),
+                "tool_execution_context": {"scope": "research", "step_id": step["id"]},
+            },
+            tool_overrides=overrides or None,
+        )
+        for wrapped in dispatched:
+            message = unwrap_tool_result_message(wrapped)
+            result = str(message.content)
+            name = str(message.name or "")
+            if name == "search_web" and message.status != "error":
+                search_count += 1
+            if message.status == "error":
+                format_tool_error(name, result)
             else:
-                try:
-                    with track_tool(
-                        name=tc["name"],
-                        scope="research",
-                        step_id=step["id"],
-                        args_preview=args_preview,
-                    ) as span:
-                        result = tool_fn.invoke(args)
-                        format_tool_result(result)
-                        if tc["name"] == "search_web":
-                            search_count += 1
-                        evt_summary = ""
-                        try:
-                            parsed = json.loads(result)
-                            if isinstance(parsed, dict):
-                                if parsed.get("tool_result_id"):
-                                    tool_result_ids.add(parsed["tool_result_id"])
-                                evt_summary = parsed.get("summary", "")
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                        span["summary"] = evt_summary
-                except Exception as e:
-                    result = json.dumps({"error": str(e)})
-                    format_tool_error(tc["name"], str(e))
-            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                format_tool_result(result)
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict) and parsed.get("tool_result_id"):
+                    tool_result_ids.add(str(parsed["tool_result_id"]))
+            except (json.JSONDecodeError, TypeError):
+                pass
+            messages.append(message)
 
     from graphs.workflows.dcf.payload import extract_dcf_report_from_tool_pointer  # noqa: PLC0415
 
@@ -505,6 +471,8 @@ def plan_node(state: dict) -> dict:
             "don't repeat work already done):\n"
             f"{prior}\n"
         )
+    memory_section += format_memory_context_prompt(state.get("memory_context"))
+    memory_section += format_evidence_pack_prompt(state.get("evidence_pack"))
 
     # ── Document inventory: surface uploaded docs to the planner ──────────
     doc_context = ""
@@ -561,6 +529,16 @@ def plan_node(state: dict) -> dict:
 
     plan = Plan(query=str(query), steps=steps).model_dump()
     plan_path = save_plan_to_store(get_run_dir().name, plan)
+    from graphs.research_persistence import persist_draft_plan, persist_research_context  # noqa: PLC0415
+
+    persistence_state = {
+        **state,
+        "thread_id": get_run_dir().name,
+        "objective": str(query),
+    }
+    context_object = persist_research_context(persistence_state)
+    persistence_state["research_context_version_id"] = context_object["version_id"]
+    plan_object = persist_draft_plan(persistence_state, plan)
     return {
         "plan": plan,
         "plan_path": plan_path,
@@ -568,6 +546,12 @@ def plan_node(state: dict) -> dict:
         "approved": False,
         "review_feedback": None,
         "context_stack": [],
+        "research_context_version_id": context_object["version_id"],
+        "plan_version_id": plan_object["version_id"],
+        "approved_plan_version_id": None,
+        "step_result_version_ids": {},
+        "report_version_id": None,
+        "report_path": None,
     }
 
 
@@ -594,7 +578,25 @@ def review_plan_node(state: dict) -> dict:
     if approved:
         plan["status"] = "approved"
         plan_path = save_plan_to_store(get_run_dir().name, plan)
-    return {"approved": approved, "plan": plan, "plan_path": plan_path, "review_feedback": feedback}
+    approved_version_id = None
+    if approved and state.get("research_context_version_id"):
+        from graphs.research_persistence import persist_approved_plan  # noqa: PLC0415
+
+        plan_object = persist_approved_plan(
+            state,
+            plan,
+            actor_id=str(decision.get("actor_id") or "user:hitl"),
+            decision=action,
+        )
+        approved_version_id = plan_object["version_id"]
+    return {
+        "approved": approved,
+        "plan": plan,
+        "plan_path": plan_path,
+        "review_feedback": feedback,
+        "plan_version_id": approved_version_id or state.get("plan_version_id"),
+        "approved_plan_version_id": approved_version_id,
+    }
 
 
 def execute_one_step_node(state: dict) -> dict:
@@ -665,6 +667,8 @@ def execute_one_step_node(state: dict) -> dict:
             next_step="none",
             context_stack=context_stack,
             user_settings=state.get("user_settings") or {},
+            memory_context=state.get("memory_context"),
+            evidence_pack=state.get("evidence_pack"),
         )
         result_text = _clean_step_output(result_text)
 
@@ -681,6 +685,16 @@ def execute_one_step_node(state: dict) -> dict:
             "summary": summary,
             "tool_result_ids": tool_result_ids,
         })
+        step_versions = dict(state.get("step_result_version_ids") or {})
+        if state.get("approved_plan_version_id"):
+            from graphs.research_persistence import persist_step_result  # noqa: PLC0415
+
+            step_object = persist_step_result(
+                state,
+                step=step,
+                tool_result_ids=tool_result_ids,
+            )
+            step_versions[step["id"]] = step_object["version_id"]
 
         agent_log.step_done(step["id"], result_text.strip(), _step_resume_t)
         emit_ui_event({
@@ -694,6 +708,7 @@ def execute_one_step_node(state: dict) -> dict:
             "plan": plan,
             "messages": [AIMessage(content=f"[{step['id']}] {result_text}")],
             "context_stack": context_stack,
+            "step_result_version_ids": step_versions,
         }
 
     # ── Normal execution ───────────────────────────────────────────────
@@ -747,6 +762,8 @@ def execute_one_step_node(state: dict) -> dict:
         next_step=next_step,
         context_stack=context_stack,
         user_settings=state.get("user_settings") or {},
+        memory_context=state.get("memory_context"),
+        evidence_pack=state.get("evidence_pack"),
     )
     result_text = _clean_step_output(result_text)
 
@@ -786,6 +803,16 @@ def execute_one_step_node(state: dict) -> dict:
         "summary": summary,
         "tool_result_ids": tool_result_ids,
     })
+    step_versions = dict(state.get("step_result_version_ids") or {})
+    if state.get("approved_plan_version_id"):
+        from graphs.research_persistence import persist_step_result  # noqa: PLC0415
+
+        step_object = persist_step_result(
+            state,
+            step=step,
+            tool_result_ids=tool_result_ids,
+        )
+        step_versions[step["id"]] = step_object["version_id"]
 
     agent_log.step_done(step["id"], result_text.strip(), _step_start_t)
     emit_ui_event({
@@ -804,6 +831,7 @@ def execute_one_step_node(state: dict) -> dict:
         "plan": plan,
         "messages": [AIMessage(content=f"[{step['id']}] {result_text}")],
         "context_stack": context_stack,
+        "step_result_version_ids": step_versions,
     }
 
 
@@ -864,10 +892,21 @@ def synthesize_node(state: dict) -> dict:
         str(objective),
         final_markdown,
     )
+    from graphs.research_persistence import persist_research_report  # noqa: PLC0415
+
+    report_object = persist_research_report(
+        state,
+        content=final_markdown,
+        report_path=report_path,
+    )
     agent_log.synth_done(str(report_path), _synth_t)
     emit_ui_event({"type": "synthesis_complete", "content": final_text, "artifact_paths": artifact_paths})
 
-    return {"messages": [AIMessage(content=final_text)]}
+    return {
+        "messages": [AIMessage(content=final_text)],
+        "report_path": report_path,
+        "report_version_id": report_object["version_id"],
+    }
 
 
 def update_memory_node(state: dict) -> dict:

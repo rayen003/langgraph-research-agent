@@ -22,6 +22,7 @@ from activity import (
     ActivityStatus,
     make_activity,
 )
+from tracing import current_span_id, current_trace_id, emit_trace_span, make_trace_span
 
 console = Console()
 BASE_DIR = Path(__file__).parent
@@ -147,6 +148,8 @@ def emit_activity(
     confidence_label: str | None = None,
     flag_count: int | None = None,
     error: str | None = None,
+    detail: dict[str, Any] | None = None,
+    review_ref: dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
 ) -> None:
     """Fire a normalized activity event over the UI bus.
@@ -170,6 +173,8 @@ def emit_activity(
         confidence_label=confidence_label,
         flag_count=flag_count,
         error=error,
+        detail=detail,
+        review_ref=review_ref,
         meta=meta,
     )
     emit_ui_event(payload)
@@ -180,6 +185,7 @@ def track_tool(
     *,
     name: str,
     scope: ActivityScope,
+    activity_id: str | None = None,
     step_id: str | None = None,
     args_preview: str | None = None,
     parent_activity_id: str | None = None,
@@ -197,8 +203,10 @@ def track_tool(
             result = tool_fn.invoke(args)
             span["summary"] = parsed_summary
     """
-    activity_id = f"tool_{uuid4().hex[:12]}"
+    activity_id = activity_id or f"tool_{uuid4().hex[:12]}"
     started_at = time.time()
+    trace_id = current_trace_id()
+    parent_span_id = current_span_id()
     span: dict[str, Any] = {
         "summary": "",
         "meta": None,
@@ -217,10 +225,21 @@ def track_tool(
         parent_activity_id=parent_activity_id,
         display_label=display_label,
     )
+    emit_trace_span(make_trace_span(
+        trace_id=trace_id,
+        span_id=activity_id,
+        parent_span_id=parent_span_id,
+        category="tool",
+        name=name,
+        status="started",
+        started_at=started_at,
+        metadata={"scope": scope, "step_id": step_id, "args_preview": args_preview or ""},
+    ))
 
     try:
         yield span
     except Exception as exc:  # noqa: BLE001
+        ended_at = time.time()
         emit_activity(
             activity_id=activity_id,
             kind="tool",
@@ -229,29 +248,64 @@ def track_tool(
             status="error",
             step_id=step_id,
             started_at=started_at,
-            ended_at=time.time(),
+            ended_at=ended_at,
             error=str(exc),
             args_preview=span.get("args_preview"),
             parent_activity_id=parent_activity_id,
             display_label=display_label,
         )
+        emit_trace_span(make_trace_span(
+            trace_id=trace_id,
+            span_id=activity_id,
+            parent_span_id=parent_span_id,
+            category="tool",
+            name=name,
+            status="error",
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_ms=(ended_at - started_at) * 1000,
+            metadata={"scope": scope, "step_id": step_id, "args_preview": span.get("args_preview") or ""},
+            error=f"{type(exc).__name__}: {exc}",
+        ))
         raise
     else:
+        ended_at = time.time()
+        terminal_error = str(span.get("error") or "")
+        terminal_status = "error" if span.get("status") == "error" else "completed"
         emit_activity(
             activity_id=activity_id,
             kind="tool",
             name=name,
             scope=scope,
-            status="completed",
+            status=terminal_status,
             step_id=step_id,
             started_at=started_at,
-            ended_at=time.time(),
+            ended_at=ended_at,
             summary=span.get("summary") or "",
             args_preview=span.get("args_preview"),
             meta=span.get("meta"),
+            error=terminal_error or None,
             parent_activity_id=parent_activity_id,
             display_label=display_label,
         )
+        emit_trace_span(make_trace_span(
+            trace_id=trace_id,
+            span_id=activity_id,
+            parent_span_id=parent_span_id,
+            category="tool",
+            name=name,
+            status=terminal_status,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_ms=(ended_at - started_at) * 1000,
+            metadata={
+                "scope": scope,
+                "step_id": step_id,
+                "args_preview": span.get("args_preview") or "",
+                "summary": span.get("summary") or "",
+            },
+            error=terminal_error or None,
+        ))
 
 
 @contextlib.contextmanager
@@ -463,10 +517,22 @@ def resolve_deck_output_path(thread_id: str) -> Path | None:
     return None
 
 
-def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -> str:
+def persist_tool_result(
+    tool_name: str,
+    args: dict,
+    result: str,
+    summary: str,
+    *,
+    manifest: dict | None = None,
+) -> str:
     result_id = f"{tool_name}_{uuid4().hex[:12]}"
     tool_dir = get_run_dir() / "tool_results"
     tool_dir.mkdir(parents=True, exist_ok=True)
+    safe_manifest = {
+        key: value
+        for key, value in (manifest or {}).items()
+        if key not in {"tool_result_id", "tool_name", "created_at", "args", "summary", "result", "stored_at"}
+    }
     payload = {
         "tool_result_id": result_id,
         "tool_name": tool_name,
@@ -474,6 +540,7 @@ def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -
         "args": args,
         "summary": summary,
         "result": result,
+        **safe_manifest,
     }
     file_path = tool_dir / f"{result_id}.json"
     file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -484,6 +551,7 @@ def persist_tool_result(tool_name: str, args: dict, result: str, summary: str) -
             "summary": summary,
             "stored_at": str(file_path),
             "hint": "Call retrieve_tool_result with this tool_result_id to read the full content.",
+            **safe_manifest,
         },
         ensure_ascii=False,
     )

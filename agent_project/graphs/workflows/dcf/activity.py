@@ -4,21 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import agent_log
-from utils import emit_activity, emit_ui_event
-
-# Map internal step-status strings to the ActivityStatus literal.
-_ACTIVITY_STATUS_MAP: dict[str, str] = {
-    "start": "started",
-    "complete": "completed",
-    "skipped": "skipped",
-    "awaiting_input": "awaiting_input",
-    "edited": "completed",
-    "approved": "completed",
-    "rejected": "error",
-    "fallback": "completed",
-}
-
+from utils import emit_ui_event
+from workflow_activity import emit_workflow, emit_workflow_step
 
 def emit_step(
     step: str,
@@ -34,39 +21,15 @@ def emit_step(
     Prefers ``summary_line`` from payload for human-readable display;
     falls back to well-known keys (ticker, rows, implied_share_price).
     """
-    activity_status = _ACTIVITY_STATUS_MAP.get(status, "completed")
-    summary = ""
-    meta: dict[str, Any] | None = None
-    if payload:
-        # Prefer explicit summary_line, fall back to auto-generated summary
-        if "summary_line" in payload:
-            summary = str(payload.pop("summary_line"))
-        elif "ticker" in payload:
-            summary = f"ticker={payload['ticker']}"
-        elif "rows" in payload:
-            summary = f"{payload['rows']} rows"
-        elif "implied_share_price" in payload:
-            summary = f"implied ${payload['implied_share_price']:.2f}"
-        meta = dict(payload)
-
-    # ── Terminal log ────────────────────────────────────────────────────────
-    if status == "start":
-        agent_log.dcf_step_start(step, parent_step_id, summary)
-    else:
-        agent_log.dcf_step_done(step, parent_step_id, summary, activity_status)
-
-    emit_activity(
-        activity_id=f"dcf_{parent_step_id}_{step}",
-        kind="workflow_step",
-        name=f"workflow:dcf:{step}",
-        scope="workflow",
-        status=activity_status,
-        step_id=parent_step_id,
-        parent_activity_id=f"workflow_dcf_{parent_step_id}",
-        summary=summary or None,
-        meta=meta,
-        error=str(payload.get("error")) if status == "rejected" and payload else None,
-    )
+    normalized = dict(payload or {})
+    if "summary_line" not in normalized:
+        if "ticker" in normalized:
+            normalized["summary_line"] = f"ticker={normalized['ticker']}"
+        elif "rows" in normalized:
+            normalized["summary_line"] = f"{normalized['rows']} rows"
+        elif "implied_share_price" in normalized:
+            normalized["summary_line"] = f"implied ${normalized['implied_share_price']:.2f}"
+    emit_workflow_step(workflow="dcf", step=step, status=status, parent_step_id=parent_step_id, payload=normalized)
 
 
 def emit_review_substep(
@@ -81,30 +44,9 @@ def emit_review_substep(
     so the frontend groups review_deep_dive / synthesize_adjustments *inside*
     the review_subgraph row rather than at the top-level DCF group.
     """
-    activity_status = _ACTIVITY_STATUS_MAP.get(status, "completed")
-    summary = ""
-    meta: dict[str, Any] | None = None
-    if payload:
-        if "summary_line" in payload:
-            summary = str(payload.pop("summary_line"))
-        meta = dict(payload)
-
-    if status == "start":
-        agent_log.dcf_step_start(step, workflow_parent_step_id, summary)
-    else:
-        agent_log.dcf_step_done(step, workflow_parent_step_id, summary, activity_status)
-
-    emit_activity(
-        activity_id=f"dcf_{workflow_parent_step_id}_{step}",
-        kind="workflow_step",
-        name=f"workflow:dcf:{step}",
-        scope="workflow",
-        status=activity_status,
-        step_id=workflow_parent_step_id,
-        # Key difference: parent is the review_subgraph activity, not the workflow
-        parent_activity_id=f"dcf_{workflow_parent_step_id}_review_subgraph",
-        summary=summary or None,
-        meta=meta,
+    emit_workflow_step(
+        workflow="dcf", step=step, status=status, parent_step_id=workflow_parent_step_id,
+        payload=payload, parent_activity_id=f"dcf_{workflow_parent_step_id}_review_subgraph",
     )
 
 
@@ -128,21 +70,7 @@ def emit_workflow_terminal(
     Carries ``confidence_label`` and ``flag_count`` so the frontend can
     render trust signals without parsing the full output payload.
     """
-    summary = None
-    meta = dict(payload) if payload else None
-    if payload and "implied_share_price" in payload:
-        summary = f"implied ${payload['implied_share_price']:.2f}"
-    elif payload and "summary_line" in payload:
-        summary = str(payload.pop("summary_line"))
-    emit_activity(
-        activity_id=f"workflow_dcf_{parent_step_id}",
-        kind="workflow",
-        name="workflow:dcf",
-        scope="workflow",
-        status=status,  # type: ignore[arg-type]
-        step_id=parent_step_id,
-        summary=summary,
-        confidence_label=payload.get("confidence_label") if payload else None,
-        flag_count=payload.get("flag_count") if payload else None,
-        meta=meta,
-    )
+    normalized = dict(payload or {})
+    if "summary_line" not in normalized and "implied_share_price" in normalized:
+        normalized["summary_line"] = f"implied ${normalized['implied_share_price']:.2f}"
+    emit_workflow(workflow="dcf", parent_step_id=parent_step_id, status=status, payload=normalized)

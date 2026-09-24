@@ -107,6 +107,7 @@ def _extract_candidates_from_text(
 def _infer_assumptions_from_documents(
     session_id: str,
     ticker: str,
+    selected_doc_ids: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Search uploaded documents for assumption hints."""
     if not session_id:
@@ -121,7 +122,7 @@ def _infer_assumptions_from_documents(
             f"{ticker} DCF valuation assumptions revenue growth FCFF margin WACC "
             "terminal growth tax rate net debt shares outstanding"
         )
-        results = hybrid_search(query, session_id, n_results=6)
+        results = hybrid_search(query, session_id, n_results=6, doc_ids=selected_doc_ids)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "DCF document assumptions unavailable session_id=%s error=%s",
@@ -303,6 +304,8 @@ def build_assumptions_node(state: dict) -> dict:
     assumptions, provenance = _default_assumptions()
     ticker = state["ticker"]
     session_id = state.get("session_id") or ""
+    workflow_context = state.get("workflow_context") or {}
+    selected_doc_ids = workflow_context.get("selected_doc_ids") if isinstance(workflow_context, dict) else None
     allow_external = bool(state.get("allow_external_assumptions", True))
     fundamentals = state.get("fundamentals") or {}
 
@@ -318,7 +321,11 @@ def build_assumptions_node(state: dict) -> dict:
     web_candidates_raw = (
         _infer_assumptions_from_web(ticker) if allow_external else {}
     )
-    doc_candidates_raw = _infer_assumptions_from_documents(session_id, ticker)
+    doc_candidates_raw = _infer_assumptions_from_documents(
+        session_id,
+        ticker,
+        selected_doc_ids=selected_doc_ids if isinstance(selected_doc_ids, list) else None,
+    )
 
     web_candidates, web_conflicts = _filter_tier_a_conflicts(
         web_candidates_raw, canonical_fields,

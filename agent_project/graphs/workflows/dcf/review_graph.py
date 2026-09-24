@@ -24,6 +24,7 @@ from typing import Any
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from tracing import traced_node
 
 from .activity import emit_review_substep
 from .review_state import ReviewFindings, ReviewState, ScenarioFinding
@@ -795,8 +796,8 @@ def synthesize_adjustments_node(state: ReviewState) -> dict:
 # ---------------------------------------------------------------------------
 
 _review_graph = StateGraph(ReviewState)
-_review_graph.add_node("review_deep_dive", review_deep_dive_node)
-_review_graph.add_node("synthesize_adjustments", synthesize_adjustments_node)
+_review_graph.add_node("review_deep_dive", traced_node("dcf.review_deep_dive", review_deep_dive_node))
+_review_graph.add_node("synthesize_adjustments", traced_node("dcf.synthesize_adjustments", synthesize_adjustments_node))
 
 _review_graph.add_edge(START, "review_deep_dive")
 _review_graph.add_edge("review_deep_dive", "synthesize_adjustments")

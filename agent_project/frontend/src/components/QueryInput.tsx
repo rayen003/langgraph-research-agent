@@ -3,9 +3,9 @@ import type { DocumentInfo, Mode } from '../types'
 import { AttachmentChip } from './AttachmentChip'
 
 const MODE_OPTIONS: { value: Mode; label: string; hint: string }[] = [
-  { value: 'auto', label: 'Auto', hint: 'Automatically decides research or chat' },
-  { value: 'research', label: 'Research', hint: 'Full research plan with HITL approval' },
   { value: 'chat', label: 'Chat', hint: 'Quick conversational answer' },
+  { value: 'auto', label: 'Auto', hint: 'Intent routing disabled for now' },
+  { value: 'research', label: 'Research', hint: 'Disabled while workflow UX is rebuilt' },
 ]
 
 const MODE_ICON: Record<Mode, React.ReactNode> = {
@@ -81,9 +81,11 @@ export function QueryInput({
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
+  const hasUnreadyAttachments = docs.some(doc => doc.status !== 'ready')
+
   const submit = () => {
     const q = value.trim()
-    if (!q || disabled || sendingAttachments) return
+    if (!q || disabled || sendingAttachments || hasUnreadyAttachments) return
 
     const send = () => {
       onSubmit(q, mode)
@@ -169,15 +171,23 @@ export function QueryInput({
 
             {modeOpen && (
               <div className="absolute bottom-full mb-2 left-0 w-52 bg-bg-overlay border border-border-hover rounded-xl overflow-hidden shadow-xl shadow-black/60 z-[100] animate-fade-up">
-                {MODE_OPTIONS.map(opt => (
+                {MODE_OPTIONS.map(opt => {
+                  const unavailable = opt.value !== 'chat'
+                  return (
                   <button
                     key={opt.value}
                     type="button"
-                    onClick={() => { onModeChange(opt.value); setModeOpen(false) }}
+                    disabled={unavailable}
+                    onClick={() => {
+                      if (unavailable) return
+                      onModeChange(opt.value)
+                      setModeOpen(false)
+                    }}
                     className={`
                       w-full flex items-start gap-2.5 px-3 py-2.5 text-left
-                      hover:bg-bg-raised transition-colors duration-100
+                      transition-colors duration-100
                       ${opt.value === mode ? 'bg-bg-raised' : ''}
+                      ${unavailable ? 'opacity-45 cursor-not-allowed' : 'hover:bg-bg-raised'}
                     `}
                   >
                     <span className={`mt-0.5 flex-shrink-0 ${opt.value === mode ? 'text-accent' : 'text-ink-disabled'}`}>
@@ -195,7 +205,8 @@ export function QueryInput({
                       </svg>
                     )}
                   </button>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>
@@ -259,11 +270,11 @@ export function QueryInput({
           <button
             type="button"
           onClick={submit}
-          disabled={disabled || sendingAttachments || !value.trim()}
+          disabled={disabled || sendingAttachments || hasUnreadyAttachments || !value.trim()}
             className={`
               flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center
               transition-all duration-150 mb-0.5
-              ${value.trim() && !disabled
+              ${value.trim() && !disabled && !hasUnreadyAttachments
                 ? 'bg-accent hover:opacity-90'
                 : 'bg-surface-2 opacity-40 cursor-not-allowed'
               }
@@ -277,7 +288,9 @@ export function QueryInput({
       </div>
 
       <p className="mt-2 text-center text-[11px] text-ink-disabled">
-        Enter to submit · Shift+Enter for new line
+        {hasUnreadyAttachments
+          ? 'Documents are indexing. Send is available once embeddings are ready.'
+          : 'Enter to submit · Shift+Enter for new line'}
       </p>
     </div>
   )

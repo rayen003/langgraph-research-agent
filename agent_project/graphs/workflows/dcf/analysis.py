@@ -579,7 +579,13 @@ def analysis_node(state: dict) -> dict:
 
         # Apply justified adjustments
         adj = position.adjustment
-        if adj and position.position == "EXPLAINED" and adj.field in new_assumptions:
+        from .state import is_user_locked_assumption  # noqa: PLC0415
+        if (
+            adj
+            and position.position == "EXPLAINED"
+            and adj.field in new_assumptions
+            and not is_user_locked_assumption(state.get("assumption_provenance") or {}, adj.field)
+        ):
             delta = _clamp_adjustment(adj.field, adj.delta)
             if delta != 0.0:
                 old = new_assumptions[adj.field]

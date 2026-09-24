@@ -36,7 +36,19 @@ export interface ActivityEvent {
   confidence_label?: string
   flag_count?: number
   error?: string
+  detail?: ActivityDetail
+  review_ref?: Record<string, unknown>
   meta?: Record<string, unknown>
+}
+
+export interface ActivityDetail {
+  inputs?: Record<string, unknown>
+  outputs?: Record<string, unknown>
+  evidence_refs?: unknown[]
+  artifact_refs?: unknown[]
+  object_refs?: unknown[]
+  metrics?: Record<string, unknown>
+  notes?: string[]
 }
 
 // Frontend-side aggregation: a single Activity can receive multiple
@@ -58,6 +70,8 @@ export interface ActivityEntry {
   confidence_label?: string
   flag_count?: number
   error?: string
+  detail?: ActivityDetail
+  review_ref?: Record<string, unknown>
   meta?: Record<string, unknown>
 }
 
@@ -108,6 +122,8 @@ export function mergeActivity(
     confidence_label: event.confidence_label,
     flag_count: event.flag_count,
     error: event.error,
+    detail: event.detail,
+    review_ref: event.review_ref,
     meta: event.meta,
   }
 
@@ -124,6 +140,8 @@ export function mergeActivity(
     confidence_label: incoming.confidence_label ?? prev.confidence_label,
     flag_count: incoming.flag_count ?? prev.flag_count,
     error: incoming.error ?? prev.error,
+    detail: incoming.detail ?? prev.detail,
+    review_ref: incoming.review_ref ?? prev.review_ref,
     meta: incoming.meta ?? prev.meta,
   }
   const next = [...entries]

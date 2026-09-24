@@ -11,7 +11,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from .activity import emit_step
-from .state import DCFState
+from .state import DCFState, is_user_locked_assumption
 from .wacc import clip_wacc_to_profile_band, append_wacc_stack_delta
 
 logger = logging.getLogger(__name__)
@@ -278,6 +278,8 @@ def refine_assumptions_node(state: DCFState) -> dict:
 
     changes: list[str] = []
     for field, delta in adjustments.items():
+        if is_user_locked_assumption(provenance, field):
+            continue
         if field in assumptions:
             old = assumptions[field]
             new_value = round(old + delta, 4)

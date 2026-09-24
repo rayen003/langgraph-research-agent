@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
+import { Pause } from 'lucide-react'
 import type { ConfidenceBreakdown, DcfReviewState, EvidenceItem, StepState, ToolCall } from '../types'
 import type { ActivityEntry, ActivityScope } from '../lib/activity'
 import { activityStatusToToolStatus } from '../lib/activity'
@@ -64,11 +65,8 @@ type RowItem = FlatRow | WorkflowGroup
 
 function groupActivities(entries: ActivityEntry[], scope?: ActivityScope): RowItem[] {
   const safe = Array.isArray(entries) ? entries : []
-  // Inline chat (scope='chat') shows ONLY the agent's own tool calls — workflow
-  // substeps live in the right-bar BlockStack, so don't duplicate them here.
-  // Research/other scopes still fold in workflow steps (no separate panel).
   const filtered = scope
-    ? safe.filter(e => e.scope === scope || (scope !== 'chat' && e.scope === 'workflow'))
+    ? safe.filter(e => e.scope === scope || e.scope === 'workflow')
     : safe
 
   // Pass 1 — build childrenByParent for ALL parent_activity_ids (two levels)
@@ -1517,6 +1515,119 @@ function fmtDuration(ms: number): string {
   return `${m}m ${rs}s`
 }
 
+function auditValue(value: unknown): string {
+  if (value == null) return '—'
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    const text = JSON.stringify(value)
+    return text.length > 180 ? `${text.slice(0, 177)}…` : text
+  } catch {
+    return String(value)
+  }
+}
+
+function AuditFields({ title, values }: { title: string; values?: Record<string, unknown> }) {
+  if (!values || Object.keys(values).length === 0) return null
+  return (
+    <div>
+      {title && <div className="mb-1 text-[9px] uppercase tracking-widest text-ink-dim">{title}</div>}
+      <dl className="grid grid-cols-[minmax(7rem,auto)_1fr] gap-x-3 gap-y-1 text-[10px]">
+        {Object.entries(values).slice(0, 16).map(([key, value]) => (
+          <div key={key} className="contents">
+            <dt className="text-ink-dim">{key.replace(/_/g, ' ')}</dt>
+            <dd className="min-w-0 break-words text-ink-muted">{auditValue(value)}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function RecordedData({ values }: { values?: Record<string, unknown> }) {
+  if (!values || Object.keys(values).length === 0) return null
+  const entries = Object.entries(values).slice(0, 16)
+  const scalars = Object.fromEntries(entries.filter(([, value]) => value == null || ['string', 'number', 'boolean'].includes(typeof value)))
+  const complex = entries.filter(([, value]) => value != null && !['string', 'number', 'boolean'].includes(typeof value))
+  return (
+    <div className="space-y-3">
+      <AuditFields title="Recorded data" values={scalars} />
+      {complex.map(([key, value]) => (
+        <div key={key}>
+          <div className="mb-1 text-[9px] uppercase tracking-widest text-ink-dim">{key.replace(/_/g, ' ')}</div>
+          {Array.isArray(value) ? (
+            <ul className="space-y-1 text-[10px] leading-relaxed text-ink-muted">
+              {value.slice(0, 8).map((item, index) => (
+                <li key={index} className="flex items-start gap-2">
+                  <span className="mt-[0.45rem] h-1 w-1 shrink-0 rounded-full bg-zinc-600" />
+                  {item && typeof item === 'object' && !Array.isArray(item) ? (
+                    <span className="min-w-0 space-x-2 break-words">
+                      {Object.entries(item as Record<string, unknown>).slice(0, 5).map(([itemKey, itemValue]) => (
+                        <span key={itemKey}>
+                          <span className="text-ink-dim">{itemKey.replace(/_/g, ' ')} </span>
+                          <span>{auditValue(itemValue)}</span>
+                        </span>
+                      ))}
+                    </span>
+                  ) : (
+                    <span className="min-w-0 break-words">{auditValue(item)}</span>
+                  )}
+                </li>
+              ))}
+              {value.length > 8 && <li className="text-ink-dim">{value.length - 8} more</li>}
+            </ul>
+          ) : typeof value === 'object' ? (
+            <AuditFields title="" values={value as Record<string, unknown>} />
+          ) : null}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AuditRefs({ title, refs }: { title: string; refs?: unknown[] }) {
+  if (!refs?.length) return null
+  return (
+    <div>
+      <div className="mb-1 text-[9px] uppercase tracking-widest text-ink-dim">{title}</div>
+      <div className="space-y-1 font-mono text-[10px] text-ink-muted">
+        {refs.slice(0, 12).map((ref, index) => <div key={index} className="break-all">{auditValue(ref)}</div>)}
+      </div>
+    </div>
+  )
+}
+
+function WorkflowAuditDetail({ entry, includeMetadata }: { entry: ActivityEntry; includeMetadata: boolean }) {
+  const detail = entry.detail
+  const duration = entry.started_at != null && entry.ended_at != null
+    ? fmtDuration((entry.ended_at - entry.started_at) * 1000)
+    : null
+  const genericMeta = entry.meta && Object.keys(entry.meta).length > 0
+    ? Object.fromEntries(Object.entries(entry.meta).filter(([key]) => ![
+        'items', 'evidence_items', 'scenario_results', 'scenarios', 'sensitivity',
+        'iterations', 'initial', 'final', 'flags', 'adjustments',
+      ].includes(key)))
+    : undefined
+
+  return (
+    <div className="space-y-3">
+      <AuditFields title="Execution" values={{ status: entry.status, duration, summary: entry.summary || undefined }} />
+      <AuditFields title="Inputs" values={detail?.inputs} />
+      <AuditFields title="Outputs" values={detail?.outputs} />
+      <AuditFields title="Metrics" values={detail?.metrics} />
+      {!detail && includeMetadata && <RecordedData values={genericMeta} />}
+      <AuditRefs title="Evidence" refs={detail?.evidence_refs} />
+      <AuditRefs title="Objects" refs={detail?.object_refs} />
+      <AuditRefs title="Artifacts" refs={detail?.artifact_refs} />
+      {detail?.notes?.length ? (
+        <div className="space-y-1 text-[10px] text-ink-muted">
+          {detail.notes.map((note, index) => <div key={index}>{note}</div>)}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: boolean }) {
   const [open, setOpen] = useState(false)
   const settling = useSettleOn(entry.status, 'completed')
@@ -1524,7 +1635,8 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
   const stepName = entry.name.includes(':') ? entry.name.split(':').pop()! : entry.name
   const meta = entry.meta
   const subChildren = entry.subChildren ?? []
-  const hasDetail = (entry.status === 'completed' && meta && Object.keys(meta).length > 1) || subChildren.length > 0
+  const hasDetail = entry.status !== 'started' && entry.status !== 'running' || subChildren.length > 0
+  const hasSpecializedDetail = !!meta && hasDcfStepDetail(entry.name, meta)
   const cleaned = cleanToolSummary(entry.summary)
   const runCount = (meta as Record<string, unknown> | undefined)?.run_count as number | undefined
   const isReRerun = runCount != null && runCount > 1
@@ -1541,7 +1653,8 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
   // Timeline connector line color
   const isCompleted = entry.status === 'completed'
   const isRunning = entry.status === 'running'
-  const lineColor = isCompleted ? 'bg-emerald-600/40' : isRunning ? 'bg-indigo-400/30' : 'bg-border'
+  const isAwaiting = entry.status === 'awaiting_input'
+  const lineColor = isCompleted ? 'bg-emerald-600/40' : isAwaiting ? 'bg-amber-500/30' : isRunning ? 'bg-indigo-400/30' : 'bg-border'
 
   return (
     <div className="relative text-[11px] animate-step-reveal">
@@ -1556,6 +1669,7 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
         <div className={`relative z-10 flex-shrink-0 mt-[3px] w-[17px] h-[17px] rounded-full flex items-center justify-center border ${
           kgHit ? 'border-teal-500/50 bg-teal-500/10' :
           thesisFallback ? 'border-amber-500/50 bg-amber-500/10' :
+          isAwaiting ? 'border-amber-500/50 bg-amber-500/10' :
           isCompleted ? `border-emerald-500/40 bg-emerald-500/10 ${settling ? 'ring-2 ring-emerald-500/20' : ''}` :
           entry.status === 'error' ? 'border-red-500/40 bg-red-500/10' :
           entry.status === 'skipped' ? 'border-zinc-600/40 bg-zinc-800/30' :
@@ -1565,6 +1679,8 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
             <span className="text-teal-400 text-[9px] leading-none">⚡</span>
           ) : thesisFallback ? (
             <span className="text-amber-400 text-[9px] leading-none">⚠</span>
+          ) : isAwaiting ? (
+            <Pause size={9} className="text-amber-400" aria-hidden />
           ) : isCompleted ? (
             <svg width="9" height="9" viewBox="0 0 12 12" fill="none">
               <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" className="text-emerald-400" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
@@ -1582,6 +1698,7 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
             <span className={`font-medium ${
               kgHit ? 'text-teal-300' :
               thesisFallback ? 'text-amber-400' :
+              isAwaiting ? 'text-amber-300' :
               isCompleted ? 'text-ink-muted' :
               isRunning ? 'text-indigo-300' :
               'text-ink-dim'
@@ -1605,6 +1722,9 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
             {hasDetail && (
               <button
                 onClick={() => setOpen(o => !o)}
+                type="button"
+                aria-label={`${open ? 'Collapse' : 'Inspect'} ${display.label}`}
+                aria-expanded={open}
                 className="text-ink-dim hover:text-ink-muted flex-shrink-0 ml-0.5"
               >
                 <svg width="6" height="6" viewBox="0 0 8 8" fill="none" className={`transition-transform duration-150 ${open ? 'rotate-180' : ''}`}>
@@ -1626,11 +1746,12 @@ function DcfSubstepRow({ entry, isLastStep }: { entry: ChildEntry; isLastStep?: 
                 </div>
               )}
               {/* Step detail panel */}
-              {meta && Object.keys(meta).length > 1 && (
-                <div className="pt-0.5 pb-1 pl-2 border-l border-border-hover">
+              <div className="space-y-3 border-l border-border-hover py-1 pl-3">
+                {hasSpecializedDetail && (
                   <DcfStepDetail stepName={stepName} meta={meta as Record<string, unknown>} />
-                </div>
-              )}
+                )}
+                <WorkflowAuditDetail entry={entry} includeMetadata={!hasSpecializedDetail} />
+              </div>
             </div>
           )}
         </div>
@@ -2156,10 +2277,17 @@ export function ActivityTrace({
                   <ActivityRow key={`${tc.tool_name}-${i}`} tc={tc} isLast={i === flatRows.length - 1} />
                 ))
             }
-            {/* DcfHitlSection now rendered exclusively in ExecutionSidebar */}
           </div>
         </div>
       </div>
+      {dcfReview && (
+        <DcfHitlSection
+          review={dcfReview}
+          threadId={threadId}
+          onApprove={onDcfApprove}
+          onReject={onDcfReject}
+        />
+      )}
     </div>
   )
 }
@@ -2169,13 +2297,16 @@ export function ActivityTrace({
 function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
   const { parent, children } = group
   const isRunning = parent.status === 'started' || parent.status === 'running'
+  const isAwaiting = parent.status === 'awaiting_input'
   const isError = parent.status === 'error'
   const display = getToolDisplay(parent.name)
   const doneCount = children.filter(c => c.status === 'completed' || c.status === 'skipped').length
   const [open, setOpen] = useState(isRunning || parent.status === 'started')
+  const manuallyToggled = useRef(false)
   const settling = useSettleOn(parent.status, 'completed')
-
-  const isDcf = parent.name === 'workflow:dcf'
+  useEffect(() => {
+    if (!manuallyToggled.current) setOpen(isRunning || parent.status === 'awaiting_input')
+  }, [isRunning, parent.status])
 
   const confidenceColor =
     parent.confidence_label === 'HIGH' ? 'bg-emerald-950/80 text-emerald-400' :
@@ -2185,11 +2316,17 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
   return (
     <div className="rounded border border-border bg-bg overflow-hidden">
       <button
-        onClick={() => setOpen(o => !o)}
+        onClick={() => {
+          manuallyToggled.current = true
+          setOpen(o => !o)
+        }}
+        type="button"
+        aria-expanded={open}
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-[11px] hover:bg-bg-overlay transition-colors"
       >
         <div className={`w-[19px] h-[19px] rounded-full border flex items-center justify-center flex-shrink-0 ${
           isRunning ? 'border-indigo-500/40 bg-indigo-500/10' :
+          isAwaiting ? 'border-amber-500/40 bg-amber-500/10' :
           isError ? 'border-red-500/40 bg-red-500/10' :
           'border-violet-500/30 bg-violet-500/10'
         }`}>
@@ -2197,6 +2334,8 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
             <svg className="animate-spin" width="10" height="10" viewBox="0 0 12 12" fill="none">
               <path d="M6 1a5 5 0 0 1 5 5" stroke="#818cf8" strokeWidth="1.5" strokeLinecap="round"/>
             </svg>
+          ) : isAwaiting ? (
+            <Pause size={10} className="text-amber-400" aria-hidden />
           ) : isError ? (
             <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
               <path d="M2 2L6 6M6 2L2 6" stroke="#f87171" strokeWidth="1.2" strokeLinecap="round"/>
@@ -2235,11 +2374,9 @@ function WorkflowGroupRow({ group }: { group: WorkflowGroup }) {
       <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open && children.length > 0 ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
         <div className="overflow-hidden">
           <div className="border-t border-border-subtle px-3 py-1.5 space-y-1.5 ml-1">
-            {children.map((child, i) =>
-              isDcf
-                ? <DcfSubstepRow key={child.activity_id || `c-${i}`} entry={child} isLastStep={i === children.length - 1} />
-                : <ActivityRow key={child.activity_id || `c-${i}`} tc={entryToRow(child)} />
-            )}
+            {children.map((child, i) => (
+              <DcfSubstepRow key={child.activity_id || `c-${i}`} entry={child} isLastStep={i === children.length - 1} />
+            ))}
           </div>
         </div>
       </div>
@@ -2255,7 +2392,7 @@ function ActivityRow({ tc, isLast }: { tc: ToolCall; isLast?: boolean }) {
   const display = getToolDisplay(tc.tool_name)
   const cleaned = cleanToolSummary(tc.summary)
   const expandable = tc.status !== 'running' && cleaned.length > 0
-  const argsLabel = fmtArgsPreview(tc.args_preview || '')
+  const argsLabel = display.group === 'workflow' ? '' : fmtArgsPreview(tc.args_preview || '')
   const isDone = tc.status === 'done'
   const isError = tc.status === 'error'
 

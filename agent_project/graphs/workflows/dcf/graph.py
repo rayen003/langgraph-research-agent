@@ -35,7 +35,8 @@ from typing import Any
 
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
-from langgraph.checkpoint.memory import MemorySaver
+from tracing import traced_node
+from checkpointing import durable_checkpointer
 
 from utils import get_dcf_hitl_payload, get_run_dir
 
@@ -95,15 +96,21 @@ def _build_initial_state(
     session_id: str,
     parent_run_id: str | None = None,
     run_trigger: str = "initial",
+    workflow_context: dict[str, Any] | None = None,
 ) -> DCFState:
     """Build the initial DCFState dict."""
     return {
+        "thread_id": get_run_dir().name,
+        "workflow_context_version_id": None,
+        "approved_assumptions_version_id": None,
+        "result_version_id": None,
         "ticker": ticker,
         "horizon_years": horizon_years,
         "session_id": session_id,
         "assumption_review_mode": assumption_review_mode,
         "allow_external_assumptions": allow_external_assumptions,
         "assumption_overrides": assumption_overrides,
+        "workflow_context": workflow_context or {},
         "assumptions": {},
         "assumption_provenance": {},
         "assumptions_approved": False,
@@ -210,25 +217,25 @@ def _canonical_assumptions_from_snapshot(hitl: dict[str, Any] | None) -> dict[st
 
 graph = StateGraph(DCFState)
 
-graph.add_node("normalize_input", normalize_input_node)
-graph.add_node("cache_check", cache_check_node)
-graph.add_node("assemble_evidence", assemble_evidence_node)
-graph.add_node("semantic_synthesis", semantic_synthesis_node)
-graph.add_node("formulate_thesis", formulate_thesis_node)
-graph.add_node("propose_assumptions", propose_assumptions_node)
-graph.add_node("scenario_generator", scenario_generator_node)
-graph.add_node("review_assumptions", review_assumptions_node)
-graph.add_node("coherence_gate", coherence_gate_node)
-graph.add_node("scenario_runner", scenario_runner_node)
-graph.add_node("project_cashflows", project_cashflows_node)
-graph.add_node("compute_valuation", compute_valuation_node)
-graph.add_node("compute_market_signals", compute_market_signals_node)
-graph.add_node("sensitivity", sensitivity_node)
-graph.add_node("review_subgraph", run_review_subgraph)
-graph.add_node("detect_divergences", detect_divergences_node)
-graph.add_node("analysis", analysis_node)
-graph.add_node("convergence_gate", convergence_gate_node)
-graph.add_node("finalize", finalize_node)
+graph.add_node("normalize_input", traced_node("dcf.normalize_input", normalize_input_node))
+graph.add_node("cache_check", traced_node("dcf.cache_check", cache_check_node))
+graph.add_node("assemble_evidence", traced_node("dcf.assemble_evidence", assemble_evidence_node))
+graph.add_node("semantic_synthesis", traced_node("dcf.semantic_synthesis", semantic_synthesis_node))
+graph.add_node("formulate_thesis", traced_node("dcf.formulate_thesis", formulate_thesis_node))
+graph.add_node("propose_assumptions", traced_node("dcf.propose_assumptions", propose_assumptions_node))
+graph.add_node("scenario_generator", traced_node("dcf.scenario_generator", scenario_generator_node))
+graph.add_node("review_assumptions", traced_node("dcf.review_assumptions", review_assumptions_node))
+graph.add_node("coherence_gate", traced_node("dcf.coherence_gate", coherence_gate_node))
+graph.add_node("scenario_runner", traced_node("dcf.scenario_runner", scenario_runner_node))
+graph.add_node("project_cashflows", traced_node("dcf.project_cashflows", project_cashflows_node))
+graph.add_node("compute_valuation", traced_node("dcf.compute_valuation", compute_valuation_node))
+graph.add_node("compute_market_signals", traced_node("dcf.compute_market_signals", compute_market_signals_node))
+graph.add_node("sensitivity", traced_node("dcf.sensitivity", sensitivity_node))
+graph.add_node("review_subgraph", traced_node("dcf.review_subgraph", run_review_subgraph))
+graph.add_node("detect_divergences", traced_node("dcf.detect_divergences", detect_divergences_node))
+graph.add_node("analysis", traced_node("dcf.analysis", analysis_node))
+graph.add_node("convergence_gate", traced_node("dcf.convergence_gate", convergence_gate_node))
+graph.add_node("finalize", traced_node("dcf.finalize", finalize_node))
 
 graph.add_edge(START, "normalize_input")
 graph.add_edge("normalize_input", "cache_check")
@@ -267,22 +274,22 @@ graph.add_conditional_edges(
 )
 graph.add_edge("finalize", END)
 
-dcf_workflow_app = graph.compile(checkpointer=MemorySaver())
+dcf_workflow_app = graph.compile(checkpointer=durable_checkpointer("dcf_workflow"))
 
 # Valuation-only graph — skips evidence/synthesis/memo (fast path after HITL approval).
 _val_graph = StateGraph(DCFState)
-_val_graph.add_node("normalize_input", normalize_input_node)
-_val_graph.add_node("collect_market_data", collect_market_data_node)
-_val_graph.add_node("coherence_gate", coherence_gate_node)
-_val_graph.add_node("project_cashflows", project_cashflows_node)
-_val_graph.add_node("compute_valuation", compute_valuation_node)
-_val_graph.add_node("compute_market_signals", compute_market_signals_node)
-_val_graph.add_node("sensitivity", sensitivity_node)
-_val_graph.add_node("review_subgraph", run_review_subgraph)
-_val_graph.add_node("detect_divergences", detect_divergences_node)
-_val_graph.add_node("analysis", analysis_node)
-_val_graph.add_node("convergence_gate", convergence_gate_node)
-_val_graph.add_node("finalize", finalize_node)
+_val_graph.add_node("normalize_input", traced_node("dcf.normalize_input", normalize_input_node))
+_val_graph.add_node("collect_market_data", traced_node("dcf.collect_market_data", collect_market_data_node))
+_val_graph.add_node("coherence_gate", traced_node("dcf.coherence_gate", coherence_gate_node))
+_val_graph.add_node("project_cashflows", traced_node("dcf.project_cashflows", project_cashflows_node))
+_val_graph.add_node("compute_valuation", traced_node("dcf.compute_valuation", compute_valuation_node))
+_val_graph.add_node("compute_market_signals", traced_node("dcf.compute_market_signals", compute_market_signals_node))
+_val_graph.add_node("sensitivity", traced_node("dcf.sensitivity", sensitivity_node))
+_val_graph.add_node("review_subgraph", traced_node("dcf.review_subgraph", run_review_subgraph))
+_val_graph.add_node("detect_divergences", traced_node("dcf.detect_divergences", detect_divergences_node))
+_val_graph.add_node("analysis", traced_node("dcf.analysis", analysis_node))
+_val_graph.add_node("convergence_gate", traced_node("dcf.convergence_gate", convergence_gate_node))
+_val_graph.add_node("finalize", traced_node("dcf.finalize", finalize_node))
 _val_graph.add_edge(START, "normalize_input")
 _val_graph.add_edge("normalize_input", "collect_market_data")
 _val_graph.add_edge("collect_market_data", "coherence_gate")
@@ -308,13 +315,13 @@ dcf_valuation_app = _val_graph.compile()
 
 # Scenario valuation graph — runs per scenario, no analysis loop.
 _scenario_graph = StateGraph(DCFState)
-_scenario_graph.add_node("normalize_input", normalize_input_node)
-_scenario_graph.add_node("collect_market_data", collect_market_data_node)
-_scenario_graph.add_node("coherence_gate", coherence_gate_node)
-_scenario_graph.add_node("project_cashflows", project_cashflows_node)
-_scenario_graph.add_node("compute_valuation", compute_valuation_node)
-_scenario_graph.add_node("compute_market_signals", compute_market_signals_node)
-_scenario_graph.add_node("sensitivity", sensitivity_node)
+_scenario_graph.add_node("normalize_input", traced_node("dcf.normalize_input", normalize_input_node))
+_scenario_graph.add_node("collect_market_data", traced_node("dcf.collect_market_data", collect_market_data_node))
+_scenario_graph.add_node("coherence_gate", traced_node("dcf.coherence_gate", coherence_gate_node))
+_scenario_graph.add_node("project_cashflows", traced_node("dcf.project_cashflows", project_cashflows_node))
+_scenario_graph.add_node("compute_valuation", traced_node("dcf.compute_valuation", compute_valuation_node))
+_scenario_graph.add_node("compute_market_signals", traced_node("dcf.compute_market_signals", compute_market_signals_node))
+_scenario_graph.add_node("sensitivity", traced_node("dcf.sensitivity", sensitivity_node))
 _scenario_graph.add_edge(START, "normalize_input")
 _scenario_graph.add_edge("normalize_input", "collect_market_data")
 _scenario_graph.add_edge("collect_market_data", "coherence_gate")
@@ -341,6 +348,7 @@ def run_dcf_workflow_sync(
     session_id: str = "",
     parent_run_id: str | None = None,
     run_trigger: str = "initial",
+    workflow_context: dict[str, Any] | None = None,
 ) -> dict:
     """Run the DCF workflow synchronously and return the result payload.
 
@@ -378,7 +386,12 @@ def run_dcf_workflow_sync(
         session_id=session_id,
         parent_run_id=parent_run_id,
         run_trigger=run_trigger,
+        workflow_context=workflow_context or {},
     )
+    from .persistence import persist_workflow_context  # noqa: PLC0415
+
+    context_object = persist_workflow_context(initial_state)
+    initial_state["workflow_context_version_id"] = context_object["version_id"]
 
     # 50-step limit: full workflow = ~18 steps/pass × up to 2 convergence
     # retries = 36 steps; fast-path = ~11 steps × 2 = 22. Default 25 is too

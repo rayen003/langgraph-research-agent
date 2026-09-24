@@ -100,5 +100,6 @@ def test_chat_node_calls_deck_tool_when_user_requests_deck(monkeypatch, tmp_path
     })
 
     assert fake_llm.calls == 1
-    assert "Draft Deck Outline" in result["messages"][-1].content
+    assert result["messages"][-1].content == "Deck outline ready for review."
+    assert "##" not in result["messages"][-1].content
     assert not any(e.get("type") == "chat_complete" for e in events)

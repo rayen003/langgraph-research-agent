@@ -52,12 +52,20 @@ const TOOL_DISPLAY: Record<string, ToolDisplay> = {
   run_dcf_workflow: {
     label: 'Running DCF workflow',
     description: 'Deterministic discounted cash flow valuation',
-    group: 'tool',
+    group: 'workflow',
+    workflow: 'dcf',
   },
   run_deck_workflow: {
     label: 'Building slide deck',
     description: 'Generate a PPTX from typed source inputs',
-    group: 'tool',
+    group: 'workflow',
+    workflow: 'deck',
+  },
+  run_memo_workflow: {
+    label: 'Writing investment memo',
+    description: 'Generate a source-linked investment memo',
+    group: 'workflow',
+    workflow: 'memo',
   },
   fetch_sec_filing: {
     label: 'Reading SEC filing',
@@ -70,6 +78,7 @@ const WORKFLOW_LABEL: Record<string, string> = {
   dcf: 'DCF',
   deck: 'Deck',
   rag: 'Documents',
+  memo: 'Memo',
 }
 
 const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
@@ -111,6 +120,12 @@ const WORKFLOW_STEP_LABEL: Record<string, Record<string, string>> = {
     finalize_deck: 'Finalizing deck',
     adapter_failure: 'Adapter failure',
   },
+  memo: {
+    validate_inputs: 'Validating brief and sources',
+    generate_draft: 'Drafting memo',
+    review_draft: 'Reviewing memo draft',
+    finalize_memo: 'Finalizing memo',
+  },
   rag: {
     retrieve: 'Searching documents',
     embed_query: 'Matching by meaning',
@@ -134,6 +149,7 @@ const TOOL_ACTION_PHRASE: Record<string, string> = {
   retrieve_tool_result: 'Retrieved result',
   run_dcf_workflow: 'Ran DCF',
   run_deck_workflow: 'Built deck',
+  run_memo_workflow: 'Wrote memo',
   fetch_sec_filing: 'Read filing',
 }
 
@@ -201,6 +217,42 @@ export function cleanToolSummary(raw: string | undefined, maxLen = 160): string 
   if (!raw) return ''
   let s = String(raw).trim()
   if (!s) return ''
+
+  if (s.includes('DCF Assumptions for') || (s.includes('STOP') && /assumptions?/i.test(s))) {
+    const ticker = s.match(/DCF Assumptions for\s+([A-Z0-9.-]+)/i)?.[1]?.toUpperCase()
+    return ticker ? `Assumptions ready for review · ${ticker}` : 'Assumptions ready for review'
+  }
+  if (s.includes('Draft Deck Outline') || (s.includes('STOP') && /outline/i.test(s))) {
+    const count = s.match(/Draft Deck Outline\s*\((\d+) slides?\)/i)?.[1]
+    return count ? `Deck outline ready for review · ${count} slides` : 'Deck outline ready for review'
+  }
+  if (/"__memo_hitl__"\s*:\s*true|"type"\s*:\s*"memo_draft_review"/.test(s)) {
+    return 'Memo draft ready for review'
+  }
+  if (/"__dcf_hitl__"\s*:\s*true|"type"\s*:\s*"dcf_assumptions_review"/.test(s)) {
+    return 'DCF assumptions ready for review'
+  }
+  if (/"__deck_hitl__"\s*:\s*true|"type"\s*:\s*"deck_outline_review"/.test(s)) {
+    return 'Deck outline ready for review'
+  }
+
+  // Decode persisted structured workflow payloads semantically. Older runs
+  // may contain protocol JSON in activity summaries; replay must remain safe.
+  if (s.startsWith('{') || s.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(s) as unknown
+      if (parsed && !Array.isArray(parsed) && typeof parsed === 'object') {
+        const record = parsed as Record<string, unknown>
+        if (typeof record.summary === 'string' && record.summary.trim()) return record.summary.trim().slice(0, maxLen)
+        if (record.__memo_hitl__ || record.type === 'memo_draft_review') return 'Memo draft ready for review'
+        if (record.__dcf_hitl__ || record.type === 'dcf_assumptions_review') return 'DCF assumptions ready for review'
+        if (record.__deck_hitl__ || record.type === 'deck_outline_review') return 'Deck outline ready for review'
+        if (typeof record.error === 'string' && record.error.trim()) return record.error.trim().slice(0, maxLen)
+      }
+    } catch {
+      // Continue with path cleanup and bounded fallback.
+    }
+  }
 
   // Replace absolute filesystem paths with just the file name to reduce noise.
   s = s.replace(/(\s|^|["'(,])((?:\/[A-Za-z0-9._-]+)+)(\.[A-Za-z0-9]+)/g, (_m, lead, _full, ext) => {

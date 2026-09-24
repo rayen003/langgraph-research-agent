@@ -35,8 +35,24 @@ except ImportError:  # LangGraph >=1.0 style
 
 from .activity import emit_step, emit_workflow_terminal
 from .state import DeckOutline, DeckState
+from .persistence import persist_approved_outline
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_outline(
+    state: DeckState,
+    outline: dict[str, Any],
+    *,
+    actor_id: str,
+    decision: str,
+) -> str:
+    if not state.get("deck_context_version_id"):
+        return ""
+    stored = persist_approved_outline(
+        state, outline=outline, actor_id=actor_id, decision=decision,
+    )
+    return str(stored["version_id"])
 
 
 def outline_review_node(state: DeckState) -> dict:
@@ -57,7 +73,14 @@ def outline_review_node(state: DeckState) -> dict:
             "slide_count": len(outline_dict.get("slides") or []),
         })
         logger.info("Deck outline auto-approved (hitl_mode=disabled).")
-        return {"outline_approved": True, "outline_feedback": None}
+        version_id = _persist_outline(
+            state, outline_dict, actor_id="workflow:deck", decision="auto_approve",
+        )
+        return {
+            "outline_approved": True,
+            "outline_feedback": None,
+            "approved_outline_version_id": version_id,
+        }
 
     # Build a compact block inventory for UI context (kept lightweight).
     blocks = state.get("blocks") or []
@@ -78,6 +101,7 @@ def outline_review_node(state: DeckState) -> dict:
         ),
         "hitl_mode": hitl_mode,
         "outline": outline_dict,
+        "deck_context_version_id": state.get("deck_context_version_id"),
         "blocks_preview": blocks_preview,
     })
 
@@ -90,12 +114,14 @@ def outline_review_node(state: DeckState) -> dict:
             "content generation runs."
         ),
         "outline": outline_dict,
+        "deck_context_version_id": state.get("deck_context_version_id"),
         "blocks_preview": blocks_preview,
         "choices": ["approve", "reject", "edit"],
     })
 
     action = str(decision.get("action") or "approve").lower()
     feedback = decision.get("feedback")
+    actor_id = str(decision.get("actor_id") or "user:hitl")
 
     if action == "reject":
         emit_step("outline_review", "rejected", parent_step_id, {
@@ -130,6 +156,9 @@ def outline_review_node(state: DeckState) -> dict:
                     "outline": edited.model_dump(),
                     "outline_approved": True,
                     "outline_feedback": feedback,
+                    "approved_outline_version_id": _persist_outline(
+                        state, edited.model_dump(), actor_id=actor_id, decision="edit",
+                    ),
                 }
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Edited outline failed validation: %s — falling back to original.", exc)
@@ -143,7 +172,13 @@ def outline_review_node(state: DeckState) -> dict:
         "summary_line": f"Outline approved as-is ({len(outline_dict.get('slides') or [])} slides).",
         "feedback": feedback,
     })
-    return {"outline_approved": True, "outline_feedback": feedback}
+    return {
+        "outline_approved": True,
+        "outline_feedback": feedback,
+        "approved_outline_version_id": _persist_outline(
+            state, outline_dict, actor_id=actor_id, decision="approve",
+        ),
+    }
 
 
 def route_after_outline_review(state: DeckState) -> str:

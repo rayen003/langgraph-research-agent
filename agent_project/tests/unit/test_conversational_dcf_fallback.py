@@ -93,3 +93,47 @@ def test_chat_node_does_not_reprompt_llm_after_completed_dcf_tool(monkeypatch, t
     assert events[-1]["type"] == "chat_complete"
     assert events[-1]["content"] == report
 
+
+def test_quota_fallback_names_openai_provider() -> None:
+    message = conversational._QUOTA_FALLBACK_MSG
+
+    assert "OpenAI" in message
+    assert "OPENAI_API_KEY" in message
+    assert "DeepSeek" not in message
+    assert "DCF workflow completed" not in message
+
+
+def test_dcf_review_tool_returns_structured_control_payload(monkeypatch) -> None:
+    import agent_project.tools as runtime_tools
+
+    events: list[dict] = []
+    snapshot = {
+        "ticker": "AAPL",
+        "horizon_years": 5,
+        "assumptions": {"wacc": 0.09},
+        "assumption_provenance": {"wacc": {"source": "capm", "confidence": 0.9}},
+    }
+    monkeypatch.setattr(runtime_tools, "run_dcf_workflow_sync", lambda **_kwargs: {
+        "__dcf_hitl__": True,
+        "ticker": "AAPL",
+        "horizon_years": 5,
+        "memo_proposals": {},
+    })
+    monkeypatch.setattr(runtime_tools, "build_hitl_snapshot", lambda _payload: snapshot)
+    monkeypatch.setattr(runtime_tools, "set_dcf_hitl_payload", lambda _snapshot: None)
+    monkeypatch.setattr(runtime_tools, "emit_ui_event", lambda event: events.append(dict(event)))
+
+    result = json.loads(runtime_tools.run_dcf_workflow.invoke({"ticker": "AAPL"}))
+
+    assert result == {
+        "__dcf_hitl__": True,
+        "workflow": "dcf",
+        "type": "dcf_assumptions_review",
+        "status": "waiting",
+        "ticker": "AAPL",
+        "horizon_years": 5,
+        "summary": "Assumptions ready for review · AAPL · 5yr",
+        "next_actions": ["Await user approval, edits, or rejection."],
+    }
+    assert "##" not in json.dumps(result)
+    assert events[-1]["type"] == "dcf_assumptions_review"

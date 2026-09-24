@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -91,6 +92,18 @@ def init_db() -> None:
                 created_at REAL NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS document_versions (
+                version_id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                snapshot TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(doc_id, version_number)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_document_versions_doc
+            ON document_versions(doc_id, version_number);
 
             CREATE TABLE IF NOT EXISTS job_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,6 +209,157 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_session_layout_group
             ON session_layout(group_id);
 
+            CREATE TABLE IF NOT EXISTS workspace_objects (
+                object_id TEXT PRIMARY KEY,
+                object_type TEXT NOT NULL,
+                schema_ref TEXT,
+                schema_version TEXT NOT NULL DEFAULT '0.1',
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                session_id TEXT,
+                thread_id TEXT,
+                case_id TEXT,
+                task_id TEXT,
+                run_id TEXT,
+                source_message_id TEXT,
+                created_by TEXT,
+                updated_by TEXT,
+                source_object_ids TEXT NOT NULL DEFAULT '[]',
+                source_version_ids TEXT NOT NULL DEFAULT '[]',
+                entity_refs TEXT NOT NULL DEFAULT '[]',
+                source_refs TEXT NOT NULL DEFAULT '[]',
+                kg_node_ids TEXT NOT NULL DEFAULT '[]',
+                artifact_paths TEXT NOT NULL DEFAULT '[]',
+                search_text TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                confidence REAL,
+                quality TEXT NOT NULL DEFAULT '{}',
+                visibility TEXT NOT NULL DEFAULT 'session',
+                summary TEXT,
+                payload TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workspace_objects_session
+            ON workspace_objects(session_id, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_workspace_objects_type
+            ON workspace_objects(object_type, updated_at);
+
+            CREATE TABLE IF NOT EXISTS workspace_object_versions (
+                version_id TEXT PRIMARY KEY,
+                object_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                snapshot TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(object_id, version_number),
+                FOREIGN KEY(object_id) REFERENCES workspace_objects(object_id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_workspace_object_versions_object
+            ON workspace_object_versions(object_id, version_number);
+
+            CREATE TABLE IF NOT EXISTS object_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                previous_version_id TEXT,
+                resulting_version_id TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(object_id) REFERENCES workspace_objects(object_id) ON DELETE RESTRICT,
+                FOREIGN KEY(previous_version_id) REFERENCES workspace_object_versions(version_id) ON DELETE RESTRICT,
+                FOREIGN KEY(resulting_version_id) REFERENCES workspace_object_versions(version_id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_object_actions_object
+            ON object_actions(object_id, action_id);
+
+            CREATE TABLE IF NOT EXISTS collaboration_actors (
+                actor_id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT NOT NULL,
+                handle TEXT NOT NULL UNIQUE, avatar_url TEXT, capabilities TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'available', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS collaboration_workspaces (
+                workspace_id TEXT PRIMARY KEY, name TEXT NOT NULL, created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS collaboration_memberships (
+                workspace_id TEXT NOT NULL, actor_id TEXT NOT NULL, role TEXT NOT NULL,
+                joined_at TEXT NOT NULL, PRIMARY KEY(workspace_id, actor_id)
+            );
+            CREATE TABLE IF NOT EXISTS collaboration_channels (
+                channel_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL,
+                name TEXT NOT NULL, topic TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
+                object_id TEXT, case_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_channels_workspace ON collaboration_channels(workspace_id, updated_at);
+            CREATE TABLE IF NOT EXISTS collaboration_messages (
+                message_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL, body TEXT NOT NULL, mentions TEXT NOT NULL DEFAULT '[]',
+                object_version_ids TEXT NOT NULL DEFAULT '[]', parent_message_id TEXT,
+                created_at TEXT NOT NULL, edited_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_messages_channel ON collaboration_messages(channel_id, created_at);
+            CREATE TABLE IF NOT EXISTS collaboration_comments (
+                comment_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                object_version_id TEXT NOT NULL, block_id TEXT, actor_id TEXT NOT NULL, body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, resolved_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_comments_object ON collaboration_comments(object_id, created_at);
+            CREATE TABLE IF NOT EXISTS collaboration_suggestions (
+                suggestion_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                base_version_id TEXT NOT NULL, block_id TEXT, actor_id TEXT NOT NULL, patch TEXT NOT NULL,
+                rationale TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+                decided_by TEXT, decided_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_suggestions_object ON collaboration_suggestions(object_id, created_at);
+            CREATE TABLE IF NOT EXISTS collaboration_approvals (
+                approval_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, object_id TEXT NOT NULL,
+                object_version_id TEXT NOT NULL, requested_by TEXT NOT NULL, assigned_to TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                decided_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_approvals_assignee ON collaboration_approvals(assigned_to, status);
+            CREATE TABLE IF NOT EXISTS collaboration_notifications (
+                notification_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+                event_type TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+                target_type TEXT NOT NULL, target_id TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_notifications_actor ON collaboration_notifications(actor_id, read, created_at);
+            CREATE TABLE IF NOT EXISTS collaboration_assignments (
+                assignment_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '', assigned_by TEXT NOT NULL, assigned_to TEXT NOT NULL,
+                case_id TEXT, object_version_ids TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'open',
+                due_at TEXT, channel_id TEXT, source_message_id TEXT, thread_id TEXT,
+                output_object_version_ids TEXT NOT NULL DEFAULT '[]', error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_collab_assignments_assignee ON collaboration_assignments(workspace_id, assigned_to, status);
+
+            CREATE TABLE IF NOT EXISTS route_records (
+                route_id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                session_id TEXT,
+                user_id TEXT,
+                decision TEXT NOT NULL,
+                model TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_route_records_thread
+            ON route_records(thread_id, created_at);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_route_records_thread_turn
+            ON route_records(thread_id, turn_id);
+
             -- KG audit log: records findings from periodic quality checks
             CREATE TABLE IF NOT EXISTS kg_audit_log (
                 audit_id TEXT PRIMARY KEY,
@@ -220,6 +384,10 @@ def init_db() -> None:
         )
         # ── Migrations: add entity metadata columns to older databases ──────
         _migrate_documents_entity_columns(conn)
+        _backfill_document_versions(conn)
+        _migrate_workspace_object_columns(conn)
+        _migrate_collaboration_assignment_columns(conn)
+        _backfill_workspace_object_versions(conn)
 
 
 def _migrate_documents_entity_columns(conn: sqlite3.Connection) -> None:
@@ -236,6 +404,98 @@ def _migrate_documents_entity_columns(conn: sqlite3.Connection) -> None:
     for col_name, col_type in new_cols:
         if col_name not in existing:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
+
+
+def _backfill_document_versions(conn: sqlite3.Connection) -> None:
+    """Give pre-existing immutable uploads stable source-version identities."""
+    rows = conn.execute("SELECT * FROM documents WHERE status = 'ready'").fetchall()
+    for row in rows:
+        _ensure_document_version(conn, dict(row))
+
+
+def _migrate_workspace_object_columns(conn: sqlite3.Connection) -> None:
+    """Add retrievable envelope columns to older workspace object tables."""
+    new_cols = [
+        ("schema_ref", "TEXT"),
+        ("schema_version", "TEXT NOT NULL DEFAULT '0.1'"),
+        ("case_id", "TEXT"),
+        ("task_id", "TEXT"),
+        ("run_id", "TEXT"),
+        ("created_by", "TEXT"),
+        ("updated_by", "TEXT"),
+        ("entity_refs", "TEXT NOT NULL DEFAULT '[]'"),
+        ("source_refs", "TEXT NOT NULL DEFAULT '[]'"),
+        ("search_text", "TEXT"),
+        ("tags", "TEXT NOT NULL DEFAULT '[]'"),
+        ("confidence", "REAL"),
+        ("quality", "TEXT NOT NULL DEFAULT '{}'"),
+        ("visibility", "TEXT NOT NULL DEFAULT 'session'"),
+        ("source_version_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ("current_version_id", "TEXT"),
+        ("version_number", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(workspace_objects)").fetchall()}
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE workspace_objects ADD COLUMN {col_name} {col_type}")
+
+
+def _migrate_collaboration_assignment_columns(conn: sqlite3.Connection) -> None:
+    """Add execution links while preserving existing assignments as tasks."""
+    new_cols = [
+        ("channel_id", "TEXT"),
+        ("source_message_id", "TEXT"),
+        ("thread_id", "TEXT"),
+        ("output_object_version_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ("error", "TEXT"),
+    ]
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(collaboration_assignments)").fetchall()
+    }
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            conn.execute(
+                f"ALTER TABLE collaboration_assignments ADD COLUMN {col_name} {col_type}"
+            )
+
+
+def _backfill_workspace_object_versions(conn: sqlite3.Connection) -> None:
+    """Preserve each pre-versioning object as immutable version one."""
+    rows = conn.execute(
+        "SELECT * FROM workspace_objects WHERE COALESCE(version_number, 0) = 0"
+    ).fetchall()
+    for row in rows:
+        snapshot = _row_to_workspace_object(row)
+        object_id = str(snapshot["object_id"])
+        version_id = f"{object_id}:v000001"
+        actor_id = str(snapshot.get("updated_by") or snapshot.get("created_by") or "system:migration")
+        snapshot.update({"version_id": version_id, "version_number": 1})
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO workspace_object_versions (
+                version_id, object_id, version_number, snapshot, actor_id, action_type, created_at
+            ) VALUES (?, ?, 1, ?, ?, 'migrated', ?)
+            """,
+            (version_id, object_id, _json_text(snapshot, {}), actor_id, snapshot.get("updated_at") or _now()),
+        )
+        conn.execute(
+            "UPDATE workspace_objects SET current_version_id = ?, version_number = 1 WHERE object_id = ?",
+            (version_id, object_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO object_actions (
+                object_id, action_type, actor_id, previous_version_id,
+                resulting_version_id, metadata, created_at
+            )
+            SELECT ?, 'migrated', ?, NULL, ?, '{}', ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM object_actions WHERE object_id = ? AND resulting_version_id = ?
+            )
+            """,
+            (object_id, actor_id, version_id, snapshot.get("updated_at") or _now(), object_id, version_id),
+        )
 
 
 def mark_stale_running_jobs() -> None:
@@ -527,6 +787,322 @@ def get_report(thread_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _json_text(value: Any, default: Any) -> str:
+    return json.dumps(value if value is not None else default, ensure_ascii=False)
+
+
+def _parse_json_field(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    try:
+        return json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def record_route_decision(
+    *,
+    route_id: str,
+    turn_id: str,
+    thread_id: str,
+    session_id: str | None,
+    user_id: str | None,
+    decision: dict[str, Any],
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Append one route per turn; retries update same deterministic record."""
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO route_records (
+                route_id, turn_id, thread_id, session_id, user_id,
+                decision, model, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id, turn_id) DO UPDATE SET
+                decision = excluded.decision,
+                model = excluded.model,
+                updated_at = excluded.updated_at
+            """,
+            (
+                route_id, turn_id, thread_id, session_id, user_id,
+                _json_text(decision, {}), model, now, now,
+            ),
+        )
+    records = list_route_records(thread_id=thread_id)
+    return next(record for record in records if record["turn_id"] == turn_id)
+
+
+def list_route_records(*, thread_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM route_records
+            WHERE thread_id = ?
+            ORDER BY created_at ASC, route_id ASC
+            LIMIT ?
+            """,
+            (thread_id, max(1, min(int(limit), 1000))),
+        ).fetchall()
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        record["decision"] = _parse_json_field(record.get("decision"), {})
+        records.append(record)
+    return records
+
+
+def _row_to_workspace_object(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["source_object_ids"] = _parse_json_field(data.get("source_object_ids"), [])
+    data["source_version_ids"] = _parse_json_field(data.get("source_version_ids"), [])
+    data["entity_refs"] = _parse_json_field(data.get("entity_refs"), [])
+    data["source_refs"] = _parse_json_field(data.get("source_refs"), [])
+    data["kg_node_ids"] = _parse_json_field(data.get("kg_node_ids"), [])
+    data["artifact_paths"] = _parse_json_field(data.get("artifact_paths"), [])
+    data["tags"] = _parse_json_field(data.get("tags"), [])
+    data["quality"] = _parse_json_field(data.get("quality"), {})
+    data["payload"] = _parse_json_field(data.get("payload"), {})
+    data["version_id"] = data.get("current_version_id")
+    return data
+
+
+def upsert_workspace_object(
+    obj: dict[str, Any],
+    *,
+    action_type: str | None = None,
+    action_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write current projection and append one immutable object version."""
+    now = _now()
+    object_id = str(obj["object_id"])
+    created_at = str(obj.get("created_at") or now)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            "SELECT current_version_id, version_number FROM workspace_objects WHERE object_id = ?",
+            (object_id,),
+        ).fetchone()
+        previous_version_id = str(previous["current_version_id"]) if previous and previous["current_version_id"] else None
+        previous_number = int(previous["version_number"] or 0) if previous else 0
+        conn.execute(
+            """
+            INSERT INTO workspace_objects (
+                object_id, object_type, schema_ref, schema_version, title, status,
+                session_id, thread_id, case_id, task_id, run_id, source_message_id,
+                created_by, updated_by, source_object_ids, source_version_ids, entity_refs, source_refs,
+                kg_node_ids, artifact_paths, search_text, tags, confidence, quality,
+                visibility, summary, payload, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(object_id) DO UPDATE SET
+                object_type = excluded.object_type,
+                schema_ref = excluded.schema_ref,
+                schema_version = excluded.schema_version,
+                title = excluded.title,
+                status = excluded.status,
+                session_id = excluded.session_id,
+                thread_id = excluded.thread_id,
+                case_id = excluded.case_id,
+                task_id = excluded.task_id,
+                run_id = excluded.run_id,
+                source_message_id = excluded.source_message_id,
+                created_by = COALESCE(workspace_objects.created_by, excluded.created_by),
+                updated_by = excluded.updated_by,
+                source_object_ids = excluded.source_object_ids,
+                source_version_ids = excluded.source_version_ids,
+                entity_refs = excluded.entity_refs,
+                source_refs = excluded.source_refs,
+                kg_node_ids = excluded.kg_node_ids,
+                artifact_paths = excluded.artifact_paths,
+                search_text = excluded.search_text,
+                tags = excluded.tags,
+                confidence = excluded.confidence,
+                quality = excluded.quality,
+                visibility = excluded.visibility,
+                summary = excluded.summary,
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (
+                object_id,
+                str(obj["object_type"]),
+                obj.get("schema_ref"),
+                str(obj.get("schema_version") or "0.1"),
+                str(obj["title"]),
+                str(obj.get("status") or "complete"),
+                obj.get("session_id"),
+                obj.get("thread_id"),
+                obj.get("case_id"),
+                obj.get("task_id"),
+                obj.get("run_id"),
+                obj.get("source_message_id"),
+                obj.get("created_by"),
+                obj.get("updated_by"),
+                _json_text(obj.get("source_object_ids"), []),
+                _json_text(obj.get("source_version_ids"), []),
+                _json_text(obj.get("entity_refs"), []),
+                _json_text(obj.get("source_refs"), []),
+                _json_text(obj.get("kg_node_ids"), []),
+                _json_text(obj.get("artifact_paths"), []),
+                obj.get("search_text"),
+                _json_text(obj.get("tags"), []),
+                obj.get("confidence"),
+                _json_text(obj.get("quality"), {}),
+                str(obj.get("visibility") or "session"),
+                obj.get("summary"),
+                _json_text(obj.get("payload"), {}),
+                created_at,
+                now,
+            ),
+        )
+        version_number = previous_number + 1
+        version_id = f"{object_id}:v{version_number:06d}"
+        current_row = conn.execute(
+            "SELECT * FROM workspace_objects WHERE object_id = ?",
+            (object_id,),
+        ).fetchone()
+        snapshot = _row_to_workspace_object(current_row)
+        snapshot["version_id"] = version_id
+        snapshot["version_number"] = version_number
+        actor_id = str(obj.get("updated_by") or obj.get("created_by") or "system:unknown")
+        resolved_action = str(action_type or ("created" if previous_number == 0 else "updated"))
+        conn.execute(
+            """
+            INSERT INTO workspace_object_versions (
+                version_id, object_id, version_number, snapshot,
+                actor_id, action_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version_id,
+                object_id,
+                version_number,
+                _json_text(snapshot, {}),
+                actor_id,
+                resolved_action,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE workspace_objects
+            SET current_version_id = ?, version_number = ?
+            WHERE object_id = ?
+            """,
+            (version_id, version_number, object_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO object_actions (
+                object_id, action_type, actor_id, previous_version_id,
+                resulting_version_id, metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                object_id,
+                resolved_action,
+                actor_id,
+                previous_version_id,
+                version_id,
+                _json_text(action_metadata, {}),
+                now,
+            ),
+        )
+    stored = get_workspace_object(object_id)
+    return stored or {**obj, "created_at": created_at, "updated_at": now}
+
+
+def get_workspace_object(object_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM workspace_objects WHERE object_id = ?",
+            (object_id,),
+        ).fetchone()
+    return _row_to_workspace_object(row) if row else None
+
+
+def list_workspace_object_versions(object_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT snapshot FROM workspace_object_versions
+            WHERE object_id = ?
+            ORDER BY version_number ASC
+            """,
+            (object_id,),
+        ).fetchall()
+    return [_parse_json_field(row["snapshot"], {}) for row in rows]
+
+
+def get_workspace_object_version(object_id: str, version_number: int) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT snapshot FROM workspace_object_versions
+            WHERE object_id = ? AND version_number = ?
+            """,
+            (object_id, int(version_number)),
+        ).fetchone()
+    return _parse_json_field(row["snapshot"], {}) if row else None
+
+
+def list_object_actions(object_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM object_actions WHERE object_id = ? ORDER BY action_id ASC",
+            (object_id,),
+        ).fetchall()
+    actions: list[dict[str, Any]] = []
+    for row in rows:
+        action = dict(row)
+        action["metadata"] = _parse_json_field(action.get("metadata"), {})
+        actions.append(action)
+    return actions
+
+
+def delete_workspace_object(object_id: str, *, actor_id: str = "system:archive") -> None:
+    """Archive object through a new version; never remove object history."""
+    current = get_workspace_object(object_id)
+    if current is None or current.get("status") == "archived":
+        return
+    current["status"] = "archived"
+    current["updated_by"] = actor_id
+    current.pop("version_id", None)
+    current.pop("version_number", None)
+    current.pop("current_version_id", None)
+    upsert_workspace_object(current, action_type="archived")
+
+
+def list_workspace_objects(
+    *,
+    session_id: str | None = None,
+    object_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    if session_id:
+        clauses.append("session_id = ?")
+        values.append(session_id)
+    if object_type:
+        clauses.append("object_type = ?")
+        values.append(object_type)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    values.append(max(1, min(int(limit or 50), 200)))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM workspace_objects
+            {where}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            values,
+        ).fetchall()
+    return [_row_to_workspace_object(row) for row in rows]
+
+
 def get_session_memory(session_id: str) -> str:
     if not session_id:
         return ""
@@ -552,6 +1128,40 @@ def set_session_memory(session_id: str, content: str) -> None:
             """,
             (session_id, content, _now()),
         )
+
+
+def _ensure_document_version(conn: sqlite3.Connection, doc: dict[str, Any]) -> None:
+    if doc.get("status") != "ready":
+        return
+    upload_path = str(doc.get("upload_path") or "")
+    content_hash = None
+    if upload_path and Path(upload_path).is_file():
+        digest = hashlib.sha256()
+        with Path(upload_path).open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        content_hash = digest.hexdigest()
+    version_id = f"{doc['doc_id']}:v1"
+    snapshot = {
+        key: doc.get(key)
+        for key in (
+            "doc_id", "filename", "session_id", "upload_path", "company",
+            "ticker", "doc_type", "fiscal_period", "created_at",
+        )
+    }
+    snapshot.update({
+        "version_id": version_id,
+        "version_number": 1,
+        "content_hash": content_hash,
+    })
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO document_versions (
+            version_id, doc_id, version_number, snapshot, created_at
+        ) VALUES (?, ?, 1, ?, ?)
+        """,
+        (version_id, doc["doc_id"], _json_text(snapshot, {}), doc.get("updated_at") or _now()),
+    )
 
 
 def upsert_document(doc: dict[str, Any]) -> None:
@@ -599,6 +1209,25 @@ def upsert_document(doc: dict[str, Any]) -> None:
                 _now(),
             ),
         )
+        _ensure_document_version(conn, doc)
+
+
+def get_document_version(version_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT snapshot FROM document_versions WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+    return _parse_json_field(row["snapshot"], {}) if row else None
+
+
+def list_document_versions(doc_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT snapshot FROM document_versions WHERE doc_id = ? ORDER BY version_number ASC",
+            (doc_id,),
+        ).fetchall()
+    return [_parse_json_field(row["snapshot"], {}) for row in rows]
 
 
 def update_document(doc_id: str, **fields: Any) -> None:
@@ -618,6 +1247,9 @@ def update_document(doc_id: str, **fields: Any) -> None:
     values.append(doc_id)
     with _connect() as conn:
         conn.execute(f"UPDATE documents SET {', '.join(assignments)} WHERE doc_id = ?", values)
+        current = conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+        if current:
+            _ensure_document_version(conn, dict(current))
 
 
 def list_documents(session_id: str | None = None) -> list[dict[str, Any]]:

@@ -34,6 +34,7 @@ def test_resolve_injects_dcf_from_disk(tmp_path, monkeypatch):
         "ticker": "AAPL",
         "valuation": {"implied_share_price": 200},
         "assumptions": {"wacc": 0.09},
+        "result_version_id": "dcf_run:chat_test:v000003",
     }
     (run_dir / "dcf_output.json").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -48,6 +49,9 @@ def test_resolve_injects_dcf_from_disk(tmp_path, monkeypatch):
 
     assert brief["title"].startswith("AAPL")
     assert any(s["type"] == "dcf_output" for s in sources)
+    dcf_source = next(s for s in sources if s["type"] == "dcf_output")
+    assert dcf_source["object_id"] == "dcf_run:chat_test"
+    assert dcf_source["version_id"] == "dcf_run:chat_test:v000003"
     assert is_full_dcf_payload(payload)
 
 

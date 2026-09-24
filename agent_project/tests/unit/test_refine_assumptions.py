@@ -17,6 +17,7 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-placeholder")
 import pytest
 
 from agent_project.graphs.workflows.dcf.refinement import refine_assumptions_node
+from agent_project.graphs.workflows.dcf import review_loop
 from agent_project.tests.helpers import build_test_state
 
 
@@ -60,6 +61,53 @@ def test_multiple_adjustments_applied():
     assert a["revenue_growth"] == pytest.approx(orig["revenue_growth"] + 0.01, abs=1e-6)
     assert a["fcff_margin"] == pytest.approx(orig["fcff_margin"] - 0.02, abs=1e-6)
     assert a["terminal_growth"] == pytest.approx(orig["terminal_growth"] - 0.003, abs=1e-6)
+
+
+def test_user_edited_assumptions_are_not_overwritten_by_refinement():
+    state = build_test_state(critique={
+        "suggested_adjustments": {"wacc": 0.01, "terminal_growth": -0.003},
+        "flags": [],
+    })
+    state["assumption_provenance"] = {
+        "wacc": {"source": "capm", "user_edited": True, "approved_by": "user"},
+        "terminal_growth": {"source": "user_override", "approved_by": "user"},
+    }
+    original = dict(state["assumptions"])
+
+    result = refine_assumptions_node(state)
+
+    assert result["assumptions"]["wacc"] == original["wacc"]
+    assert result["assumptions"]["terminal_growth"] == original["terminal_growth"]
+
+
+def test_user_edited_assumption_is_not_overwritten_by_review_loop(monkeypatch):
+    state = build_test_state()
+    state.update({
+        "analysis_iteration": 0,
+        "previous_valuation": {},
+        "initial_assumptions": {},
+        "assumption_history": [],
+        "scenarios": [],
+        "assumption_provenance": {
+            "wacc": {"source": "capm", "user_edited": True, "approved_by": "user"},
+        },
+    })
+    original = dict(state["assumptions"])
+    monkeypatch.setattr(review_loop.review_dcf_app, "invoke", lambda _state: {
+        "should_stop": True,
+        "suggested_adjustments": {"base": {"wacc": 0.01, "revenue_growth": 0.01}},
+        "review_summary": "test",
+        "findings": None,
+        "severity_score": 0.0,
+        "change_records": [],
+    })
+
+    result = review_loop.run_review_subgraph(state)
+
+    assert result["assumptions"]["wacc"] == original["wacc"]
+    assert result["assumptions"]["revenue_growth"] == pytest.approx(
+        original["revenue_growth"] + 0.01
+    )
 
 
 def test_unchanged_fields_preserved():

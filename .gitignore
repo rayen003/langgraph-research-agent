@@ -37,6 +37,7 @@ Thumbs.db
 # Agent project runtime data (do not push)
 agent_project/plans/
 agent_project/runs/
+agent_project/runtime/
 
 # Embeddings
 **/embeddings/embeddings.json

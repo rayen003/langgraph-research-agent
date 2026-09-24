@@ -65,6 +65,8 @@ class ActivityEvent(TypedDict, total=False):
     confidence_label: str     # workflow-only; surfaces trust signal
     flag_count: int           # workflow-only; total quality flags
     error: str                # populated when status == "error"
+    detail: dict[str, Any]    # structured audit detail; never used as display text
+    review_ref: dict[str, Any]  # reference to separate HITL event/card
     meta: dict[str, Any]      # free-form payload (links, ids, etc.)
 
 
@@ -85,6 +87,8 @@ def make_activity(
     confidence_label: str | None = None,
     flag_count: int | None = None,
     error: str | None = None,
+    detail: dict[str, Any] | None = None,
+    review_ref: dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an ActivityEvent payload, omitting unset fields."""
@@ -116,6 +120,10 @@ def make_activity(
         payload["flag_count"] = flag_count
     if error:
         payload["error"] = error
+    if detail:
+        payload["detail"] = detail
+    if review_ref:
+        payload["review_ref"] = review_ref
     if meta:
         payload["meta"] = meta
     return payload

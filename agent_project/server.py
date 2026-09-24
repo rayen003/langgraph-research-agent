@@ -60,16 +60,58 @@ import lg_compat  # noqa: F401 — validates langgraph version at startup, not m
 from plan_store import save_plan as save_plan_to_store  # noqa: E402
 from storage import (  # noqa: E402
     append_job_event,
+    delete_workspace_object,
     get_job,
+    get_document_version,
     get_report as get_stored_report,
     get_session_layout,
     get_session_memory,
+    get_workspace_object,
+    get_workspace_object_version,
+    list_object_actions,
+    list_route_records,
+    list_workspace_object_versions,
+    list_workspace_objects,
     list_job_events,
+    list_document_versions,
     list_jobs as list_stored_jobs,
     mark_stale_running_jobs,
     replace_session_layout,
     update_job,
     upsert_job,
+    upsert_workspace_object,
+)
+from collaboration_store import (  # noqa: E402
+    add_membership,
+    create_assignment,
+    create_approval,
+    create_channel,
+    create_message,
+    create_object_comment,
+    create_suggestion,
+    decide_approval,
+    decide_suggestion,
+    ensure_workspace,
+    list_actors,
+    list_assignments,
+    list_channels,
+    list_messages,
+    list_notifications,
+    list_object_approvals,
+    list_object_comments,
+    list_object_suggestions,
+    mark_notification_read,
+    require_workspace_role,
+    resolve_comment,
+    update_actor_status,
+    update_assignment,
+    upsert_actor,
+)
+from tracing import (  # noqa: E402
+    TraceCallbackHandler,
+    emit_trace_span,
+    make_trace_span,
+    set_trace_context,
 )
 
 AGENT_DIR = Path(__file__).parent
@@ -98,6 +140,7 @@ mark_stale_running_jobs()
 
 
 POLL_INTERVAL_SECONDS = 0.5
+STREAM_SUBSCRIBER_GRACE_SECONDS = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -106,15 +149,20 @@ POLL_INTERVAL_SECONDS = 0.5
 
 class RunState:
     __slots__ = (
-        "thread_id", "loop", "event_queue", "hitl_future",
+        "thread_id", "loop", "event_queue", "stream_connected", "stream_expected", "hitl_future",
         "status", "query", "mode", "intent", "created_at", "session_id",
-        "dcf_hitl_payload", "deck_hitl_payload",
+        "dcf_hitl_payload", "deck_hitl_payload", "memo_hitl_payload", "workflow_context_payload",
+        "collaboration_channel_id", "collaboration_workspace_id", "collaboration_actor_id", "collaboration_replied",
+        "collaboration_object_version_ids", "collaboration_assignment_id", "collaboration_task_context",
+        "trace_id", "root_span_id", "trace_started_at",
     )
 
     def __init__(self, thread_id: str, loop: asyncio.AbstractEventLoop, query: str, mode: str, session_id: str = "") -> None:
         self.thread_id = thread_id
         self.loop = loop
         self.event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        self.stream_connected = asyncio.Event()
+        self.stream_expected = False
         self.hitl_future: asyncio.Future | None = None
         self.status = "classifying"
         self.query = query
@@ -124,6 +172,18 @@ class RunState:
         self.session_id = session_id
         self.dcf_hitl_payload: dict | None = None
         self.deck_hitl_payload: dict | None = None
+        self.memo_hitl_payload: dict | None = None
+        self.workflow_context_payload: dict | None = None
+        self.collaboration_channel_id: str | None = None
+        self.collaboration_workspace_id: str | None = None
+        self.collaboration_actor_id: str | None = None
+        self.collaboration_replied = False
+        self.collaboration_object_version_ids: list[str] = []
+        self.collaboration_assignment_id: str | None = None
+        self.collaboration_task_context: dict[str, Any] | None = None
+        self.trace_id = f"trace_{uuid4().hex[:16]}"
+        self.root_span_id = f"run_{uuid4().hex[:12]}"
+        self.trace_started_at = time.time()
 
 
 _run_registry: dict[str, RunState] = {}
@@ -133,7 +193,9 @@ _RUNNING_STATUSES = {
     "planning",
     "awaiting_approval",
     "awaiting_assumptions",
+    "awaiting_workflow_context",
     "awaiting_outline_review",
+    "awaiting_memo_review",
     "workflow_running",
     "executing",
     "synthesizing",
@@ -148,6 +210,23 @@ def _persist_event(thread_id: str, event: dict) -> dict:
 def _send_event(rs: RunState, event: dict) -> None:
     persisted = _persist_event(rs.thread_id, event)
     rs.event_queue.put_nowait(persisted)
+
+
+async def _await_stream_subscriber(rs: RunState) -> None:
+    """Give interactive clients time to subscribe before expensive work starts.
+
+    Prevents first workflow activities becoming one replay burst. Timeout keeps
+    background, collaboration, and API-only runs independent from UI presence.
+    """
+    if not rs.stream_expected or rs.stream_connected.is_set():
+        return
+    try:
+        await asyncio.wait_for(
+            rs.stream_connected.wait(),
+            timeout=STREAM_SUBSCRIBER_GRACE_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return
 
 
 def _format_sse_event(event: dict) -> str:
@@ -389,6 +468,113 @@ async def _handle_deck_hitl(rs: RunState, thread_id: str) -> dict | None:
     return None
 
 
+async def _handle_memo_hitl(rs: RunState, thread_id: str) -> dict | None:
+    """Wait for memo draft decision and resume paused memo graph."""
+    from graphs.workflows.memo import memo_workflow_app  # noqa: PLC0415
+    from lg_compat import Command  # noqa: PLC0415
+    from utils import get_run_dir, set_thread_id  # noqa: PLC0415
+
+    rs.hitl_future = rs.loop.create_future()
+    decision = await rs.hitl_future
+    action = "approve" if decision.get("approved", True) else "reject"
+    action = str(decision.get("action") or action).lower()
+    resume_payload: dict[str, Any] = {
+        "action": action,
+        "actor_id": str(decision.get("actor_id") or "user"),
+    }
+    if decision.get("feedback"):
+        resume_payload["feedback"] = decision["feedback"]
+    if action == "edit" and isinstance(decision.get("draft"), dict):
+        resume_payload["draft"] = decision["draft"]
+
+    _send_event(rs, {
+        "type": "memo_draft_rejected" if action == "reject" else "memo_draft_submitted",
+        "workflow": "memo",
+        "action": action,
+    })
+
+    set_thread_id(thread_id)
+    config = {"configurable": {"thread_id": f"{get_run_dir().name}_memo"}, "recursion_limit": 30}
+    result = await rs.loop.run_in_executor(
+        None, lambda: memo_workflow_app.invoke(Command(resume=resume_payload), config=config),
+    )
+    return result.get("output") if action != "reject" else None
+
+
+def _has_pending_collaboration_review(rs: RunState) -> bool:
+    return bool(
+        rs.dcf_hitl_payload
+        or rs.deck_hitl_payload
+        or rs.memo_hitl_payload
+        or rs.workflow_context_payload
+    )
+
+
+def _complete_collaboration_assignment(
+    rs: RunState,
+    content: str,
+    *,
+    artifact_paths: list[str] | None = None,
+    output_version_ids: list[str] | None = None,
+) -> None:
+    """Persist one final channel response and link it to tracked assignment."""
+    if (
+        not rs.collaboration_workspace_id
+        or rs.collaboration_replied
+    ):
+        return
+    task_context = rs.collaboration_task_context or {}
+    result_object = upsert_workspace_object({
+        "object_id": f"task_result:{rs.thread_id}",
+        "object_type": "task_result",
+        "schema_ref": "workspace.collaboration_task_result",
+        "schema_version": "0.1",
+        "title": str(task_context.get("title") or rs.query.splitlines()[0])[:140],
+        "status": "complete",
+        "session_id": rs.session_id,
+        "thread_id": rs.thread_id,
+        "task_id": rs.collaboration_assignment_id,
+        "run_id": rs.thread_id,
+        "source_message_id": task_context.get("source_message_id"),
+        "created_by": rs.collaboration_actor_id or "agent:research",
+        "updated_by": rs.collaboration_actor_id or "agent:research",
+        "source_version_ids": rs.collaboration_object_version_ids,
+        "artifact_paths": artifact_paths or [],
+        "summary": " ".join(content.split())[:300],
+        "search_text": f"{rs.query} {content}",
+        "payload": {
+            "assignment": task_context.get("goal") or rs.query,
+            "result": content,
+            "channel_id": rs.collaboration_channel_id,
+        },
+    }, action_type="agent_assignment_completed")
+    result_version = result_object.get("version_id")
+    outputs = [str(value) for value in (output_version_ids or []) if value]
+    if result_version:
+        outputs.append(str(result_version))
+    outputs = list(dict.fromkeys(outputs))
+    if rs.collaboration_assignment_id:
+        update_assignment(
+            rs.collaboration_assignment_id,
+            "completed",
+            rs.collaboration_actor_id or "agent:research",
+            thread_id=rs.thread_id,
+            output_object_version_ids=outputs,
+        )
+    if rs.collaboration_channel_id:
+        create_message(
+            rs.collaboration_channel_id,
+            rs.collaboration_workspace_id,
+            rs.collaboration_actor_id or "agent:research",
+            {
+                "body": content,
+                "mentions": [],
+                "object_version_ids": [*rs.collaboration_object_version_ids, *outputs],
+            },
+        )
+    rs.collaboration_replied = True
+
+
 def _make_event_bridge(rs: RunState):
     """Return a sync callback safe to call from any thread."""
     def bridge(event: dict) -> None:
@@ -428,6 +614,23 @@ def _make_event_bridge(rs: RunState):
             }
             rs.status = "awaiting_outline_review"
             update_job(rs.thread_id, status=rs.status)
+        elif event.get("type") == "memo_draft_review":
+            rs.memo_hitl_payload = {
+                "draft": event.get("draft", {}),
+                "sources": event.get("sources", []),
+                "context_version_id": event.get("context_version_id"),
+            }
+            rs.status = "awaiting_memo_review"
+            update_job(rs.thread_id, status=rs.status)
+        elif event.get("type") == "workflow_context_review":
+            rs.workflow_context_payload = {
+                "workflow_id": event.get("workflow_id", ""),
+                "title": event.get("title", "Workflow setup"),
+                "context": event.get("context", {}),
+                "controls": event.get("controls", []),
+            }
+            rs.status = "awaiting_workflow_context"
+            update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "synthesis_start":
             rs.status = "synthesizing"
             update_job(rs.thread_id, status=rs.status)
@@ -435,8 +638,23 @@ def _make_event_bridge(rs: RunState):
             rs.status = "complete"
             update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "chat_complete":
+            if not _has_pending_collaboration_review(rs):
+                _complete_collaboration_assignment(
+                    rs,
+                    str(event.get("content") or ""),
+                    artifact_paths=event.get("artifact_paths")
+                    if isinstance(event.get("artifact_paths"), list)
+                    else [],
+                )
+            _sync_text_workspace_object(
+                thread_id=rs.thread_id,
+                session_id=rs.session_id,
+                query=rs.query,
+                content=str(event.get("content") or ""),
+                artifact_paths=event.get("artifact_paths") if isinstance(event.get("artifact_paths"), list) else [],
+            )
             # Skip marking complete if workflow HITL is pending — keep SSE alive
-            if not rs.dcf_hitl_payload and not rs.deck_hitl_payload:
+            if not rs.dcf_hitl_payload and not rs.deck_hitl_payload and not rs.memo_hitl_payload and not rs.workflow_context_payload:
                 rs.status = "complete"
                 update_job(rs.thread_id, status=rs.status)
         elif event.get("type") == "execution_started":
@@ -462,27 +680,76 @@ async def _run_agent_task(
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     rs = _run_registry[thread_id]
-    config = {"configurable": {"thread_id": thread_id}}
+    set_trace_context(rs.trace_id, rs.root_span_id)
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": [TraceCallbackHandler(rs.trace_id, rs.root_span_id)],
+    }
     set_thread_id(thread_id)
     set_ui_event_handler(_make_event_bridge(rs))
     session_memory = get_session_memory(session_id)
     _run_t = agent_log.run_start(thread_id, query, mode)
 
     try:
+        await _await_stream_subscriber(rs)
         # Phase 1 — intent + (plan for research | chat for conversational)
         result = await agent_graph.ainvoke(
             {
                 "messages": [HumanMessage(content=query)],
+                "trace_id": rs.trace_id,
+                "root_span_id": rs.root_span_id,
                 "mode": mode,
                 "resolved_intent": None,
                 "session_id": session_id,
                 "session_memory": session_memory,
                 "user_settings": user_settings or {},
+                "task_id": rs.collaboration_assignment_id,
+                "task_context": rs.collaboration_task_context,
             },
             config=config,
         )
 
         interrupts = result.get("__interrupt__", ())
+
+        if interrupts:
+            first_interrupt = interrupts[0].value if hasattr(interrupts[0], "value") else {}
+        else:
+            first_interrupt = {}
+
+        while isinstance(first_interrupt, dict) and first_interrupt.get("type") == "workflow_context_review":
+            setup_payload = first_interrupt
+            rs.status = "awaiting_workflow_context"
+            update_job(thread_id, status=rs.status)
+            rs.hitl_future = rs.loop.create_future()
+            _send_event(rs, setup_payload)
+            decision = await rs.hitl_future
+            rs.workflow_context_payload = None
+            if setup_payload.get("workflow_id") == "tracked_task" and decision.get("approved", True):
+                workspace_id = rs.collaboration_workspace_id or "workspace:default"
+                ensure_workspace(workspace_id)
+                assignment = create_assignment(workspace_id, {
+                    "title": query[:160], "description": query,
+                    "assigned_to": "agent:research", "thread_id": thread_id,
+                    "channel_id": rs.collaboration_channel_id,
+                    "object_version_ids": rs.collaboration_object_version_ids,
+                }, "human:local")
+                rs.collaboration_workspace_id = workspace_id
+                rs.collaboration_assignment_id = assignment["assignment_id"]
+                rs.collaboration_actor_id = "agent:research"
+                rs.collaboration_task_context = {
+                    "task_id": assignment["assignment_id"], "title": assignment["title"],
+                    "goal": query, "assigned_to": "agent:research",
+                    "input_object_version_ids": rs.collaboration_object_version_ids,
+                }
+                update_assignment(assignment["assignment_id"], "working", "agent:research")
+                decision["task_context"] = rs.collaboration_task_context
+            if not decision.get("approved", True):
+                decision = {"action": "cancel", "approved": False, "context": setup_payload.get("context", {})}
+            rs.status = "chat_responding"
+            update_job(thread_id, status=rs.status)
+            result = await agent_graph.ainvoke(Command(resume=decision), config=config)
+            interrupts = result.get("__interrupt__", ())
+            first_interrupt = interrupts[0].value if interrupts and hasattr(interrupts[0], "value") else {}
 
         # Check for DCF HITL — payload set by event bridge when dcf_assumptions_review fires
         # (chat mode: tool emitted event, chat_node broke its ReAct loop).
@@ -523,6 +790,16 @@ async def _run_agent_task(
             if artifact_paths:
                 complete_event["artifact_paths"] = artifact_paths
             _send_event(rs, complete_event)
+            _sync_dcf_workspace_object(
+                thread_id,
+                session_id,
+                result_path=_payload.get("result_path"),
+            )
+            _complete_collaboration_assignment(
+                rs,
+                report,
+                artifact_paths=artifact_paths,
+            )
             update_job(thread_id, status="complete")
             _send_event(rs, {"type": "run_complete"})
             rs.event_queue.put_nowait(None)
@@ -547,6 +824,7 @@ async def _run_agent_task(
                 if "deck_output_path" in deck_result
                 else None,
                 "slide_count": len(deck_result.get("slides") or []),
+                "result_version_id": deck_result.get("result_version_id"),
             }
             if not complete_payload.get("deck_output_path"):
                 run_dir = _runs_dir_for(thread_id)
@@ -577,6 +855,14 @@ async def _run_agent_task(
 
                 deck_paths = list_deck_artifact_paths(_runs_dir_for(thread_id))
                 rel_pptx = deck_paths[0] if deck_paths else None
+            _sync_deck_workspace_object(
+                thread_id=thread_id,
+                session_id=session_id,
+                deck_title=complete_payload.get("deck_title"),
+                pptx_path=rel_pptx or pptx_abs,
+                slide_count=complete_payload.get("slide_count"),
+                result_version_id=complete_payload.get("result_version_id"),
+            )
             update_job(thread_id, status="complete")
             _send_event(
                 rs,
@@ -590,8 +876,40 @@ async def _run_agent_task(
             rs.event_queue.put_nowait(None)
             return
 
+        if rs.memo_hitl_payload:
+            rs.memo_hitl_payload = None
+            memo_result = await _handle_memo_hitl(rs, thread_id)
+            if memo_result is None:
+                update_job(thread_id, status="complete")
+                _send_event(rs, {"type": "run_complete", "workflow": "memo", "status": "rejected"})
+                rs.event_queue.put_nowait(None)
+                return
+            _send_event(rs, {
+                "type": "chat_complete",
+                "content": memo_result.get("markdown") or "",
+                "artifact_paths": [memo_result["markdown_path"]] if memo_result.get("markdown_path") else [],
+            })
+            _complete_collaboration_assignment(
+                rs,
+                memo_result.get("markdown") or "",
+                artifact_paths=[memo_result["markdown_path"]] if memo_result.get("markdown_path") else [],
+                output_version_ids=[memo_result["memo_version_id"]]
+                if memo_result.get("memo_version_id")
+                else [],
+            )
+            update_job(thread_id, status="complete")
+            _send_event(rs, {
+                "type": "run_complete",
+                "workflow": "memo",
+                "memo_id": memo_result.get("memo_id"),
+                "memo_version_id": memo_result.get("memo_version_id"),
+            })
+            rs.event_queue.put_nowait(None)
+            return
+
         # No interrupt → chat run or plan-less completion
         if not interrupts:
+            _sync_dcf_workspace_object(thread_id, session_id)
             update_job(thread_id, status="complete")
             _send_event(rs, {"type": "run_complete"})
             rs.event_queue.put_nowait(None)
@@ -646,6 +964,8 @@ async def _run_agent_task(
             break
 
         update_job(thread_id, status="complete")
+        _sync_dcf_workspace_object(thread_id, session_id)
+        _sync_report_workspace_object(thread_id, session_id, query)
         _send_event(rs, {"type": "run_complete"})
         agent_log.run_done(thread_id, _run_t, "done")
 
@@ -654,10 +974,33 @@ async def _run_agent_task(
         logger.error("Agent task failed:\n%s", tb)
         rs.status = "error"
         update_job(thread_id, status=rs.status, error=f"{type(exc).__name__}: {exc}")
+        if rs.collaboration_assignment_id:
+            update_assignment(
+                rs.collaboration_assignment_id,
+                "blocked",
+                rs.collaboration_actor_id or "agent:research",
+                thread_id=rs.thread_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         _send_event(rs, {"type": "error", "message": f"{type(exc).__name__}: {exc}\n\n{tb}"})
         agent_log.run_done(thread_id, _run_t, "error")
     finally:
+        trace_ended_at = time.time()
+        emit_trace_span(make_trace_span(
+            trace_id=rs.trace_id,
+            span_id=rs.root_span_id,
+            category="run",
+            name="agent_run",
+            status="error" if rs.status == "error" else "completed",
+            started_at=rs.trace_started_at,
+            ended_at=trace_ended_at,
+            duration_ms=(trace_ended_at - rs.trace_started_at) * 1000,
+            metadata={"mode": mode, "session_id": session_id, "final_status": rs.status},
+            error="agent run failed" if rs.status == "error" else None,
+        ))
         rs.event_queue.put_nowait(None)  # sentinel — closes SSE stream
+        _run_registry.pop(thread_id, None)
+        set_ui_event_handler(None)
 
 
 # ---------------------------------------------------------------------------
@@ -684,8 +1027,7 @@ async def _find_amend_checkpoint(
     """
     target_index = -1
     snapshots: list[Any] = []
-    # MemorySaver returns a sync iterator; iterate without async-for.
-    for snap in agent_graph.get_state_history(config):
+    async for snap in agent_graph.aget_state_history(config):
         snapshots.append(snap)
         msgs = (snap.values or {}).get("messages") or []
         if target_index == -1:
@@ -722,13 +1064,18 @@ async def _run_amended_agent_task(
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     rs = _run_registry[thread_id]
+    set_trace_context(rs.trace_id, rs.root_span_id)
     set_thread_id(thread_id)
     set_ui_event_handler(_make_event_bridge(rs))
     session_memory = get_session_memory(session_id)
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": [TraceCallbackHandler(rs.trace_id, rs.root_span_id)],
+    }
     _run_t = agent_log.run_start(thread_id, new_content, mode)
 
     try:
+        await _await_stream_subscriber(rs)
         target_config, target_index = await _find_amend_checkpoint(
             agent_graph, config, original_content,
         )
@@ -748,12 +1095,14 @@ async def _run_amended_agent_task(
         result = await agent_graph.ainvoke(
             {
                 "messages": [HumanMessage(content=new_content)],
+                "trace_id": rs.trace_id,
+                "root_span_id": rs.root_span_id,
                 "mode": mode,
                 "resolved_intent": None,
                 "session_id": session_id,
                 "session_memory": session_memory,
             },
-            config=target_config,
+            config={**target_config, "callbacks": config["callbacks"]},
         )
 
         # Mirror the simple completion path from _run_agent_task. The amended
@@ -775,6 +1124,19 @@ async def _run_amended_agent_task(
         _send_event(rs, {"type": "error", "message": f"{type(exc).__name__}: {exc}\n\n{tb}"})
         agent_log.run_done(thread_id, _run_t, "error")
     finally:
+        trace_ended_at = time.time()
+        emit_trace_span(make_trace_span(
+            trace_id=rs.trace_id,
+            span_id=rs.root_span_id,
+            category="run",
+            name="agent_run",
+            status="error" if rs.status == "error" else "completed",
+            started_at=rs.trace_started_at,
+            ended_at=trace_ended_at,
+            duration_ms=(trace_ended_at - rs.trace_started_at) * 1000,
+            metadata={"mode": mode, "session_id": session_id, "amended": True, "final_status": rs.status},
+            error="amended agent run failed" if rs.status == "error" else None,
+        ))
         rs.event_queue.put_nowait(None)
         if rs.status not in _RUNNING_STATUSES:
             _run_registry.pop(thread_id, None)
@@ -787,7 +1149,11 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
     from utils import set_thread_id, set_ui_event_handler  # noqa: PLC0415
 
     rs = _run_registry[thread_id]
-    config = {"configurable": {"thread_id": thread_id}}
+    set_trace_context(rs.trace_id, rs.root_span_id)
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": [TraceCallbackHandler(rs.trace_id, rs.root_span_id)],
+    }
     set_thread_id(thread_id)
     set_ui_event_handler(_make_event_bridge(rs))
 
@@ -832,6 +1198,7 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
     }
 
     try:
+        await _await_stream_subscriber(rs)
         rs.status = "workflow_running"
         update_job(thread_id, status=rs.status, intent="workflow_dcf")
         # Workflow-started activity is emitted from inside normalize_input_node
@@ -882,7 +1249,9 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
             result = await dcf_workflow_app.ainvoke(Command(resume=resume_payload), config=config)
 
         result_path = result.get("result_path")
-        update_job(thread_id, status="complete")
+        _sync_dcf_workspace_object(thread_id, request.session_id or "")
+        rs.status = "complete"
+        update_job(thread_id, status=rs.status)
         _send_event(
             rs,
             {
@@ -906,6 +1275,19 @@ async def _run_dcf_workflow_task(thread_id: str, request: "DCFRunRequest") -> No
             },
         )
     finally:
+        trace_ended_at = time.time()
+        emit_trace_span(make_trace_span(
+            trace_id=rs.trace_id,
+            span_id=rs.root_span_id,
+            category="run",
+            name="dcf_workflow_run",
+            status="error" if rs.status == "error" else "completed",
+            started_at=rs.trace_started_at,
+            ended_at=trace_ended_at,
+            duration_ms=(trace_ended_at - rs.trace_started_at) * 1000,
+            metadata={"ticker": request.ticker, "final_status": rs.status},
+            error="DCF workflow run failed" if rs.status == "error" else None,
+        ))
         rs.event_queue.put_nowait(None)
         if rs.status not in _RUNNING_STATUSES:
             _run_registry.pop(thread_id, None)
@@ -940,6 +1322,285 @@ def _workflow_result_path(thread_id: str, filename: str) -> Path:
     return _runs_dir_for(thread_id) / filename
 
 
+def _money(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"${number:,.2f}"
+
+
+def _sync_dcf_workspace_object(
+    thread_id: str,
+    session_id: str = "",
+    *,
+    result_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    path = Path(result_path) if result_path else _workflow_result_path(thread_id, "dcf_output.json")
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read DCF workspace object payload thread=%s", thread_id, exc_info=True)
+        return None
+
+    persisted_version_id = payload.get("result_version_id")
+    if persisted_version_id:
+        current = get_workspace_object(f"dcf_run:{thread_id}")
+        if current and current.get("version_id") == persisted_version_id:
+            return current
+
+    ticker = str(payload.get("ticker") or "DCF").upper()
+    valuation = payload.get("valuation") if isinstance(payload.get("valuation"), dict) else {}
+    implied = valuation.get("implied_share_price") if valuation else payload.get("implied_share_price")
+    current = valuation.get("current_price") if valuation else payload.get("current_price")
+    confidence = payload.get("confidence_label") or payload.get("confidence")
+    summary_parts = [f"Implied {_money(implied)}"]
+    if current is not None:
+        summary_parts.append(f"spot {_money(current)}")
+    if confidence:
+        summary_parts.append(f"confidence {confidence}")
+
+    return upsert_workspace_object({
+        "object_id": f"dcf_run:{thread_id}",
+        "object_type": "dcf_run",
+        "schema_ref": "domain.cases.ValuationRunResult",
+        "schema_version": "0.1",
+        "title": f"{ticker} DCF run",
+        "status": "complete",
+        "session_id": session_id or payload.get("session_id") or "",
+        "thread_id": thread_id,
+        "run_id": payload.get("kg_run_id") or thread_id,
+        "created_by": "dcf_workflow",
+        "updated_by": "dcf_workflow",
+        "source_message_id": None,
+        "source_object_ids": [],
+        "entity_refs": [{"kind": "company", "name": ticker, "ticker": ticker}],
+        "source_refs": [],
+        "kg_node_ids": [payload.get("kg_run_id")] if payload.get("kg_run_id") else [],
+        "artifact_paths": [
+            f"/runs/{thread_id}/dcf-report.md",
+            f"/runs/{thread_id}/dcf-report.pdf?inline=1",
+            f"/workflows/dcf/runs/{thread_id}/result",
+        ],
+        "summary": " · ".join(summary_parts),
+        "search_text": f"{ticker} DCF valuation FCFF implied share price WACC terminal growth",
+        "tags": [ticker.lower(), "dcf", "valuation"],
+        "confidence": payload.get("effective_confidence") if isinstance(payload.get("effective_confidence"), (int, float)) else None,
+        "quality": {
+            "validation_status": payload.get("model_validity"),
+            "warnings": payload.get("valuation_flags") or [],
+            "blocking_gaps": [payload.get("invalidation_reason")] if payload.get("invalidation_reason") else [],
+        },
+        "payload": {
+            "ticker": ticker,
+            "kg_run_id": payload.get("kg_run_id"),
+            "implied_share_price": implied,
+            "current_price": current,
+            "confidence_label": confidence,
+            "model_validity": payload.get("model_validity"),
+            "result_path": str(path),
+        },
+    })
+
+
+def _object_type_from_query(query: str, content: str = "") -> str | None:
+    q = (query or "").lower()
+    c = (content or "").lower()
+    if "deck" in q or "presentation" in q or "slides" in q:
+        return "deck"
+    if "memo" in q or "investment committee" in q or "ic memo" in q:
+        return "memo"
+    if "compare" in q or "comparison" in q or " vs " in q or "versus" in q:
+        return "comparison"
+    if "[doc:" in content or "document" in q or "pdf" in q or "uploaded" in q or "citations" in c:
+        return "document_analysis"
+    return None
+
+
+def _sync_text_workspace_object(
+    *,
+    thread_id: str,
+    session_id: str,
+    query: str,
+    content: str,
+    artifact_paths: list[str] | None = None,
+) -> dict[str, Any] | None:
+    if _workflow_result_path(thread_id, "dcf_output.json").exists():
+        return None
+    object_type = _object_type_from_query(query, content)
+    if not object_type or object_type == "deck":
+        return None
+    title_seed = " ".join(query.strip().split())[:80] or object_type.replace("_", " ").title()
+    summary = " ".join(content.strip().split())[:220] if content else None
+    return upsert_workspace_object({
+        "object_id": f"{object_type}:{thread_id}",
+        "object_type": object_type,
+        "schema_ref": f"workspace.{object_type}",
+        "schema_version": "0.1",
+        "title": title_seed,
+        "status": "complete",
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "created_by": "chat_workflow",
+        "updated_by": "chat_workflow",
+        "source_message_id": None,
+        "source_object_ids": [],
+        "entity_refs": [],
+        "source_refs": [],
+        "kg_node_ids": [],
+        "artifact_paths": artifact_paths or [],
+        "summary": summary,
+        "search_text": f"{query} {summary or ''}".strip(),
+        "tags": [object_type],
+        "quality": {},
+        "payload": {
+            "query": query,
+            "content": content,
+        },
+    })
+
+
+def _sync_report_workspace_object(thread_id: str, session_id: str, query: str) -> dict[str, Any] | None:
+    current = get_workspace_object(f"research_report:{thread_id}")
+    if current:
+        return current
+    path = _report_path(thread_id)
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _sync_text_workspace_object(
+        thread_id=thread_id,
+        session_id=session_id,
+        query=query,
+        content=content,
+        artifact_paths=[f"/runs/{thread_id}/report"],
+    )
+
+
+def _sync_deck_workspace_object(
+    *,
+    thread_id: str,
+    session_id: str,
+    deck_title: str | None,
+    pptx_path: str | None,
+    slide_count: int | None = None,
+    result_version_id: str | None = None,
+) -> dict[str, Any] | None:
+    if result_version_id:
+        current = get_workspace_object(f"deck:{thread_id}")
+        if current and current.get("version_id") == result_version_id:
+            return current
+    title = deck_title or "Presentation deck"
+    artifacts: list[str] = []
+    if pptx_path:
+        filename = Path(str(pptx_path)).name
+        artifacts.append(f"/runs/{thread_id}/decks/{filename}")
+    return upsert_workspace_object({
+        "object_id": f"deck:{thread_id}",
+        "object_type": "deck",
+        "schema_ref": "workspace.deck",
+        "schema_version": "0.1",
+        "title": title,
+        "status": "complete",
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "run_id": thread_id,
+        "created_by": "deck_workflow",
+        "updated_by": "deck_workflow",
+        "source_message_id": None,
+        "source_object_ids": [],
+        "entity_refs": [],
+        "source_refs": [],
+        "kg_node_ids": [],
+        "artifact_paths": artifacts,
+        "summary": f"{slide_count or 0} slides" if slide_count is not None else None,
+        "search_text": f"{title} deck presentation slides",
+        "tags": ["deck", "presentation"],
+        "quality": {},
+        "payload": {
+            "deck_title": deck_title,
+            "pptx_path": pptx_path,
+            "slide_count": slide_count,
+        },
+    })
+
+
+def _sync_uploaded_document_workspace_object(info: dict[str, Any]) -> dict[str, Any] | None:
+    doc_id = str(info.get("doc_id") or "")
+    if not doc_id:
+        return None
+
+    filename = str(info.get("filename") or "Uploaded document")
+    status = str(info.get("status") or "processing")
+    stage = info.get("stage")
+    page_count = int(info.get("page_count") or 0)
+    chunk_count = int(info.get("chunk_count") or 0)
+    company = info.get("company")
+    ticker = info.get("ticker")
+    fiscal_period = info.get("fiscal_period")
+
+    summary_parts: list[str] = []
+    if company:
+        summary_parts.append(str(company))
+    if ticker:
+        summary_parts.append(str(ticker).upper())
+    if fiscal_period:
+        summary_parts.append(str(fiscal_period))
+    if page_count:
+        summary_parts.append(f"{page_count} pg")
+    elif stage:
+        summary_parts.append(str(stage))
+
+    return upsert_workspace_object({
+        "object_id": f"uploaded_document:{doc_id}",
+        "object_type": "uploaded_document",
+        "schema_ref": "workspace.uploaded_document",
+        "schema_version": "0.1",
+        "title": filename,
+        "status": status,
+        "session_id": info.get("session_id") or "",
+        "thread_id": None,
+        "created_by": "document_ingest",
+        "updated_by": "document_ingest",
+        "source_message_id": None,
+        "source_object_ids": [],
+        "entity_refs": [
+            {"kind": "company", "name": str(company), "ticker": str(ticker).upper() if ticker else None}
+        ] if company or ticker else [],
+        "source_refs": [{
+            "source_id": f"doc:{doc_id}",
+            "source_type": "document",
+            "title": filename,
+            "object_id": f"uploaded_document:{doc_id}",
+            "period": fiscal_period,
+            "license_status": "unknown",
+        }],
+        "kg_node_ids": [f"doc:{doc_id}"],
+        "artifact_paths": [f"/documents/{doc_id}/file"],
+        "summary": " · ".join(summary_parts) if summary_parts else (f"{chunk_count} chunks" if chunk_count else None),
+        "search_text": " ".join(str(part) for part in [filename, company, ticker, fiscal_period, stage] if part),
+        "tags": [tag for tag in ["uploaded_document", str(ticker).lower() if ticker else ""] if tag],
+        "quality": {"ingest_stage": stage, "chunk_count": chunk_count, "page_count": page_count},
+        "payload": {
+            "doc_id": doc_id,
+            "filename": filename,
+            "status": status,
+            "stage": stage,
+            "chunk_count": chunk_count,
+            "page_count": page_count,
+            "company": company,
+            "ticker": ticker,
+            "doc_type": info.get("doc_type"),
+            "fiscal_period": fiscal_period,
+        },
+    })
+
+
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
@@ -962,6 +1623,8 @@ class RunCreatedResponse(BaseModel):
     # this back as ?after_id= when opening the SSE stream so prior turns in
     # the same chat thread don't get replayed as live events.
     start_event_id: int = 0
+    trace_id: str | None = None
+    root_span_id: str | None = None
 
 
 class DecisionRequest(BaseModel):
@@ -1022,6 +1685,81 @@ class JobSummary(BaseModel):
     mode: str
     intent: str | None
     created_at: str
+
+
+class WorkspaceObject(BaseModel):
+    object_id: str
+    object_type: str
+    schema_ref: str | None = None
+    schema_version: str = "0.1"
+    title: str
+    status: str
+    session_id: str | None = None
+    thread_id: str | None = None
+    case_id: str | None = None
+    task_id: str | None = None
+    run_id: str | None = None
+    source_message_id: str | None = None
+    created_by: str | None = None
+    updated_by: str | None = None
+    source_object_ids: list[str] = Field(default_factory=list)
+    source_version_ids: list[str] = Field(default_factory=list)
+    entity_refs: list[dict[str, Any]] = Field(default_factory=list)
+    source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    kg_node_ids: list[str] = Field(default_factory=list)
+    artifact_paths: list[str] = Field(default_factory=list)
+    search_text: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    confidence: float | None = None
+    quality: dict[str, Any] = Field(default_factory=dict)
+    visibility: str = "session"
+    summary: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+    version_id: str | None = None
+    version_number: int = 0
+
+
+class WorkspaceObjectAction(BaseModel):
+    action_id: int
+    object_id: str
+    action_type: str
+    actor_id: str
+    previous_version_id: str | None = None
+    resulting_version_id: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class WorkspaceObjectCreate(BaseModel):
+    object_id: str | None = None
+    object_type: str
+    schema_ref: str | None = None
+    schema_version: str = "0.1"
+    title: str
+    status: str = "complete"
+    session_id: str | None = None
+    thread_id: str | None = None
+    case_id: str | None = None
+    task_id: str | None = None
+    run_id: str | None = None
+    source_message_id: str | None = None
+    created_by: str | None = None
+    updated_by: str | None = None
+    source_object_ids: list[str] = Field(default_factory=list)
+    source_version_ids: list[str] = Field(default_factory=list)
+    entity_refs: list[dict[str, Any]] = Field(default_factory=list)
+    source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    kg_node_ids: list[str] = Field(default_factory=list)
+    artifact_paths: list[str] = Field(default_factory=list)
+    search_text: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    confidence: float | None = None
+    quality: dict[str, Any] = Field(default_factory=dict)
+    visibility: str = "session"
+    summary: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1840,7 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
 
     loop = asyncio.get_running_loop()
     rs = RunState(thread_id, loop, body.query, body.mode, session_id)
+    rs.stream_expected = True
     _run_registry[thread_id] = rs
     upsert_job(
         thread_id=thread_id,
@@ -1110,6 +1849,15 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
         status=rs.status,
         session_id=session_id,
     )
+    _send_event(rs, make_trace_span(
+        trace_id=rs.trace_id,
+        span_id=rs.root_span_id,
+        category="run",
+        name="agent_run",
+        status="started",
+        started_at=rs.trace_started_at,
+        metadata={"mode": body.mode, "session_id": session_id},
+    ))
     asyncio.create_task(_run_agent_task(
         thread_id,
         body.query,
@@ -1117,7 +1865,12 @@ async def create_run(body: RunRequest) -> RunCreatedResponse:
         session_id,
         body.user_settings,
     ))
-    return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
+    return RunCreatedResponse(
+        thread_id=thread_id,
+        start_event_id=start_event_id,
+        trace_id=rs.trace_id,
+        root_span_id=rs.root_span_id,
+    )
 
 
 @app.post("/runs/{thread_id}/amend", response_model=RunCreatedResponse)
@@ -1143,6 +1896,7 @@ async def amend_message(thread_id: str, body: AmendRequest) -> RunCreatedRespons
 
     loop = asyncio.get_running_loop()
     rs = RunState(thread_id, loop, body.new_content, body.mode, session_id)
+    rs.stream_expected = True
     _run_registry[thread_id] = rs
     upsert_job(
         thread_id=thread_id,
@@ -1151,13 +1905,27 @@ async def amend_message(thread_id: str, body: AmendRequest) -> RunCreatedRespons
         status=rs.status,
         session_id=session_id,
     )
+    _send_event(rs, make_trace_span(
+        trace_id=rs.trace_id,
+        span_id=rs.root_span_id,
+        category="run",
+        name="agent_run",
+        status="started",
+        started_at=rs.trace_started_at,
+        metadata={"mode": body.mode, "session_id": session_id, "amended": True},
+    ))
     asyncio.create_task(
         _run_amended_agent_task(
             thread_id, body.original_content, body.new_content,
             body.mode, session_id,
         )
     )
-    return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
+    return RunCreatedResponse(
+        thread_id=thread_id,
+        start_event_id=start_event_id,
+        trace_id=rs.trace_id,
+        root_span_id=rs.root_span_id,
+    )
 
 
 @app.post("/workflows/dcf/runs", response_model=RunCreatedResponse)
@@ -1177,6 +1945,7 @@ async def create_dcf_run(body: DCFRunRequest) -> RunCreatedResponse:
 
     loop = asyncio.get_running_loop()
     rs = RunState(thread_id, loop, f"DCF valuation for {ticker}", "workflow_dcf", session_id)
+    rs.stream_expected = True
     rs.status = "workflow_running"
     rs.intent = "workflow_dcf"
     _run_registry[thread_id] = rs
@@ -1189,8 +1958,22 @@ async def create_dcf_run(body: DCFRunRequest) -> RunCreatedResponse:
         intent=rs.intent,
     )
     start_event_id = _latest_event_id_for(thread_id)
+    _send_event(rs, make_trace_span(
+        trace_id=rs.trace_id,
+        span_id=rs.root_span_id,
+        category="run",
+        name="dcf_workflow_run",
+        status="started",
+        started_at=rs.trace_started_at,
+        metadata={"ticker": ticker, "session_id": session_id},
+    ))
     asyncio.create_task(_run_dcf_workflow_task(thread_id, body))
-    return RunCreatedResponse(thread_id=thread_id, start_event_id=start_event_id)
+    return RunCreatedResponse(
+        thread_id=thread_id,
+        start_event_id=start_event_id,
+        trace_id=rs.trace_id,
+        root_span_id=rs.root_span_id,
+    )
 
 
 @app.get("/runs/{thread_id}/events")
@@ -1215,12 +1998,30 @@ async def stream_events(
         last_seen = replay_after or 0
         last_ping = time.time()
         stream_started_at = time.time()
+        transport_span_id = f"transport_{uuid4().hex[:12]}"
+        trace_id = rs.trace_id if rs is not None else thread_id
+        root_span_id = rs.root_span_id if rs is not None else None
         replay_events_sent = 0
         queue_events_sent = 0
         db_poll_events_sent = 0
         db_poll_rounds = 0
 
         try:
+            # Open transport before releasing graph execution. Padding defeats
+            # proxy/browser minimum-buffer thresholds without visible events.
+            rs_live = _run_registry.get(thread_id)
+            if rs_live is not None:
+                rs_live.stream_connected.set()
+            yield ":" + (" " * 2048) + "\n\n"
+            _persist_event(thread_id, make_trace_span(
+                trace_id=trace_id,
+                span_id=transport_span_id,
+                parent_span_id=root_span_id,
+                category="transport",
+                name="sse_connection",
+                status="started",
+                started_at=stream_started_at,
+            ))
             # Initial durable replay so reconnects never miss persisted events.
             events = list_job_events(thread_id, last_seen)
             if events:
@@ -1275,7 +2076,25 @@ async def stream_events(
                     last_ping = time.time()
                     yield 'data: {"type":"ping"}\n\n'
         finally:
-            elapsed_ms = int((time.time() - stream_started_at) * 1000)
+            stream_ended_at = time.time()
+            elapsed_ms = int((stream_ended_at - stream_started_at) * 1000)
+            _persist_event(thread_id, make_trace_span(
+                trace_id=trace_id,
+                span_id=transport_span_id,
+                parent_span_id=root_span_id,
+                category="transport",
+                name="sse_connection",
+                status="completed",
+                started_at=stream_started_at,
+                ended_at=stream_ended_at,
+                duration_ms=elapsed_ms,
+                metadata={
+                    "replay_events": replay_events_sent,
+                    "queue_events": queue_events_sent,
+                    "db_poll_events": db_poll_events_sent,
+                    "db_poll_rounds": db_poll_rounds,
+                },
+            ))
             logger.info(
                 "SSE stream closed thread_id=%s elapsed_ms=%d replay_events=%d queue_events=%d db_poll_events=%d db_poll_rounds=%d",
                 thread_id,
@@ -1289,8 +2108,49 @@ async def stream_events(
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
+
+
+@app.get("/runs/{thread_id}/trace")
+async def get_run_trace(
+    thread_id: str,
+    trace_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    if get_job(thread_id) is None:
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+    span_events = [
+        event for event in list_job_events(thread_id, 0, limit=10_000)
+        if event.get("type") == "trace_span"
+    ]
+    selected_trace_id = trace_id
+    if selected_trace_id is None and span_events:
+        selected_trace_id = str(span_events[-1].get("trace_id") or "") or None
+    if selected_trace_id:
+        span_events = [event for event in span_events if event.get("trace_id") == selected_trace_id]
+
+    merged: dict[str, dict[str, Any]] = {}
+    for event in span_events:
+        span_id = str(event.get("span_id") or "")
+        if not span_id:
+            continue
+        prior = merged.get(span_id, {})
+        merged[span_id] = {
+            **prior,
+            **event,
+            "started_at": prior.get("started_at", event.get("started_at")),
+            "metadata": {**(prior.get("metadata") or {}), **(event.get("metadata") or {})},
+        }
+    spans = sorted(merged.values(), key=lambda item: float(item.get("started_at") or 0))
+    return {
+        "thread_id": thread_id,
+        "trace_id": selected_trace_id,
+        "spans": spans,
+    }
 
 
 @app.post("/runs/{thread_id}/decision")
@@ -1371,6 +2231,19 @@ class DeckDecisionRequest(BaseModel):
     feedback: str | None = None
 
 
+class MemoDecisionRequest(BaseModel):
+    approved: bool = True
+    action: str = "approve"
+    draft: dict[str, Any] | None = None
+    feedback: str | None = None
+
+
+class WorkflowContextDecisionRequest(BaseModel):
+    approved: bool = True
+    action: str = "approve"
+    context: dict[str, Any] | None = None
+
+
 class DcfContinueRequest(BaseModel):
     action: str = "approve"
     assumptions: dict[str, float] | None = None
@@ -1399,6 +2272,30 @@ async def submit_dcf_decision(
     return {"ok": True}
 
 
+@app.post("/runs/{thread_id}/workflow-context-decision")
+async def submit_workflow_context_decision(
+    thread_id: str,
+    body: WorkflowContextDecisionRequest,
+) -> dict:
+    """Submit user decision on workflow setup review."""
+    rs = _run_registry.get(thread_id)
+    if rs is None or rs.status != "awaiting_workflow_context":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thread '{thread_id}' is not awaiting workflow setup review.",
+        )
+
+    if rs.hitl_future and not rs.hitl_future.done():
+        rs.hitl_future.set_result(
+            {
+                "approved": body.approved,
+                "action": "cancel" if not body.approved else body.action,
+                "context": body.context or {},
+            }
+        )
+    return {"ok": True}
+
+
 @app.post("/runs/{thread_id}/deck-decision")
 async def submit_deck_decision(
     thread_id: str,
@@ -1421,6 +2318,25 @@ async def submit_deck_decision(
                 "feedback": body.feedback,
             }
         )
+    return {"ok": True}
+
+
+@app.post("/runs/{thread_id}/memo-decision")
+async def submit_memo_decision(thread_id: str, body: MemoDecisionRequest) -> dict:
+    """Submit user decision on memo draft review."""
+    rs = _run_registry.get(thread_id)
+    if rs is None or rs.status != "awaiting_memo_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thread '{thread_id}' is not awaiting memo review.",
+        )
+    if rs.hitl_future and not rs.hitl_future.done():
+        rs.hitl_future.set_result({
+            "approved": body.approved,
+            "action": "reject" if not body.approved else body.action,
+            "draft": body.draft,
+            "feedback": body.feedback,
+        })
     return {"ok": True}
 
 
@@ -1681,6 +2597,456 @@ def list_jobs() -> list[JobSummary]:
     return sorted(jobs, key=lambda j: j.created_at, reverse=True)
 
 
+@app.get("/threads/{thread_id}/routes", response_model=list[dict[str, Any]])
+def list_thread_routes(
+    thread_id: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[dict[str, Any]]:
+    """Return durable route decisions in chronological turn order."""
+    return list_route_records(thread_id=thread_id, limit=limit)
+
+
+@app.get("/workspace/objects", response_model=list[WorkspaceObject])
+def list_workspace_objects_endpoint(
+    session_id: str | None = Query(default=None),
+    object_type: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[WorkspaceObject]:
+    return [
+        WorkspaceObject(**obj)
+        for obj in list_workspace_objects(
+            session_id=session_id,
+            object_type=object_type,
+            limit=limit,
+        )
+    ]
+
+
+@app.get("/workspace/objects/{object_id}", response_model=WorkspaceObject)
+def get_workspace_object_endpoint(object_id: str) -> WorkspaceObject:
+    obj = get_workspace_object(object_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail=f"Workspace object '{object_id}' not found")
+    return WorkspaceObject(**obj)
+
+
+@app.get("/workspace/objects/{object_id}/versions", response_model=list[WorkspaceObject])
+def list_workspace_object_versions_endpoint(object_id: str) -> list[WorkspaceObject]:
+    versions = list_workspace_object_versions(object_id)
+    if not versions and not get_workspace_object(object_id):
+        raise HTTPException(status_code=404, detail=f"Workspace object '{object_id}' not found")
+    return [WorkspaceObject(**version) for version in versions]
+
+
+@app.get("/workspace/objects/{object_id}/versions/{version_number}", response_model=WorkspaceObject)
+def get_workspace_object_version_endpoint(object_id: str, version_number: int) -> WorkspaceObject:
+    version = get_workspace_object_version(object_id, version_number)
+    if not version:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workspace object '{object_id}' version {version_number} not found",
+        )
+    return WorkspaceObject(**version)
+
+
+@app.get("/workspace/objects/{object_id}/actions", response_model=list[WorkspaceObjectAction])
+def list_workspace_object_actions_endpoint(object_id: str) -> list[WorkspaceObjectAction]:
+    if not get_workspace_object(object_id):
+        raise HTTPException(status_code=404, detail=f"Workspace object '{object_id}' not found")
+    return [WorkspaceObjectAction(**action) for action in list_object_actions(object_id)]
+
+
+class ActorCreateRequest(BaseModel):
+    actor_id: str | None = None
+    kind: str = "human"
+    display_name: str
+    handle: str
+    avatar_url: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    status: str = "available"
+
+
+class ChannelCreateRequest(BaseModel):
+    name: str
+    kind: str = "channel"
+    topic: str = ""
+    object_id: str | None = None
+    case_id: str | None = None
+    actor_id: str = "human:local"
+
+
+class CollaborationMessageRequest(BaseModel):
+    body: str
+    actor_id: str = "human:local"
+    mentions: list[dict[str, Any]] = Field(default_factory=list)
+    object_version_ids: list[str] = Field(default_factory=list)
+    parent_message_id: str | None = None
+
+
+class ObjectCommentRequest(BaseModel):
+    workspace_id: str
+    object_version_id: str
+    body: str
+    actor_id: str = "human:local"
+    block_id: str | None = None
+
+
+class ApprovalCreateRequest(BaseModel):
+    workspace_id: str
+    object_version_id: str
+    assigned_to: str
+    actor_id: str = "human:local"
+    note: str = ""
+
+
+class MembershipRequest(BaseModel):
+    actor_id: str
+    role: str = "viewer"
+
+
+class SuggestionCreateRequest(BaseModel):
+    workspace_id: str
+    base_version_id: str
+    patch: dict[str, Any]
+    actor_id: str = "human:local"
+    block_id: str | None = None
+    rationale: str = ""
+
+
+class CollaborationDecisionRequest(BaseModel):
+    decision: str
+    actor_id: str = "human:local"
+    note: str = ""
+
+
+class ReadStateRequest(BaseModel):
+    read: bool = True
+    actor_id: str = "human:local"
+
+
+class PresenceRequest(BaseModel):
+    status: str = "available"
+
+
+class AssignmentCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    assigned_to: str
+    actor_id: str = "human:local"
+    case_id: str | None = None
+    object_version_ids: list[str] = Field(default_factory=list)
+    due_at: str | None = None
+    channel_id: str | None = None
+    source_message_id: str | None = None
+    start_now: bool = False
+
+
+class AssignmentStatusRequest(BaseModel):
+    status: str
+    actor_id: str = "human:local"
+
+
+@app.post("/collaboration/workspaces/{workspace_id}", response_model=dict[str, Any])
+def bootstrap_collaboration_workspace(workspace_id: str, name: str = "Finance workspace") -> dict[str, Any]:
+    return ensure_workspace(workspace_id, name=name)
+
+
+@app.get("/collaboration/workspaces/{workspace_id}/actors", response_model=list[dict[str, Any]])
+def collaboration_actor_directory(workspace_id: str) -> list[dict[str, Any]]:
+    ensure_workspace(workspace_id)
+    return list_actors(workspace_id)
+
+
+@app.post("/collaboration/actors", response_model=dict[str, Any])
+def create_collaboration_actor(body: ActorCreateRequest) -> dict[str, Any]:
+    return upsert_actor(body.model_dump(exclude_none=True))
+
+
+@app.post("/collaboration/workspaces/{workspace_id}/memberships", response_model=dict[str, Any])
+def create_collaboration_membership(workspace_id: str, body: MembershipRequest) -> dict[str, Any]:
+    try:
+        return add_membership(workspace_id, body.actor_id, body.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/collaboration/actors/{actor_id}/presence", response_model=dict[str, Any])
+def update_collaboration_presence(actor_id: str, body: PresenceRequest) -> dict[str, Any]:
+    if body.status not in {"available", "working", "waiting", "blocked", "offline"}:
+        raise HTTPException(status_code=422, detail="Invalid presence status")
+    result = update_actor_status(actor_id, body.status)
+    if not result:
+        raise HTTPException(status_code=404, detail="Actor not found")
+    return result
+
+
+@app.get("/collaboration/workspaces/{workspace_id}/assignments", response_model=list[dict[str, Any]])
+def collaboration_assignments(workspace_id: str, actor_id: str | None = None) -> list[dict[str, Any]]:
+    return list_assignments(workspace_id, actor_id)
+
+
+async def _start_collaboration_assignment(assignment: dict[str, Any]) -> dict[str, Any]:
+    """Launch a confirmed task through the shared main graph."""
+    workspace_id = assignment["workspace_id"]
+    actor_id = assignment["assigned_to"]
+    channel_id = assignment.get("channel_id")
+    refs = assignment.get("object_version_ids") or []
+    thread_id = assignment.get("thread_id") or f"thread_{uuid4().hex[:8]}"
+    query = assignment.get("description") or assignment["title"]
+    loop = asyncio.get_running_loop()
+    rs = RunState(thread_id, loop, query, "auto", workspace_id)
+    rs.collaboration_channel_id = channel_id
+    rs.collaboration_workspace_id = workspace_id
+    rs.collaboration_actor_id = actor_id
+    rs.collaboration_object_version_ids = list(refs)
+    rs.collaboration_assignment_id = assignment["assignment_id"]
+    rs.collaboration_task_context = {
+        "task_id": assignment["assignment_id"],
+        "title": assignment["title"],
+        "goal": assignment["description"],
+        "status": "working",
+        "assigned_by": assignment["assigned_by"],
+        "assigned_to": assignment["assigned_to"],
+        "channel_id": channel_id,
+        "source_message_id": assignment.get("source_message_id"),
+        "input_object_version_ids": list(refs),
+    }
+    _run_registry[thread_id] = rs
+    upsert_job(thread_id=thread_id, query=query, mode="auto", status=rs.status, session_id=workspace_id)
+    assignment = update_assignment(
+        assignment["assignment_id"], "working", actor_id, thread_id=thread_id,
+    ) or assignment
+    asyncio.create_task(_run_agent_task(thread_id, query, "auto", workspace_id, {}))
+    return assignment
+
+
+@app.post("/collaboration/workspaces/{workspace_id}/assignments", response_model=dict[str, Any])
+async def create_collaboration_assignment(workspace_id: str, body: AssignmentCreateRequest) -> dict[str, Any]:
+    try:
+        require_workspace_role(workspace_id, body.actor_id, "commenter")
+        require_workspace_role(workspace_id, body.assigned_to, "viewer")
+        if body.channel_id and not any(channel["channel_id"] == body.channel_id for channel in list_channels(workspace_id)):
+            raise HTTPException(status_code=422, detail="Channel does not belong to workspace")
+        assignment = create_assignment(workspace_id, body.model_dump(exclude={"actor_id", "start_now"}), body.actor_id)
+        if body.start_now and body.assigned_to.startswith("agent:"):
+            return await _start_collaboration_assignment(assignment)
+        return assignment
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.patch("/collaboration/assignments/{assignment_id}", response_model=dict[str, Any])
+def update_collaboration_assignment(assignment_id: str, body: AssignmentStatusRequest) -> dict[str, Any]:
+    if body.status not in {"open", "working", "blocked", "completed", "cancelled"}:
+        raise HTTPException(status_code=422, detail="Invalid assignment status")
+    try:
+        result = update_assignment(assignment_id, body.status, body.actor_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    return result
+
+
+@app.get("/collaboration/workspaces/{workspace_id}/channels", response_model=list[dict[str, Any]])
+def collaboration_channels(workspace_id: str) -> list[dict[str, Any]]:
+    ensure_workspace(workspace_id)
+    return list_channels(workspace_id)
+
+
+@app.post("/collaboration/workspaces/{workspace_id}/channels", response_model=dict[str, Any])
+def create_collaboration_channel(workspace_id: str, body: ChannelCreateRequest) -> dict[str, Any]:
+    try:
+        return create_channel(workspace_id, body.model_dump(exclude={"actor_id"}), body.actor_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.get("/collaboration/channels/{channel_id}/messages", response_model=list[dict[str, Any]])
+def collaboration_messages(channel_id: str) -> list[dict[str, Any]]:
+    return list_messages(channel_id)
+
+
+@app.get("/collaboration/channels/{channel_id}/events")
+async def collaboration_channel_events(channel_id: str) -> StreamingResponse:
+    async def generate():
+        seen: set[str] = set()
+        last_ping = time.time()
+        while True:
+            try:
+                for message in list_messages(channel_id):
+                    message_id = str(message["message_id"])
+                    if message_id in seen:
+                        continue
+                    seen.add(message_id)
+                    yield f"data: {json.dumps({'type': 'collaboration_message', 'message': message}, ensure_ascii=False)}\n\n"
+                if time.time() - last_ping >= 20:
+                    last_ping = time.time()
+                    yield 'data: {"type":"ping"}\n\n'
+                await asyncio.sleep(0.75)
+            except asyncio.CancelledError:
+                return
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/collaboration/workspaces/{workspace_id}/channels/{channel_id}/messages", response_model=dict[str, Any])
+async def create_collaboration_message(workspace_id: str, channel_id: str, body: CollaborationMessageRequest) -> dict[str, Any]:
+    try:
+        require_workspace_role(workspace_id, body.actor_id, "commenter")
+        message = create_message(channel_id, workspace_id, body.actor_id, body.model_dump(exclude={"actor_id"}))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    actionable = next((mention for mention in body.mentions if mention.get("kind") == "agent" and mention.get("requested_action") in {"execute", "review"}), None)
+    if actionable:
+        thread_id = f"thread_{uuid4().hex[:8]}"
+        actor_id = str(actionable.get("target_id") or "agent:research")
+        refs = body.object_version_ids or actionable.get("context_refs") or []
+        assignment = create_assignment(workspace_id, {
+            "title": body.body[:160],
+            "description": body.body,
+            "assigned_to": actor_id,
+            "object_version_ids": refs,
+            "channel_id": channel_id,
+            "source_message_id": message["message_id"],
+            "thread_id": thread_id,
+        }, body.actor_id)
+        assignment = await _start_collaboration_assignment(assignment)
+        message["assignment"] = assignment
+    human_action = next((mention for mention in body.mentions if mention.get("kind") == "human" and mention.get("requested_action") in {"execute", "review"}), None)
+    if human_action:
+        assignment = create_assignment(workspace_id, {
+            "title": body.body[:160], "description": body.body,
+            "assigned_to": human_action["target_id"], "object_version_ids": body.object_version_ids,
+        }, body.actor_id)
+        message["human_assignment"] = assignment
+    return message
+
+
+@app.get("/workspace/objects/{object_id}/comments", response_model=list[dict[str, Any]])
+def workspace_object_comments(object_id: str) -> list[dict[str, Any]]:
+    return list_object_comments(object_id)
+
+
+@app.post("/workspace/objects/{object_id}/comments", response_model=dict[str, Any])
+def create_workspace_object_comment(object_id: str, body: ObjectCommentRequest) -> dict[str, Any]:
+    try:
+        require_workspace_role(body.workspace_id, body.actor_id, "commenter")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return create_object_comment(body.workspace_id, object_id, body.model_dump(exclude={"workspace_id", "actor_id"}), body.actor_id)
+
+
+@app.patch("/workspace/comments/{comment_id}", response_model=dict[str, Any])
+def update_workspace_object_comment(comment_id: str, body: ReadStateRequest) -> dict[str, Any]:
+    try:
+        result = resolve_comment(comment_id, body.read, body.actor_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    return result
+
+
+@app.get("/workspace/objects/{object_id}/suggestions", response_model=list[dict[str, Any]])
+def workspace_object_suggestions(object_id: str) -> list[dict[str, Any]]:
+    return list_object_suggestions(object_id)
+
+
+@app.post("/workspace/objects/{object_id}/suggestions", response_model=dict[str, Any])
+def create_workspace_object_suggestion(object_id: str, body: SuggestionCreateRequest) -> dict[str, Any]:
+    try:
+        require_workspace_role(body.workspace_id, body.actor_id, "reviewer")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return create_suggestion(body.workspace_id, object_id, body.model_dump(exclude={"workspace_id", "actor_id"}), body.actor_id)
+
+
+@app.post("/workspace/suggestions/{suggestion_id}/decision", response_model=dict[str, Any])
+def decide_workspace_object_suggestion(suggestion_id: str, body: CollaborationDecisionRequest) -> dict[str, Any]:
+    try:
+        result = decide_suggestion(suggestion_id, body.decision, body.actor_id)
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=403 if isinstance(exc, PermissionError) else 422, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    return result
+
+
+@app.post("/workspace/objects/{object_id}/approvals", response_model=dict[str, Any])
+def request_workspace_object_approval(object_id: str, body: ApprovalCreateRequest) -> dict[str, Any]:
+    try:
+        require_workspace_role(body.workspace_id, body.actor_id, "editor")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return create_approval(body.workspace_id, object_id, body.model_dump(exclude={"workspace_id", "actor_id"}), body.actor_id)
+
+
+@app.get("/workspace/objects/{object_id}/approvals", response_model=list[dict[str, Any]])
+def workspace_object_approvals(object_id: str) -> list[dict[str, Any]]:
+    return list_object_approvals(object_id)
+
+
+@app.post("/workspace/approvals/{approval_id}/decision", response_model=dict[str, Any])
+def decide_workspace_object_approval(approval_id: str, body: CollaborationDecisionRequest) -> dict[str, Any]:
+    try:
+        result = decide_approval(approval_id, body.decision, body.actor_id, body.note)
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=403 if isinstance(exc, PermissionError) else 422, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return result
+
+
+@app.get("/collaboration/actors/{actor_id}/notifications", response_model=list[dict[str, Any]])
+def collaboration_notifications(actor_id: str) -> list[dict[str, Any]]:
+    return list_notifications(actor_id)
+
+
+@app.patch("/collaboration/notifications/{notification_id}", response_model=dict[str, Any])
+def update_collaboration_notification(notification_id: str, body: ReadStateRequest) -> dict[str, Any]:
+    result = mark_notification_read(notification_id, body.read, body.actor_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return result
+
+
+@app.post("/workspace/objects", response_model=WorkspaceObject)
+def create_workspace_object_endpoint(body: WorkspaceObjectCreate) -> WorkspaceObject:
+    object_id = body.object_id or f"{body.object_type}:{uuid4().hex[:12]}"
+    obj = upsert_workspace_object({
+        "object_id": object_id,
+        "object_type": body.object_type,
+        "schema_ref": body.schema_ref,
+        "schema_version": body.schema_version,
+        "title": body.title,
+        "status": body.status,
+        "session_id": body.session_id,
+        "thread_id": body.thread_id,
+        "case_id": body.case_id,
+        "task_id": body.task_id,
+        "run_id": body.run_id,
+        "source_message_id": body.source_message_id,
+        "created_by": body.created_by,
+        "updated_by": body.updated_by,
+        "source_object_ids": body.source_object_ids,
+        "source_version_ids": body.source_version_ids,
+        "entity_refs": body.entity_refs,
+        "source_refs": body.source_refs,
+        "kg_node_ids": body.kg_node_ids,
+        "artifact_paths": body.artifact_paths,
+        "search_text": body.search_text,
+        "tags": body.tags,
+        "confidence": body.confidence,
+        "quality": body.quality,
+        "visibility": body.visibility,
+        "summary": body.summary,
+        "payload": body.payload,
+    })
+    return WorkspaceObject(**obj)
+
+
 # ---------------------------------------------------------------------------
 # Document endpoints (RAG)
 # ---------------------------------------------------------------------------
@@ -1703,6 +3069,31 @@ class DocumentInfo(BaseModel):
     ticker: str | None = None
     doc_type: str | None = None
     fiscal_period: str | None = None
+
+
+class DocumentCitationResponse(BaseModel):
+    citation_id: str
+    doc_id: str
+    document_version_id: str
+    filename: str
+    page: int | str | None = None
+    chunk_index: int
+    citation_label: str
+    company: str | None = None
+    ticker: str | None = None
+    doc_type: str | None = None
+    fiscal_period: str | None = None
+    text: str
+    previous_text: str = ""
+    next_text: str = ""
+    tables: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EvidenceQuery(BaseModel):
+    session_id: str
+    query: str
+    include_chunks: bool = True
+    limit: int = Field(default=8, ge=1, le=20)
 
 
 @app.post("/documents", response_model=DocumentInfo)
@@ -1728,6 +3119,7 @@ async def upload_document(
         "created_at": time.time(),
     }
     register_document(entry)
+    _sync_uploaded_document_workspace_object(entry)
 
     # Run parsing + embedding in a thread pool so we don't block the event loop
     loop = asyncio.get_running_loop()
@@ -1742,13 +3134,62 @@ def document_status(doc_id: str) -> DocumentInfo:
     info = _doc_registry.get(doc_id)
     if info is None:
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
+    _sync_uploaded_document_workspace_object(info)
     return DocumentInfo(**info)
 
 
 @app.get("/documents", response_model=list[DocumentInfo])
 def list_documents(session_id: str) -> list[DocumentInfo]:
     from documents import list_docs  # noqa: PLC0415
-    return [DocumentInfo(**d) for d in list_docs(session_id)]
+    docs = list_docs(session_id)
+    for doc in docs:
+        _sync_uploaded_document_workspace_object(doc)
+    return [DocumentInfo(**d) for d in docs]
+
+
+@app.get("/documents/citations/{citation_id}", response_model=DocumentCitationResponse)
+def get_document_citation_source(citation_id: str) -> DocumentCitationResponse:
+    from documents import get_document_citation  # noqa: PLC0415
+
+    try:
+        citation = get_document_citation(citation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return DocumentCitationResponse(**citation)
+
+
+@app.get("/documents/{doc_id}/versions", response_model=list[dict[str, Any]])
+def get_document_versions(doc_id: str) -> list[dict[str, Any]]:
+    versions = list_document_versions(doc_id)
+    if not versions:
+        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
+    return versions
+
+
+@app.get("/document-versions/{version_id}", response_model=dict[str, Any])
+def get_document_version_endpoint(version_id: str) -> dict[str, Any]:
+    version = get_document_version(version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail=f"Document version '{version_id}' not found")
+    return version
+
+
+@app.post("/memory/evidence", response_model=dict[str, Any])
+def retrieve_evidence(body: EvidenceQuery) -> dict[str, Any]:
+    from langchain_core.messages import HumanMessage  # noqa: PLC0415
+    from evidence_memory import build_evidence_pack  # noqa: PLC0415
+
+    return build_evidence_pack(
+        {
+            "messages": [HumanMessage(content=body.query)],
+            "session_id": body.session_id,
+            "route_decision": {"route_level": "small_task" if body.include_chunks else "direct"},
+        },
+        include_chunks=body.include_chunks,
+        limit=body.limit,
+    )
 
 
 @app.get("/documents/{doc_id}/file")
@@ -1773,6 +3214,7 @@ def remove_document(doc_id: str) -> dict:
     if doc_id not in _doc_registry:
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     delete_document(doc_id)
+    delete_workspace_object(f"uploaded_document:{doc_id}")
     return {"deleted": doc_id}
 
 

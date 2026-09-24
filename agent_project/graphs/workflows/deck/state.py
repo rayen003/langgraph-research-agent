@@ -32,6 +32,8 @@ class DcfOutputSource(_SourceBase):
     run_id: str | None = Field(default=None, description="KG dcf_run node ID, e.g. META::dcf_run::workflow_dcf::meta")
     payload_path: str | None = Field(default=None, description="Disk path to dcf_output.json")
     payload_inline: dict | None = Field(default=None, description="Full dcf_output.json dict passed directly")
+    object_id: str | None = Field(default=None, description="Durable workspace DCF object ID")
+    version_id: str | None = Field(default=None, description="Exact immutable DCF object version ID")
 
 
 class DocumentSource(_SourceBase):
@@ -375,6 +377,10 @@ SLIDE_MODELS: dict[str, str] = {
 
 
 class DeckState(TypedDict, total=False):
+    thread_id: str
+    deck_context_version_id: str | None
+    approved_outline_version_id: str | None
+    result_version_id: str | None
     # Input
     sources: list[dict]              # raw discriminated-union dicts (validated upstream)
     brief: dict                      # DeckBrief as dict

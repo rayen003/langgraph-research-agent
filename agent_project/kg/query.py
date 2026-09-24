@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -56,6 +57,16 @@ _TICKER_ALIASES: dict[str, str] = {
     "WALMART": "WMT",
     "COCA-COLA": "KO", "COCA COLA": "KO", "COKE": "KO",
 }
+
+
+def resolve_known_company_ticker(text: str) -> str | None:
+    """Resolve known company mention, including possessive spelling, to ticker."""
+    normalized = str(text or "").upper().replace("’", "'")
+    for alias in sorted(_TICKER_ALIASES, key=len, reverse=True):
+        pattern = rf"(?<![A-Z0-9]){re.escape(alias)}(?:'?S)?(?![A-Z0-9])"
+        if re.search(pattern, normalized):
+            return _TICKER_ALIASES[alias]
+    return None
 
 
 # Schema description injected into the LLM prompt so retrieval is structure-aware

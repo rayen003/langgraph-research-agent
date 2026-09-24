@@ -212,6 +212,14 @@ def resolve_deck_workflow_inputs(
                 s["run_id"] = run_node_id
                 logger.info("Deck inputs: linked dcf_output source to dcf_run node %s", run_node_id)
 
+    result_version_id = (payload or {}).get("result_version_id")
+    if result_version_id:
+        object_id = str(result_version_id).rsplit(":v", 1)[0]
+        for source in sources:
+            if source.get("type") == "dcf_output":
+                source.setdefault("object_id", object_id)
+                source.setdefault("version_id", str(result_version_id))
+
     brief = _normalize_brief(raw_brief, ticker=ticker)
     return sources, brief
 

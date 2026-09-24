@@ -1,4 +1,5 @@
 import type { ActivityEntry } from './lib/activity'
+import type { TraceSpan } from './lib/tracing'
 
 export type Mode = 'auto' | 'research' | 'chat'
 export type Intent = 'research' | 'chat' | null
@@ -8,8 +9,10 @@ export type RunStatus =
   | 'classifying'
   | 'planning'
   | 'workflow_running'
+  | 'awaiting_workflow_context'
   | 'awaiting_assumptions'
   | 'awaiting_outline_review'
+  | 'awaiting_memo_review'
   | 'awaiting_approval'
   | 'executing'
   | 'synthesizing'
@@ -66,10 +69,42 @@ export interface AgentRunState {
    * existing renderers (StepCard, ResearchStepsTrace) keep working.
    */
   activity: ActivityEntry[]
+  trace_spans: TraceSpan[]
+  execution_trace: ExecutionTraceStep[]
   dcf_review?: DcfReviewState | null
   dcf_evidence_items?: EvidenceItem[]
   dcf_citation_map?: Record<string, string>
   deck_review?: DeckReviewState | null
+  memo_review?: MemoReviewState | null
+  workflow_context_review?: WorkflowContextReviewState | null
+}
+
+export interface ExecutionTraceTask {
+  task_id: string
+  capability_id: string
+  objective: string
+  dependency_task_ids: string[]
+  required_output_types: string[]
+}
+
+export interface ExecutionTraceStep {
+  type: 'execution_step'
+  stage: string
+  route_level?: string | null
+  playbook_id?: string | null
+  selected_workflow?: string | null
+  confidence?: number | null
+  latency_class?: string | null
+  allowed_tools?: string[]
+  tool_calls?: string[]
+  object_ids?: string[]
+  citation_ids?: string[]
+  status?: string | null
+  reason?: string | null
+  case_id?: string
+  task_id?: string
+  objective?: string
+  tasks?: ExecutionTraceTask[]
 }
 
 export interface EvidenceItem {
@@ -133,6 +168,44 @@ export interface DeckReviewState {
   blocks_preview: DeckBlockPreview[]
 }
 
+export interface MemoSourceState {
+  type: 'workspace_object' | 'document' | 'manual_text' | string
+  title: string
+  summary?: string
+  object_id?: string | null
+  version_id?: string | null
+  doc_id?: string | null
+}
+
+export interface MemoDraftState {
+  title: string
+  executive_summary: string
+  sections: Record<string, string>
+  recommendation: string
+  source_version_ids: string[]
+  source_refs: Record<string, any>[]
+  confidence: number
+  limitations: string[]
+}
+
+export interface MemoReviewState {
+  draft: MemoDraftState
+  sources: MemoSourceState[]
+  context_version_id?: string | null
+}
+
+export interface WorkflowContextReviewState {
+  workflow_id: string
+  title: string
+  context: Record<string, any>
+  controls: Array<{
+    field: string
+    label: string
+    type: string
+    options: Array<string | { value: string; label: string; selected?: boolean }>
+  }>
+}
+
 // ── Session / history types ───────────────────────────────────────────────
 
 export type SessionMessageType = 'user' | 'chat_response' | 'research_report'
@@ -155,6 +228,10 @@ export interface SessionMessage {
    * Renders the same auditable view used for live runs.
    */
   activity?: ActivityEntry[]
+  /** Runtime spans retained for post-run latency inspection. */
+  traceSpans?: TraceSpan[]
+  /** Router/playbook/case decisions retained with run output. */
+  executionTrace?: ExecutionTraceStep[]
   dcfEvidenceItems?: EvidenceItem[]
   dcfCitationMap?: Record<string, string>
   /**
@@ -208,6 +285,31 @@ export interface DocumentInfo {
   created_at: number
 }
 
+export interface DocumentCitation {
+  citation_id: string
+  doc_id: string
+  filename: string
+  page?: number | string | null
+  chunk_index: number
+  citation_label: string
+  company?: string | null
+  ticker?: string | null
+  doc_type?: string | null
+  fiscal_period?: string | null
+  text: string
+  previous_text?: string
+  next_text?: string
+  tables?: Array<{
+    table_id?: string
+    page?: number | string | null
+    caption?: string
+    headers: string[]
+    rows: string[][]
+    bbox?: number[] | null
+    confidence?: number
+  }>
+}
+
 /** Snapshot of an attachment at send time (shown on the user bubble). */
 export interface AttachedDocSnapshot {
   doc_id: string
@@ -223,4 +325,128 @@ export interface JobSummary {
   mode: string
   intent: string | null
   created_at: string
+}
+
+export type WorkspaceObjectType =
+  | 'document_analysis'
+  | 'dcf_run'
+  | 'memo'
+  | 'deck'
+  | 'comparison'
+  | string
+
+export interface WorkspaceObject {
+  object_id: string
+  version_id?: string
+  version_number?: number
+  object_type: WorkspaceObjectType
+  schema_ref?: string | null
+  schema_version?: string
+  title: string
+  status: string
+  session_id?: string | null
+  thread_id?: string | null
+  case_id?: string | null
+  task_id?: string | null
+  run_id?: string | null
+  source_message_id?: string | null
+  created_by?: string | null
+  updated_by?: string | null
+  source_object_ids: string[]
+  source_version_ids?: string[]
+  entity_refs?: Record<string, any>[]
+  source_refs?: Record<string, any>[]
+  kg_node_ids: string[]
+  artifact_paths: string[]
+  search_text?: string | null
+  tags?: string[]
+  confidence?: number | null
+  quality?: Record<string, any>
+  visibility?: string
+  summary?: string | null
+  payload: Record<string, any>
+  created_at: string
+  updated_at: string
+}
+
+export interface CollaborationActor {
+  actor_id: string
+  kind: 'human' | 'agent' | 'system'
+  display_name: string
+  handle: string
+  avatar_url?: string | null
+  capabilities: string[]
+  status: 'available' | 'working' | 'waiting' | 'blocked' | 'offline'
+  role?: string
+}
+
+export interface CollaborationChannel {
+  channel_id: string
+  workspace_id: string
+  kind: 'channel' | 'direct' | 'case' | 'object'
+  name: string
+  topic: string
+  created_by: string
+  object_id?: string | null
+  case_id?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CollaborationMention {
+  mention_id: string
+  kind: 'human' | 'agent' | 'channel' | 'object' | 'case' | 'citation'
+  target_id: string
+  label: string
+  start: number
+  end: number
+  requested_action?: string | null
+  context_refs: string[]
+}
+
+export interface CollaborationMessage {
+  message_id: string
+  channel_id: string
+  workspace_id: string
+  actor_id: string
+  body: string
+  mentions: CollaborationMention[]
+  object_version_ids: string[]
+  parent_message_id?: string | null
+  created_at: string
+  edited_at?: string | null
+  assignment?: CollaborationAssignment
+}
+
+export interface CollaborationNotification {
+  notification_id: string
+  workspace_id: string
+  actor_id: string
+  event_type: string
+  title: string
+  body: string
+  target_type: string
+  target_id: string
+  read: boolean
+  created_at: string
+}
+
+export interface CollaborationAssignment {
+  assignment_id: string
+  workspace_id: string
+  title: string
+  description: string
+  assigned_by: string
+  assigned_to: string
+  case_id?: string | null
+  object_version_ids: string[]
+  output_object_version_ids: string[]
+  status: 'open' | 'working' | 'blocked' | 'completed' | 'cancelled'
+  due_at?: string | null
+  channel_id?: string | null
+  source_message_id?: string | null
+  thread_id?: string | null
+  error?: string | null
+  created_at: string
+  updated_at: string
 }

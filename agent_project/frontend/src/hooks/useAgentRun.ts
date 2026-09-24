@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react'
-import type { AgentRunState, ChatMessage, DcfReviewState, Mode, StepState, ToolCall } from '../types'
+import type { AgentRunState, ChatMessage, DcfReviewState, MemoReviewState, Mode, StepState, ToolCall, WorkflowContextReviewState } from '../types'
 import type { UserSettings } from '../lib/userSettings'
 import {
   activityStatusToToolStatus,
@@ -8,9 +8,48 @@ import {
   type ActivityEntry,
   type ActivityEvent,
 } from '../lib/activity'
+import { isTraceSpanEvent, mergeTraceSpan, type TraceSpanEvent } from '../lib/tracing'
+import type { TraceSpan } from '../lib/tracing'
 
 let _msgIdCounter = 0
 const nextId = () => `msg_${++_msgIdCounter}`
+
+function completedClientSpan(
+  traceId: string,
+  rootSpanId: string | undefined,
+  name: string,
+  startedAt: number,
+  endedAt: number,
+  metadata?: Record<string, unknown>,
+): TraceSpanEvent {
+  return {
+    type: 'trace_span',
+    trace_id: traceId,
+    span_id: `client_${name}_${Math.random().toString(36).slice(2, 10)}`,
+    parent_span_id: rootSpanId,
+    category: 'transport',
+    name,
+    status: 'completed',
+    started_at: startedAt,
+    ended_at: endedAt,
+    duration_ms: (endedAt - startedAt) * 1000,
+    metadata,
+  }
+}
+
+function completeOpenTraceSpans(spans: TraceSpan[], endedAt: number): TraceSpan[] {
+  return spans.map(span => {
+    if (span.status === 'completed' || span.status === 'error' || typeof span.started_at !== 'number') {
+      return span
+    }
+    return {
+      ...span,
+      status: 'completed',
+      ended_at: endedAt,
+      duration_ms: Math.max(0, (endedAt - span.started_at) * 1000),
+    }
+  })
+}
 
 const INITIAL_STATE: AgentRunState = {
   status: 'idle',
@@ -25,10 +64,14 @@ const INITIAL_STATE: AgentRunState = {
   completed_steps: 0,
   chat_messages: [],
   activity: [],
+  trace_spans: [],
+  execution_trace: [],
   dcf_review: null,
   dcf_evidence_items: [],
   dcf_citation_map: {},
   deck_review: null,
+  memo_review: null,
+  workflow_context_review: null,
 }
 
 /**
@@ -107,6 +150,14 @@ export function useAgentRun() {
     const type = data.type as string
     if (type === 'ping' || type === 'done') return
 
+    if (isTraceSpanEvent(data)) {
+      setState(prev => ({
+        ...prev,
+        trace_spans: mergeTraceSpan(prev.trace_spans, data),
+      }))
+      return
+    }
+
     // Unified activity envelope — merged into a single store regardless of
     // scope (research / chat / workflow). We additionally project the
     // unified log into the legacy `step.tool_calls` shape so existing
@@ -125,6 +176,14 @@ export function useAgentRun() {
           steps: projectStepToolCalls(prev.steps, nextActivity),
         }
       })
+      return
+    }
+
+    if (type === 'execution_step') {
+      setState(prev => ({
+        ...prev,
+        execution_trace: [...prev.execution_trace, data as unknown as AgentRunState['execution_trace'][number]],
+      }))
       return
     }
 
@@ -157,6 +216,18 @@ export function useAgentRun() {
 
         case 'execution_started':
           return { ...prev, status: 'executing' }
+
+        case 'workflow_context_review':
+          return {
+            ...prev,
+            status: 'awaiting_workflow_context',
+            workflow_context_review: {
+              workflow_id: (data.workflow_id as string) ?? '',
+              title: (data.title as string) ?? 'Workflow setup',
+              context: (data.context as Record<string, any>) ?? {},
+              controls: (data.controls as WorkflowContextReviewState['controls']) ?? [],
+            },
+          }
 
         // NOTE: `workflow_started` and `workflow_step` legacy reducer
         // branches were removed when DCF migrated to the unified `activity`
@@ -218,6 +289,26 @@ export function useAgentRun() {
         case 'deck_outline_rejected':
           return { ...prev, status: 'chat_responding', deck_review: null }
 
+        case 'memo_draft_review':
+          return {
+            ...prev,
+            status: 'awaiting_memo_review',
+            memo_review: {
+              draft: (data.draft as MemoReviewState['draft']) ?? {
+                title: 'Investment memo', executive_summary: '', sections: {}, recommendation: '',
+                source_version_ids: [], source_refs: [], confidence: 0, limitations: [],
+              },
+              sources: (data.sources as MemoReviewState['sources']) ?? [],
+              context_version_id: (data.context_version_id as string) ?? null,
+            },
+          }
+
+        case 'memo_draft_submitted':
+          return { ...prev, status: 'workflow_running', memo_review: null }
+
+        case 'memo_draft_rejected':
+          return { ...prev, status: 'chat_responding', memo_review: null }
+
         case 'step_start': {
           const steps = prev.steps.map(s =>
             s.id === data.step_id ? { ...s, status: 'running' as const } : s,
@@ -257,7 +348,6 @@ export function useAgentRun() {
         case 'synthesis_complete':
           return {
             ...prev,
-            status: 'complete',
             artifact_paths: (data.artifact_paths as string[]) ?? [],
           }
 
@@ -319,7 +409,11 @@ export function useAgentRun() {
             ? 'awaiting_assumptions'
             : prev.deck_review
               ? 'awaiting_outline_review'
-              : 'complete'
+              : prev.memo_review
+                ? 'awaiting_memo_review'
+              : prev.workflow_context_review
+                ? 'awaiting_workflow_context'
+              : 'chat_responding'
           return {
             ...prev,
             status: nextStatus,
@@ -334,9 +428,6 @@ export function useAgentRun() {
           const runArtifacts = (data.artifact_paths as string[]) ?? []
           return {
             ...prev,
-            status: prev.dcf_review || prev.deck_review
-              ? prev.status
-              : prev.report || prev.chat_messages.length || data.workflow ? 'complete' : prev.status,
             artifact_paths: runArtifacts.length ? runArtifacts : prev.artifact_paths,
           }
         }
@@ -362,6 +453,7 @@ export function useAgentRun() {
       userSettings?: UserSettings,
     ): Promise<string | null> => {
       esRef.current?.close()
+      const requestStartedAt = Date.now() / 1000
 
       const userMsg: ChatMessage = { id: nextId(), role: 'user', content: query }
 
@@ -404,22 +496,63 @@ export function useAgentRun() {
         setState(prev => ({ ...prev, status: 'error', error: err }))
         return null
       }
-      const { thread_id, start_event_id } = (await res.json()) as {
+      const responseReceivedAt = Date.now() / 1000
+      const { thread_id, start_event_id, trace_id, root_span_id } = (await res.json()) as {
         thread_id: string
         start_event_id?: number
+        trace_id?: string
+        root_span_id?: string
       }
-      setState(prev => ({ ...prev, thread_id }))
+      setState(prev => ({
+        ...prev,
+        thread_id,
+        trace_spans: trace_id
+          ? mergeTraceSpan(prev.trace_spans, completedClientSpan(
+              trace_id,
+              root_span_id,
+              'frontend_run_request',
+              requestStartedAt,
+              responseReceivedAt,
+              { phase: 'POST /runs' },
+            ))
+          : prev.trace_spans,
+      }))
 
       // Pass start_event_id so the server doesn't replay prior turns (events
       // persisted from earlier messages in the same chat thread). Without
       // this, second+ turns see META's substeps in the NVDA run, etc.
       const afterId = typeof start_event_id === 'number' ? start_event_id : 0
       const es = new EventSource(`/runs/${thread_id}/events?after_id=${afterId}`)
+      let firstEventSeen = false
 
       es.onmessage = (e: MessageEvent) => {
         let data: Record<string, unknown>
         try { data = JSON.parse(e.data as string) } catch { return }
+        if (!firstEventSeen && trace_id) {
+          firstEventSeen = true
+          const firstEventAt = Date.now() / 1000
+          setState(prev => ({
+            ...prev,
+            trace_spans: mergeTraceSpan(prev.trace_spans, completedClientSpan(
+              trace_id,
+              root_span_id,
+              'submit_to_first_event',
+              requestStartedAt,
+              firstEventAt,
+              { first_event_type: data.type },
+            )),
+          }))
+        }
         if (data.type === 'done') {
+          const endedAt = Date.now() / 1000
+          setState(prev => ({
+            ...prev,
+            status: prev.dcf_review || prev.deck_review || prev.memo_review
+              || prev.workflow_context_review
+              ? prev.status
+              : 'complete',
+            trace_spans: completeOpenTraceSpans(prev.trace_spans, endedAt),
+          }))
           es.close()
           esRef.current = null
           return
@@ -508,6 +641,23 @@ export function useAgentRun() {
     [handleEvent],
   )
 
+  const watchRun = useCallback((threadId: string, query = '') => {
+    esRef.current?.close()
+    setState({ ...INITIAL_STATE, status: 'classifying', thread_id: threadId, query, mode: 'auto' })
+    const es = new EventSource(`/runs/${encodeURIComponent(threadId)}/events?after_id=0`)
+    es.onmessage = (event: MessageEvent) => {
+      let data: Record<string, unknown>
+      try { data = JSON.parse(event.data as string) } catch { return }
+      if (data.type === 'done') { es.close(); esRef.current = null; return }
+      handleEvent(event)
+    }
+    es.onerror = () => {
+      es.close(); esRef.current = null
+      setState(prev => ['complete', 'rejected', 'error'].includes(prev.status) ? prev : { ...prev, status: 'error', error: 'Connection lost' })
+    }
+    esRef.current = es
+  }, [handleEvent])
+
   const approve = useCallback(async () => {
     const tid = state.thread_id
     if (!tid) return
@@ -519,12 +669,36 @@ export function useAgentRun() {
       setState(prev => ({ ...prev, status: 'chat_responding', deck_review: null }))
       return
     }
+    if (state.status === 'awaiting_memo_review') {
+      setState(prev => ({ ...prev, status: 'workflow_running', memo_review: null }))
+      return
+    }
     await fetch(`/runs/${tid}/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ approved: true }),
     })
   }, [state.status, state.thread_id])
+
+  const submitWorkflowContext = useCallback(async (context: Record<string, any>, approved = true) => {
+    const tid = state.thread_id
+    if (!tid) return
+    const response = await fetch(`/runs/${tid}/workflow-context-decision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        approved,
+        action: approved ? 'approve' : 'cancel',
+        context,
+      }),
+    })
+    if (!response.ok) throw new Error('Could not submit decision. Please retry.')
+    setState(prev => ({
+      ...prev,
+      status: approved || context.workflow_id === 'tracked_task' ? 'chat_responding' : 'idle',
+      workflow_context_review: null,
+    }))
+  }, [state.thread_id])
 
   const reject = useCallback(async () => {
     if (state.status === 'awaiting_assumptions') {
@@ -533,6 +707,10 @@ export function useAgentRun() {
     }
     if (state.status === 'awaiting_outline_review') {
       setState(prev => ({ ...prev, status: 'idle', deck_review: null }))
+      return
+    }
+    if (state.status === 'awaiting_memo_review') {
+      setState(prev => ({ ...prev, status: 'idle', memo_review: null }))
       return
     }
     const tid = state.thread_id
@@ -550,5 +728,5 @@ export function useAgentRun() {
     setState(INITIAL_STATE)
   }, [])
 
-  return { state, startRun, amendMessage, approve, reject, reset }
+  return { state, startRun, amendMessage, watchRun, approve, reject, reset, submitWorkflowContext }
 }

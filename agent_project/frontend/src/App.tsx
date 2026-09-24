@@ -1,14 +1,20 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useAgentRun } from './hooks/useAgentRun'
-import type { ActivityEntry } from './lib/activity'
 import { useSessionManager } from './hooks/useSessionManager'
 import { useJobs } from './hooks/useJobs'
 import { useDocuments } from './hooks/useDocuments'
+import { useWorkspaceObjects } from './hooks/useWorkspaceObjects'
+import { useCollaboration } from './hooks/useCollaboration'
 import { SessionsSidebar } from './components/SessionsSidebar'
+import { MobileWorkspaceBar, WorkspaceRail } from './components/WorkspaceRail'
+import { ChannelView } from './components/ChannelView'
+import { TaskView } from './components/TaskView'
+import { CreateTaskDialog } from './components/CreateTaskDialog'
+import { ListPlus } from 'lucide-react'
 import { MessageThread } from './components/MessageThread'
-import { ExecutionSidebar } from './components/ExecutionSidebar'
 import { DocumentPreview } from './components/DocumentPreview'
 import { DeckPreview } from './components/DeckPreview'
+import { ObjectInspector } from './components/ObjectInspector'
 import { JobsPanel } from './components/JobsPanel'
 import { KnowledgePanel } from './components/KnowledgePanel'
 import { KgNotificationPanel } from './components/KgNotificationPanel'
@@ -18,23 +24,30 @@ import { usePanelHidden } from './hooks/usePanelHidden'
 import { RerunToast, type RerunToastState } from './components/RerunToast'
 import { SettingsButton } from './components/SettingsPanel'
 import { loadUserSettings } from './lib/userSettings'
-import type { JobSummary, Mode } from './types'
+import type { CollaborationAssignment, CollaborationChannel, JobSummary, Mode, WorkspaceObject } from './types'
 
 let _msgCounter = 0
 const nextMsgId = () => `m_${Date.now()}_${++_msgCounter}`
 
 export default function App() {
-  const { state, startRun, amendMessage, approve, reject, reset } = useAgentRun()
+  const workspaceId = 'workspace:default'
+  const { state, startRun, amendMessage, watchRun, approve, reject, reset, submitWorkflowContext } = useAgentRun()
   const { sessions, groups, activeSession, newSession, selectSession, deleteSession, renameSession, pinSession, createGroup, updateGroup, deleteGroup, moveSessionToGroup, reorderSessions, addMessage, truncateMessagesFrom, updateChatThreadId } = useSessionManager()
   const { researchJobs, runningCount } = useJobs(true)
+  const { objects: workspaceObjects } = useWorkspaceObjects(undefined, true)
+  const collaboration = useCollaboration(workspaceId)
   const { docs, upload, remove: removeDoc } = useDocuments(
     activeSession?.id ?? '',
     () => setKgRefreshTrigger(t => t + 1),
   )
   const [composerDocIds, setComposerDocIds] = useState<Set<string>>(() => new Set())
-  const [mode, setMode] = useState<Mode>('auto')
+  const [mode, setMode] = useState<Mode>('chat')
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null)
   const [selectedDeck, setSelectedDeck] = useState<{ threadId: string; filename: string; title?: string } | null>(null)
+  const [selectedObject, setSelectedObject] = useState<WorkspaceObject | null>(null)
+  const [selectedChannel, setSelectedChannel] = useState<CollaborationChannel | null>(null)
+  const [selectedTask, setSelectedTask] = useState<CollaborationAssignment | null>(null)
+  const [taskDialogOpen, setTaskDialogOpen] = useState(false)
   const [kgPanelOpen, setKgPanelOpen] = useState(false)
   const [rerunToast, setRerunToast] = useState<RerunToastState | null>(null)
   // Increments when a rerun completes so KnowledgePanel can refresh the KG
@@ -68,6 +81,7 @@ export default function App() {
   const handleOpenDeckPreview = useCallback((filename: string, title: string | undefined, threadId: string) => {
     if (!threadId) return
     setSelectedDocId(null)
+    setSelectedObject(null)
     setSelectedDeck({ threadId, filename, title })
   }, [])
 
@@ -94,6 +108,46 @@ export default function App() {
   const handleCloseDeckPreview = useCallback(() => {
     setSelectedDeck(null)
   }, [])
+
+  const handleOpenWorkspaceObject = useCallback((object: WorkspaceObject) => {
+    setSelectedDocId(null)
+    setSelectedDeck(null)
+    setSelectedObject(object)
+  }, [])
+
+  const handleSelectChannel = useCallback((channel: CollaborationChannel) => {
+    setSelectedTask(null)
+    setSelectedChannel(channel)
+    setSelectedObject(null)
+    setSelectedDocId(null)
+    setSelectedDeck(null)
+    void collaboration.loadMessages(channel.channel_id)
+  }, [collaboration.loadMessages])
+
+  const handleOpenTask = useCallback((task: CollaborationAssignment) => {
+    setSelectedTask(task)
+    setSelectedObject(null)
+    setSelectedDocId(null)
+    setSelectedDeck(null)
+  }, [])
+
+  useEffect(() => {
+    if (!selectedTask) return
+    const current = collaboration.assignments.find(task => task.assignment_id === selectedTask.assignment_id)
+    if (current && current !== selectedTask) setSelectedTask(current)
+  }, [collaboration.assignments, selectedTask])
+
+  useEffect(() => {
+    if (!selectedChannel) return
+    const stream = new EventSource(`/collaboration/channels/${encodeURIComponent(selectedChannel.channel_id)}/events`)
+    stream.onmessage = event => {
+      try {
+        const payload = JSON.parse(event.data) as { type: string; message?: import('./types').CollaborationMessage }
+        if (payload.type === 'collaboration_message' && payload.message) collaboration.ingestMessage(payload.message)
+      } catch { /* malformed realtime event */ }
+    }
+    return () => stream.close()
+  }, [selectedChannel, collaboration.ingestMessage])
 
   // Track which thread_ids have already been committed to a session
   const committedRef = useRef<Set<string>>(new Set())
@@ -134,6 +188,8 @@ export default function App() {
         artifactPaths: state.artifact_paths,
         researchSteps: state.steps.length ? state.steps : undefined,
         activity: state.activity.length ? state.activity : undefined,
+        traceSpans: state.trace_spans.length ? state.trace_spans : undefined,
+        executionTrace: state.execution_trace.length ? state.execution_trace : undefined,
         validity,
         invalidationReason,
       })
@@ -147,6 +203,8 @@ export default function App() {
           threadId: state.thread_id,
           artifactPaths: state.artifact_paths.length ? state.artifact_paths : undefined,
           activity: state.activity.length ? state.activity : undefined,
+          traceSpans: state.trace_spans.length ? state.trace_spans : undefined,
+          executionTrace: state.execution_trace.length ? state.execution_trace : undefined,
           dcfEvidenceItems: state.dcf_evidence_items?.length ? state.dcf_evidence_items : undefined,
           dcfCitationMap: state.dcf_citation_map && Object.keys(state.dcf_citation_map).length ? state.dcf_citation_map : undefined,
           validity,
@@ -191,6 +249,106 @@ export default function App() {
     () => docs.filter(d => composerDocIds.has(d.doc_id)),
     [docs, composerDocIds],
   )
+  const visibleWorkspaceObjects = useMemo<WorkspaceObject[]>(() => {
+    const sessionMessages = activeSession?.messages ?? []
+    const messageDocObjects: WorkspaceObject[] = (activeSession?.messages ?? [])
+      .flatMap(message => message.attachedDocs ?? [])
+      .map(doc => {
+        const created = activeSession?.createdAt ?? new Date().toISOString()
+        return {
+          object_id: `uploaded_document:${doc.doc_id}`,
+          object_type: 'uploaded_document',
+          title: doc.filename,
+          status: doc.status,
+          session_id: activeSession?.id ?? null,
+          thread_id: null,
+          source_message_id: null,
+          source_object_ids: [],
+          kg_node_ids: [`doc:${doc.doc_id}`],
+          artifact_paths: [`/documents/${doc.doc_id}/file`],
+          summary: doc.page_count ? `${doc.page_count} pg` : doc.status,
+          payload: {
+            doc_id: doc.doc_id,
+            filename: doc.filename,
+            status: doc.status,
+            page_count: doc.page_count,
+          },
+          created_at: created,
+          updated_at: created,
+        }
+      })
+    const messageDeckObjects: WorkspaceObject[] = sessionMessages
+      .filter(message => message.threadId && message.artifactPaths?.some(path => /\.pptx($|\?)/i.test(path)))
+      .map(message => {
+        const pptxPath = message.artifactPaths?.find(path => /\.pptx($|\?)/i.test(path)) ?? message.artifactPaths?.[0] ?? ''
+        const filename = pptxPath.split('/').pop()?.split('?')[0] ?? 'Presentation deck'
+        const titleFromContent = message.content.match(/deck titled\s+"([^"]+)"/i)?.[1]
+        const title = titleFromContent || filename.replace(/\.pptx$/i, '').replace(/_/g, ' ')
+        const created = activeSession?.createdAt ?? new Date().toISOString()
+        const slideMatch = message.content.match(/(\d+)\s+slides?/i)
+        return {
+          object_id: `deck:${message.threadId}`,
+          object_type: 'deck',
+          title,
+          status: 'complete',
+          session_id: activeSession?.id ?? null,
+          thread_id: message.threadId ?? null,
+          source_message_id: message.id,
+          source_object_ids: [],
+          kg_node_ids: [],
+          artifact_paths: message.artifactPaths ?? [],
+          summary: slideMatch ? `${slideMatch[1]} slides` : 'Presentation deck',
+          payload: {
+            filename,
+            artifact_path: pptxPath,
+          },
+          created_at: created,
+          updated_at: created,
+        }
+      })
+
+    const localDocObjects: WorkspaceObject[] = docs.map(doc => {
+      const created = new Date(doc.created_at * 1000).toISOString()
+      const summaryParts = [
+        doc.status === 'ready'
+          ? `${doc.page_count || 0} pg`
+          : doc.stage ?? doc.status,
+        doc.chunk_count ? `${doc.chunk_count} chunks` : null,
+      ].filter(Boolean)
+      return {
+        object_id: `uploaded_document:${doc.doc_id}`,
+        object_type: 'uploaded_document',
+        title: doc.filename,
+        status: doc.status,
+        session_id: doc.session_id,
+        thread_id: null,
+        source_message_id: null,
+        source_object_ids: [],
+        kg_node_ids: [`doc:${doc.doc_id}`],
+        artifact_paths: [`/documents/${doc.doc_id}/file`],
+        summary: summaryParts.join(' · '),
+        payload: {
+          doc_id: doc.doc_id,
+          filename: doc.filename,
+          status: doc.status,
+          stage: doc.stage,
+          page_count: doc.page_count,
+          chunk_count: doc.chunk_count,
+        },
+        created_at: created,
+        updated_at: created,
+      }
+    })
+
+    const byId = new Map<string, WorkspaceObject>()
+    workspaceObjects.forEach(obj => byId.set(obj.object_id, obj))
+    messageDocObjects.forEach(obj => byId.set(obj.object_id, obj))
+    messageDeckObjects.forEach(obj => byId.set(obj.object_id, obj))
+    localDocObjects.forEach(obj => byId.set(obj.object_id, obj))
+    return Array.from(byId.values()).sort(
+      (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+    )
+  }, [activeSession?.createdAt, activeSession?.id, activeSession?.messages, docs, workspaceObjects])
 
   const handleUpload = useCallback(async (file: File) => {
     const info = await upload(file)
@@ -212,6 +370,7 @@ export default function App() {
   const handleSubmit = useCallback(
     (query: string, selectedMode: Mode) => {
       if (!activeSession) return
+      if (composerDocs.some(d => d.status !== 'ready')) return
 
       if (!query.startsWith('[DCF_APPROVED]')) {
         committedRef.current.clear()
@@ -263,7 +422,13 @@ export default function App() {
   }, [state.status, newSession])
 
   const handleSelectJob = useCallback(async (job: JobSummary) => {
-    if (job.status !== 'complete') return
+    if (job.status !== 'complete') {
+      watchRun(job.thread_id, job.query)
+      setSelectedObject(null)
+      setSelectedDocId(null)
+      setSelectedDeck(null)
+      return
+    }
     try {
       const res = await fetch(`/runs/${job.thread_id}/report`)
       if (res.ok) {
@@ -272,65 +437,37 @@ export default function App() {
         window.open(URL.createObjectURL(blob), '_blank')
       }
     } catch { /* ignore */ }
-  }, [])
+  }, [watchRun])
 
   const isRunActive = !['idle', 'complete', 'error', 'rejected'].includes(state.status)
 
-  // Execution panel: show for workflow runs (DCF, deck, research plan-then-execute).
-  // Chat-only runs (web search, ReAct) should NOT trigger the sidebar — the activity
-  // trace is already embedded inline in the chat thread.
-  //
-  // PERSISTENCE: ~150ms after a run completes, `reset` wipes live state.activity
-  // and flips status to idle (see the effect above). To let the user keep
-  // inspecting DCF substeps post-run, fall back to the activity persisted on the
-  // most recent run message. A fresh run repopulates live state; a new session
-  // (empty messages) clears it.
-  const lastRunMsg = [...(activeSession?.messages ?? [])]
-    .reverse()
-    .find((m: any) => m.type === 'research_report' || m.type === 'chat_response') as
-    { activity?: ActivityEntry[] } | undefined
-  const persistedActivity = lastRunMsg?.activity
-  const panelActivity: ActivityEntry[] =
-    state.activity.length ? state.activity : (persistedActivity ?? [])
-  const hasWorkflowActivity = panelActivity.some(
-    (a: any) => a?.kind === 'workflow' || a?.name?.startsWith('workflow:')
-  )
-  const showExecutionPanel = (
-    isRunActive || state.status === 'complete' || hasWorkflowActivity
-  ) && (
-    hasWorkflowActivity ||
-    state.dcf_review != null ||
-    state.deck_review != null
-  )
-  // When live state has reset but we're showing persisted activity, present the
-  // panel as a finished run so the BlockStack collapses to completed headers.
-  const panelStatus = state.activity.length ? state.status : 'complete'
-
   const selectedDoc = docs.find(d => d.doc_id === selectedDocId) ?? null
-  // Priority: doc preview > execution sidebar.  KG now opens as a full-screen
-  // modal (rendered below at z-50) so it doesn't compete for sidebar space.
-  const rightPanel: 'doc' | 'execution' | 'deck' | null =
-    selectedDeck ? 'deck' : selectedDoc ? 'doc' : showExecutionPanel ? 'execution' : null
+  const rightPanel: 'doc' | 'deck' | 'object' | null =
+    selectedObject ? 'object' : selectedDeck ? 'deck' : selectedDoc ? 'doc' : null
   const rightPanelOpen = rightPanel !== null
   const rightPanelStorageKey =
     rightPanel === 'deck'
       ? 'ui.rightPanel.deck'
+      : rightPanel === 'object'
+        ? 'ui.rightPanel.object'
       : rightPanel === 'doc'
         ? 'ui.rightPanel.doc'
-        : 'ui.rightPanel.execution'
-  const rightPanelDefaultWidth = rightPanel === 'execution' ? 360 : 520
+        : 'ui.rightPanel.doc'
+  const rightPanelDefaultWidth = 520
   const rightPanelRevealLabel =
-    rightPanel === 'execution' ? 'Trace' : rightPanel === 'deck' ? 'Deck' : 'Doc'
+    rightPanel === 'deck' ? 'Deck' : rightPanel === 'object' ? 'Object' : 'Doc'
 
   const sessionsPanel = usePanelHidden('ui.panel.sessions.hidden')
-  const executionPanel = usePanelHidden('ui.rightPanel.execution.hidden')
   const docPanel = usePanelHidden('ui.rightPanel.doc.hidden')
   const deckPanel = usePanelHidden('ui.rightPanel.deck.hidden')
+  const objectPanel = usePanelHidden('ui.rightPanel.object.hidden')
   const rightPanelVisibility =
-    rightPanel === 'deck' ? deckPanel : rightPanel === 'doc' ? docPanel : executionPanel
+    rightPanel === 'deck' ? deckPanel : rightPanel === 'object' ? objectPanel : docPanel
 
   return (
     <div className="h-screen bg-bg text-ink flex overflow-hidden">
+      <button type="button" title="Create task" aria-label="Create task" onClick={() => setTaskDialogOpen(true)} className="fixed right-5 top-3 z-40 flex h-9 w-9 items-center justify-center rounded border border-border bg-bg-raised text-ink"><ListPlus size={17} /></button>
+      {taskDialogOpen && <CreateTaskDialog workspaceId={workspaceId} channelId={selectedChannel?.channel_id} actors={collaboration.actors} objects={visibleWorkspaceObjects} onClose={() => setTaskDialogOpen(false)} onCreated={task => { setTaskDialogOpen(false); handleOpenTask(task); void collaboration.refresh() }} />}
 
       {/* ── Left: Sessions sidebar ─────────────────────────────── */}
       <SessionsSidebar
@@ -353,8 +490,58 @@ export default function App() {
         disabled={isRunActive}
       />
 
+      <WorkspaceRail
+        channels={collaboration.channels}
+        actors={collaboration.actors}
+        objects={visibleWorkspaceObjects}
+        notifications={collaboration.notifications}
+        assignments={collaboration.assignments}
+        activeChannelId={selectedChannel?.channel_id ?? null}
+        activeTaskId={selectedTask?.assignment_id ?? null}
+        onSelectChannel={handleSelectChannel}
+        onOpenTask={handleOpenTask}
+        onOpenObject={handleOpenWorkspaceObject}
+        onCreateChannel={(name) => { void collaboration.createChannel(name).then(channel => { if (channel) handleSelectChannel(channel) }) }}
+        onStartDirect={(actor) => {
+          const existing = collaboration.channels.find(channel => channel.kind === 'direct' && channel.name === actor.handle)
+          if (existing) { handleSelectChannel(existing); return }
+          void collaboration.createChannel(actor.handle, 'direct').then(channel => { if (channel) handleSelectChannel(channel) })
+        }}
+        onOpenNotification={(notification) => { void collaboration.markRead(notification.notification_id) }}
+        onUpdateAssignment={(assignmentId, status) => { void collaboration.updateAssignment(assignmentId, status) }}
+      />
+      <MobileWorkspaceBar
+        channels={collaboration.channels}
+        objects={visibleWorkspaceObjects}
+        notifications={collaboration.notifications}
+        activeChannelId={selectedChannel?.channel_id ?? null}
+        onSelectChannel={handleSelectChannel}
+        onOpenObject={handleOpenWorkspaceObject}
+        onOpenNotification={(notification) => { void collaboration.markRead(notification.notification_id) }}
+      />
+
       {/* ── Center: Message thread ─────────────────────────────── */}
-      <MessageThread
+      {selectedTask ? <TaskView
+        task={selectedTask}
+        actors={collaboration.actors}
+        objects={visibleWorkspaceObjects}
+        onBack={() => setSelectedTask(null)}
+        onOpenChannel={() => {
+          const channel = collaboration.channels.find(item => item.channel_id === selectedTask.channel_id)
+          if (channel) handleSelectChannel(channel)
+        }}
+        onOpenObject={handleOpenWorkspaceObject}
+        onUpdateStatus={(status) => { void collaboration.updateAssignment(selectedTask.assignment_id, status) }}
+      /> : selectedChannel ? <ChannelView
+        channel={selectedChannel}
+        actors={collaboration.actors}
+        messages={collaboration.messages[selectedChannel.channel_id] ?? []}
+        assignments={collaboration.assignments}
+        objects={visibleWorkspaceObjects}
+        onSend={(body, mentions, objectVersionIds) => { void collaboration.sendMessage(selectedChannel.channel_id, body, mentions, objectVersionIds) }}
+        onOpenTask={handleOpenTask}
+        onClose={() => setSelectedChannel(null)}
+      /> : <MessageThread
         session={activeSession}
         activeRun={state}
         mode={mode}
@@ -362,18 +549,23 @@ export default function App() {
         onSubmit={handleSubmit}
         onUpload={handleUpload}
         docs={composerDocs}
+        workspaceObjects={visibleWorkspaceObjects}
         selectedDocId={selectedDocId}
         onSelectDoc={(id) => {
           setSelectedDeck(null)
+          setSelectedObject(null)
           setSelectedDocId(id === selectedDocId ? null : id)
         }}
         onRemoveDoc={handleRemoveComposerDoc}
         disabled={false}
         onOpenDeckPreview={handleOpenDeckPreview}
         onAmendMessage={handleAmendMessage}
-      />
+        onWorkflowContextSubmit={submitWorkflowContext}
+        onApprovePlan={approve}
+        onRejectPlan={reject}
+      />}
 
-      {/* ── Right: Doc preview OR Execution panel ───────────────── */}
+      {/* ── Right: object and artifact inspectors ───────────────── */}
       {rightPanelOpen && rightPanel && (
         <ResizablePanel
           key={rightPanelStorageKey}
@@ -399,19 +591,11 @@ export default function App() {
               onHide={rightPanelVisibility.hide}
             />
           )}
-          {rightPanel === 'execution' && (
-            <ExecutionSidebar
-              status={panelStatus}
-              steps={state.steps}
-              completedSteps={state.completed_steps}
-              error={state.error}
-              activity={panelActivity}
-              dcfReview={state.dcf_review ?? undefined}
-              deckReview={state.deck_review ?? undefined}
-              threadId={state.thread_id}
-              onApprove={approve}
-              onReject={reject}
-              onHide={rightPanelVisibility.hide}
+          {rightPanel === 'object' && selectedObject && (
+            <ObjectInspector
+              object={selectedObject}
+              workspaceId={workspaceId}
+              onClose={() => setSelectedObject(null)}
             />
           )}
         </ResizablePanel>

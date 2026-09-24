@@ -814,6 +814,13 @@ def finalize_node(state: dict) -> dict:
         logger.warning("DCF conviction computation failed for %s", state["ticker"], exc_info=True)
         payload["conviction"] = conviction
 
+    from .persistence import persist_dcf_result  # noqa: PLC0415
+
+    result_object = persist_dcf_result(state, payload=payload, result_path=out_path)
+    payload["workflow_context_version_id"] = state.get("workflow_context_version_id")
+    payload["approved_assumptions_version_id"] = state.get("approved_assumptions_version_id")
+    payload["result_version_id"] = result_object["version_id"]
+
     # ── Re-write with conviction ────────────────────────────────────────
     out_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -913,6 +920,7 @@ def finalize_node(state: dict) -> dict:
 
     return {
         "result_path": str(out_path),
+        "result_version_id": result_object["version_id"],
         "confidence_label": final_confidence_label,
         "confidence_breakdown": final_confidence_breakdown or {},
     }

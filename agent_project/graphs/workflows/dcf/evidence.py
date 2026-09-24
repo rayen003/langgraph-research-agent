@@ -241,6 +241,7 @@ def _collect_raw_web_excerpts(
 def _collect_raw_document_excerpts(
     session_id: str,
     ticker: str,
+    selected_doc_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect raw document excerpts as evidence — no assumption parsing."""
     if not session_id:
@@ -257,7 +258,7 @@ def _collect_raw_document_excerpts(
             f"{ticker} financial performance outlook growth risks revenue "
             "strategy market position competitive"
         )
-        results = hybrid_search(query, session_id, n_results=5)
+        results = hybrid_search(query, session_id, n_results=5, doc_ids=selected_doc_ids)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Evidence document excerpts failed session_id=%s error=%s",
@@ -300,6 +301,7 @@ def assemble_evidence(
     include_web: bool = True,
     include_documents: bool = True,
     include_sec: bool = True,
+    selected_doc_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble a complete evidence pack for a ticker.
 
@@ -378,7 +380,7 @@ def assemble_evidence(
     # ── Tier 3: Document excerpts ──────────────────────────────────────────
     if include_documents and session_id:
         try:
-            doc_items = _collect_raw_document_excerpts(session_id, ticker)
+            doc_items = _collect_raw_document_excerpts(session_id, ticker, selected_doc_ids=selected_doc_ids)
             items.extend(doc_items)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Evidence: document excerpts failed error=%s", exc)
@@ -448,6 +450,8 @@ def assemble_evidence_node(state: dict) -> dict:
     ticker = state["ticker"]
     session_id = state.get("session_id") or ""
     allow_external = bool(state.get("allow_external_assumptions", True))
+    workflow_context = state.get("workflow_context") or {}
+    selected_doc_ids = workflow_context.get("selected_doc_ids") if isinstance(workflow_context, dict) else None
 
     emit_step("assemble_evidence", "start", parent_step_id, {"ticker": ticker})
 
@@ -457,6 +461,7 @@ def assemble_evidence_node(state: dict) -> dict:
         include_web=allow_external,
         include_documents=bool(session_id),
         include_sec=True,
+        selected_doc_ids=selected_doc_ids if isinstance(selected_doc_ids, list) else None,
     )
 
     status = "complete" if pack["total_items"] > 0 else "fallback"

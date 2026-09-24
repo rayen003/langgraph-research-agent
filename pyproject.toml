@@ -28,6 +28,7 @@ dependencies = [
     "chainlit>=2.10.0",
     "pandas>=3.0.1",
     "requests>=2.32.5",
+    "httpx>=0.28.0",
     "yfinance>=0.2.58",
     "pytz>=2026.1.post1",
     "chromadb>=0.6.0",
@@ -36,6 +37,7 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "langchain-text-splitters>=0.3.0",
     "python-pptx>=0.6.23",
+    "langgraph-checkpoint-sqlite>=3.0.0",
 ]
 
 [project.optional-dependencies]

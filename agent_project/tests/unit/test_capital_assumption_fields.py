@@ -150,3 +150,23 @@ def test_review_edit_can_add_optional_capital_fields(monkeypatch):
     assert result["assumptions"]["buyback_yield"] == 0.035
     assert result["assumptions"]["sbc_pct_revenue"] == 0.04
     assert result["assumption_provenance"]["buyback_yield"]["user_edited"] is True
+    assert result["assumption_provenance"]["revenue_growth"]["approved_by"] == "user"
+    assert result["assumption_provenance"]["fcff_margin"]["user_approved"] is True
+
+
+def test_review_approve_locks_full_assumption_bundle(monkeypatch):
+    import agent_project.graphs.workflows.dcf.review as review_mod
+
+    monkeypatch.setattr(review_mod, "interrupt", lambda _payload: {"action": "approve"})
+    result = review_assumptions_node({
+        "parent_step_id": "test",
+        "assumption_review_mode": True,
+        "assumptions": {"revenue_growth": 0.10, "wacc": 0.09},
+        "assumption_provenance": {"wacc": {"source": "capm"}},
+        "evidence_pack": {"items": []},
+    })
+
+    assert result["assumptions_approved"] is True
+    assert result["assumption_provenance"]["revenue_growth"]["approved_by"] == "user"
+    assert result["assumption_provenance"]["wacc"]["source"] == "capm"
+    assert result["assumption_provenance"]["wacc"]["user_approved"] is True

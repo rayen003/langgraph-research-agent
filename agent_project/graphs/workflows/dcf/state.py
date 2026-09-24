@@ -20,12 +20,17 @@ _DEFAULT_EQUITY_RISK_PREMIUM = float(os.getenv("DCF_EQUITY_RISK_PREMIUM", "0.055
 
 
 class DCFState(TypedDict):
+    thread_id: str
+    workflow_context_version_id: str | None
+    approved_assumptions_version_id: str | None
+    result_version_id: str | None
     ticker: str
     horizon_years: int
     session_id: str
     assumption_review_mode: bool
     allow_external_assumptions: bool
     assumption_overrides: dict[str, float]
+    workflow_context: dict[str, Any]
     assumptions: dict[str, float]
     assumption_provenance: dict[str, dict[str, Any]]
     assumptions_approved: bool
@@ -136,6 +141,19 @@ class DCFState(TypedDict):
     # Per-field auto-corrections applied by the coherence gate. Each entry:
     # {"old": float, "new": float, "delta": float, "reason": str}.
     coherence_adjustments: dict[str, dict[str, float]]
+
+
+def is_user_locked_assumption(
+    provenance: dict[str, dict[str, Any]],
+    field: str,
+) -> bool:
+    """Return True when HITL/user provenance makes field authoritative."""
+    field_provenance = provenance.get(field) or {}
+    return bool(
+        field_provenance.get("user_edited")
+        or field_provenance.get("approved_by") == "user"
+        or field_provenance.get("source") in {"user_override", "user_provided", "user_edited"}
+    )
 
 
 # ---------------------------------------------------------------------------

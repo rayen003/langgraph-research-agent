@@ -16,8 +16,42 @@ except ImportError:  # LangGraph >=1.0 style
 
 from .activity import emit_step
 from .state import _ASSUMPTION_FIELDS, clip_to_field_range
+from .persistence import persist_approved_assumptions
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_approval(
+    state: dict[str, Any],
+    assumptions: dict[str, Any],
+    provenance: dict[str, Any],
+    *,
+    actor_id: str,
+    decision: str,
+) -> str:
+    if not state.get("workflow_context_version_id"):
+        return ""
+    stored = persist_approved_assumptions(
+        state,
+        assumptions=assumptions,
+        provenance=provenance,
+        actor_id=actor_id,
+        decision=decision,
+    )
+    return str(stored["version_id"])
+
+
+def _mark_user_approved(
+    assumptions: dict[str, Any],
+    provenance: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    approved = dict(provenance)
+    for field in assumptions:
+        prior = dict(approved.get(field) or {})
+        prior["approved_by"] = "user"
+        prior["user_approved"] = True
+        approved[field] = prior
+    return approved
 
 
 def review_assumptions_node(state: dict) -> dict:
@@ -28,7 +62,16 @@ def review_assumptions_node(state: dict) -> dict:
     parent_step_id = state.get("parent_step_id") or "workflow_dcf"
     if not state.get("assumption_review_mode"):
         emit_step("assumption_review", "skipped", parent_step_id)
-        return {"assumptions_approved": True}
+        assumptions = dict(state.get("assumptions", {}))
+        provenance = dict(state.get("assumption_provenance", {}))
+        version_id = _persist_approval(
+            state, assumptions, provenance,
+            actor_id="workflow:dcf", decision="auto_approve",
+        )
+        return {
+            "assumptions_approved": True,
+            "approved_assumptions_version_id": version_id,
+        }
 
     # Build truncated evidence items for HITL payload (text capped at 400 chars)
     raw_items = (state.get("evidence_pack") or {}).get("items", [])
@@ -65,6 +108,7 @@ def review_assumptions_node(state: dict) -> dict:
         "choices": ["approve", "reject", "edit"],
     })
     action = str(decision.get("action") or "approve").lower()
+    actor_id = str(decision.get("actor_id") or "user:hitl")
     if action == "reject":
         emit_step("assumption_review", "rejected", parent_step_id)
         return {"assumptions_approved": False}
@@ -73,7 +117,10 @@ def review_assumptions_node(state: dict) -> dict:
         edits = decision.get("assumptions")
         if isinstance(edits, dict):
             merged = dict(state.get("assumptions", {}))
-            provenance = dict(state.get("assumption_provenance", {}))
+            provenance = _mark_user_approved(
+                merged,
+                dict(state.get("assumption_provenance", {})),
+            )
             for key, value in edits.items():
                 if key not in _ASSUMPTION_FIELDS:
                     continue
@@ -97,14 +144,32 @@ def review_assumptions_node(state: dict) -> dict:
                 "DCF assumption_review edited_assumptions=%s",
                 json.dumps(merged, ensure_ascii=False),
             )
+            version_id = _persist_approval(
+                state, merged, provenance,
+                actor_id=actor_id, decision="edit",
+            )
             return {
                 "assumptions": merged,
                 "assumption_provenance": provenance,
                 "assumptions_approved": True,
+                "approved_assumptions_version_id": version_id,
             }
 
+    assumptions = dict(state.get("assumptions", {}))
+    provenance = _mark_user_approved(
+        assumptions,
+        dict(state.get("assumption_provenance", {})),
+    )
     emit_step("assumption_review", "approved", parent_step_id)
-    return {"assumptions_approved": True}
+    version_id = _persist_approval(
+        state, assumptions, provenance,
+        actor_id=actor_id, decision="approve",
+    )
+    return {
+        "assumption_provenance": provenance,
+        "assumptions_approved": True,
+        "approved_assumptions_version_id": version_id,
+    }
 
 
 def route_after_assumptions(state: dict) -> str:

@@ -143,8 +143,9 @@ def test_approved_rerun_extracts_report_through_real_tool(monkeypatch, tmp_path)
     # summarize is looked up dynamically inside run_dcf_workflow, so patch where
     # the tool resolves it (the dcf package the tool imported it from).
     import agent_project.graphs.workflows.dcf as dcf_pkg
-    monkeypatch.setattr(tools, "run_dcf_workflow_sync", lambda **_kw: {"ticker": "AAPL"})
-    monkeypatch.setattr(tools, "summarize_dcf_payload", lambda _payload: report)
+    runtime_tools = sys.modules[conversational.run_dcf_workflow.func.__module__]
+    monkeypatch.setattr(runtime_tools, "run_dcf_workflow_sync", lambda **_kw: {"ticker": "AAPL"})
+    monkeypatch.setattr(runtime_tools, "summarize_dcf_payload", lambda _payload: report)
     monkeypatch.setattr(dcf_pkg, "summarize_dcf_payload", lambda _payload: report, raising=False)
 
     monkeypatch.setattr(conversational, "chat_agent_llm", _ExplodingLLM())

@@ -8,7 +8,7 @@ from typing import Any
 
 from .activity import emit_step
 from .review_graph import build_deterministic_flags, review_dcf_app
-from .state import DCFState, clip_to_field_range
+from .state import DCFState, clip_to_field_range, is_user_locked_assumption
 from .wacc import clip_wacc_to_profile_band, append_wacc_stack_delta
 
 logger = logging.getLogger(__name__)
@@ -199,6 +199,8 @@ def run_review_subgraph(state: DCFState) -> dict:
 
     base_deltas = adjustments.get("base") or {}
     for field, delta in base_deltas.items():
+        if is_user_locked_assumption(provenance, field):
+            continue
         old = new_assumptions.get(field)
         if old is None:
             continue

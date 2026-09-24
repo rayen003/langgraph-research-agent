@@ -5,11 +5,13 @@ Session-scoped: each session gets its own namespace via metadata filtering.
 Hybrid retrieval: dense (ChromaDB cosine) + sparse (BM25) merged with RRF.
 """
 
+import asyncio
 import contextvars
 import io
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -99,6 +101,12 @@ def get_upload_path(doc_id: str, filename: str) -> Path:
     folder = UPLOADS_DIR / doc_id
     folder.mkdir(parents=True, exist_ok=True)
     return folder / safe_name
+
+
+def _structured_doc_path(doc_id: str) -> Path:
+    folder = UPLOADS_DIR / doc_id
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "structured.json"
 
 _chroma_client: chromadb.ClientAPI | None = None
 _chroma_checked = False
@@ -448,21 +456,207 @@ _backfill_document_metadata_from_chroma()
 # ---------------------------------------------------------------------------
 
 
+def _clean_table_cell(value: Any) -> str:
+    return " ".join(str(value or "").replace("\n", " ").split()).strip()
+
+
+def _is_numeric_heavy(row: list[str]) -> bool:
+    if not row:
+        return False
+    numeric = 0
+    for cell in row:
+        value = cell.strip().replace(",", "")
+        if value.endswith(("%", "bn", "mn", "m")):
+            value = value.rstrip("%").removesuffix("bn").removesuffix("mn").removesuffix("m")
+        try:
+            float(value)
+            numeric += 1
+        except ValueError:
+            pass
+    return numeric >= max(1, len(row) // 2)
+
+
+def _starts_with_numeric_signal(cell: str) -> bool:
+    return bool(re.match(r"^\s*[-+]?\d[\d,.]*(?:%|bn|mn|m|x)?\b", cell, re.IGNORECASE))
+
+
+def _word_count(cell: str) -> int:
+    return len(re.findall(r"[A-Za-z][A-Za-z&-]*", cell))
+
+
+def _looks_like_slide_card_grid(headers: list[str], body: list[list[str]]) -> bool:
+    """Reject visual card grids pdfplumber often mistakes for tables."""
+    if len(headers) < 3 or len(body) < 2:
+        return False
+
+    header_numeric_signals = sum(1 for cell in headers if _starts_with_numeric_signal(cell))
+    header_word_counts = [_word_count(cell) for cell in headers if cell]
+    avg_header_words = sum(header_word_counts) / max(1, len(header_word_counts))
+
+    body_cells = [cell for row in body for cell in row if cell]
+    long_body_cells = sum(1 for cell in body_cells if _word_count(cell) >= 5)
+
+    return (
+        header_numeric_signals >= max(2, len(headers) // 2)
+        and avg_header_words >= 3
+        and long_body_cells >= max(2, len(body_cells) // 3)
+    )
+
+
+def _normalize_table(raw_table: list[list[Any]], *, page: int, table_index: int, bbox: list[float] | None = None) -> dict | None:
+    """Clean pdfplumber table output into headers + rows."""
+    rows = [[_clean_table_cell(cell) for cell in row] for row in raw_table if row]
+    rows = [row for row in rows if any(row)]
+    if not rows:
+        return None
+
+    max_cols = max(len(row) for row in rows)
+    padded = [row + [""] * (max_cols - len(row)) for row in rows]
+
+    # Drop columns that are empty across the whole table.
+    keep_cols = [
+        idx for idx in range(max_cols)
+        if any((row[idx] or "").strip() for row in padded)
+    ]
+    if not keep_cols:
+        return None
+    padded = [[row[idx] for idx in keep_cols] for row in padded]
+
+    first = padded[0]
+    if _is_numeric_heavy(first):
+        headers = [f"Column {idx + 1}" for idx in range(len(first))]
+        body = padded
+    else:
+        headers = [cell or f"Column {idx + 1}" for idx, cell in enumerate(first)]
+        body = padded[1:]
+
+    body = [row for row in body if any(row)]
+    if not body:
+        return None
+    if _looks_like_slide_card_grid(headers, body):
+        return None
+
+    return {
+        "table_id": f"p{page}_t{table_index}",
+        "page": page,
+        "table_index": table_index,
+        "caption": "",
+        "headers": headers,
+        "rows": body,
+        "bbox": bbox,
+        "confidence": 0.8,
+    }
+
+
+def _table_to_text(table: dict) -> str:
+    headers = " | ".join(str(c) for c in table.get("headers", []))
+    rows = [" | ".join(str(c) for c in row) for row in table.get("rows", [])]
+    parts = [f"[TABLE: {table.get('table_id', '')}]"]
+    if table.get("caption"):
+        parts.append(str(table["caption"]))
+    if headers:
+        parts.append(headers)
+    parts.extend(rows)
+    parts.append("[/TABLE]")
+    return "\n".join(parts)
+
+
+def _attach_table_ids(doc_id: str, pages: list[dict]) -> None:
+    for page in pages:
+        for table in page.get("tables") or []:
+            page_num = table.get("page") or page.get("page")
+            table_index = table.get("table_index", 0)
+            table["table_id"] = f"{doc_id}_p{page_num}_t{table_index}"
+
+
+def _write_structured_doc(doc_id: str, filename: str, pages: list[dict]) -> None:
+    tables = []
+    structured_pages = []
+    for page in pages:
+        page_tables = page.get("tables") or []
+        tables.extend(page_tables)
+        structured_pages.append({
+            "page": page.get("page"),
+            "text": page.get("text", ""),
+            "table_ids": [t.get("table_id") for t in page_tables if t.get("table_id")],
+        })
+    payload = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "pages": structured_pages,
+        "tables": tables,
+    }
+    _structured_doc_path(doc_id).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_structured_doc(doc_id: str) -> dict[str, Any] | None:
+    path = _structured_doc_path(doc_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to load structured document sidecar for %s", doc_id, exc_info=True)
+        return None
+
+
+def _citation_tables(doc_id: str, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    structured = _load_structured_doc(doc_id)
+    if not structured:
+        return []
+    tables = structured.get("tables") or []
+    if not isinstance(tables, list):
+        return []
+
+    table_ids_raw = str(meta.get("table_ids") or "")
+    table_ids = {part.strip() for part in table_ids_raw.split(",") if part.strip()}
+    if table_ids:
+        selected = [t for t in tables if isinstance(t, dict) and t.get("table_id") in table_ids]
+        if selected:
+            return selected
+
+    page = meta.get("page")
+    return [
+        t for t in tables
+        if isinstance(t, dict) and str(t.get("page")) == str(page)
+    ]
+
+
 def _parse_pdf(file_bytes: bytes) -> list[dict]:
     import pdfplumber
     pages = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
+            page_num = i + 1
             text = page.extract_text() or ""
-            tables = page.extract_tables() or []
-            for table in tables:
-                if not table:
-                    continue
-                rows = [" | ".join(str(c or "").strip() for c in row) for row in table if row]
-                if rows:
-                    text += "\n[TABLE]\n" + "\n".join(rows) + "\n[/TABLE]"
+            table_objs: list[dict] = []
+            try:
+                found_tables = page.find_tables() or []
+            except Exception:  # noqa: BLE001
+                found_tables = []
+            if found_tables:
+                for table_index, table in enumerate(found_tables):
+                    try:
+                        raw = table.extract() or []
+                    except Exception:  # noqa: BLE001
+                        raw = []
+                    normalized = _normalize_table(
+                        raw,
+                        page=page_num,
+                        table_index=table_index,
+                        bbox=[float(v) for v in getattr(table, "bbox", [])] if getattr(table, "bbox", None) else None,
+                    )
+                    if normalized:
+                        table_objs.append(normalized)
+            else:
+                for table_index, raw in enumerate(page.extract_tables() or []):
+                    normalized = _normalize_table(raw, page=page_num, table_index=table_index)
+                    if normalized:
+                        table_objs.append(normalized)
+            for table in table_objs:
+                text += "\n" + _table_to_text(table)
             if text.strip():
-                pages.append({"text": text, "page": i + 1})
+                pages.append({"text": text, "page": page_num, "tables": table_objs})
     return pages
 
 
@@ -534,13 +728,19 @@ _splitter = RecursiveCharacterTextSplitter(
 def _chunk_pages(pages: list[dict]) -> list[dict]:
     chunks = []
     for page in pages:
+        table_ids = [t.get("table_id") for t in page.get("tables", []) if t.get("table_id")]
         # Don't split table blocks — keep them intact
         if "[TABLE]" in page["text"] or "[SHEET:" in page["text"] or "[TABLE:" in page["text"]:
-            chunks.append({**page, "chunk_index": 0})
+            chunks.append({**page, "chunk_index": 0, "table_ids": table_ids})
             continue
         texts = _splitter.split_text(page["text"])
         for j, text in enumerate(texts):
-            chunks.append({"text": text, "page": page["page"], "chunk_index": j})
+            chunks.append({
+                "text": text,
+                "page": page["page"],
+                "chunk_index": j,
+                "table_ids": table_ids,
+            })
     return chunks
 
 
@@ -564,6 +764,9 @@ def _upsert_chunks(
             "session_id": session_id,
             "chunk_index": i,
         }
+        table_ids = chunk.get("table_ids") or []
+        if table_ids:
+            meta["table_ids"] = ",".join(str(t) for t in table_ids if t)
         # Attach document-level entity metadata to every chunk
         if entity_meta:
             meta["doc_company"] = entity_meta.get("company") or ""
@@ -622,6 +825,8 @@ def _index_file_into_chroma(
     pages = _parse_file(file_bytes, filename)
     if not pages:
         return 0
+    _attach_table_ids(doc_id, pages)
+    _write_structured_doc(doc_id, filename, pages)
     chunks = _chunk_pages(pages)
     col = collection or _get_collection()
     # Extract entity metadata from first few chunks if not already provided
@@ -703,6 +908,8 @@ def ingest_document(file_bytes: bytes, filename: str, session_id: str, doc_id: s
                 error="No text could be extracted from the file.",
             )
             return
+        _attach_table_ids(doc_id, pages)
+        _write_structured_doc(doc_id, filename, pages)
 
         # ── chunking ────────────────────────────────────────────────────────
         _update_doc(doc_id, stage="chunking")
@@ -833,7 +1040,103 @@ def delete_document(doc_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def hybrid_search(query: str, session_id: str, n_results: int = 8) -> list[dict]:
+def _make_doc_citation_id(meta: dict[str, Any], fallback_chunk_id: int | None = None) -> str:
+    """Stable citation marker for one uploaded-document chunk."""
+    doc_id = str(meta.get("doc_id") or "unknown")
+    page = meta.get("page")
+    chunk = meta.get("chunk_index", fallback_chunk_id)
+    page_part = str(page) if page is not None else "?"
+    chunk_part = str(chunk) if chunk is not None else "?"
+    return f"doc:{doc_id}:p{page_part}:c{chunk_part}"
+
+
+def _make_doc_citation_label(meta: dict[str, Any]) -> str:
+    filename = str(meta.get("filename") or "unknown")
+    page = meta.get("page")
+    page_label = f" p.{page}" if page is not None else ""
+    return f"{filename}{page_label}"
+
+
+def _parse_doc_citation_id(citation_id: str) -> dict[str, str | int]:
+    """Parse doc citation id: doc:{doc_id}:p{page}:c{chunk_index}."""
+    import re
+
+    match = re.fullmatch(r"doc:([^:]+):p([^:]+):c([^:]+)", citation_id or "")
+    if not match:
+        raise ValueError(f"Invalid document citation id: {citation_id}")
+    doc_id, page_raw, chunk_raw = match.groups()
+    try:
+        chunk_index = int(chunk_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid document citation chunk: {citation_id}") from exc
+    return {
+        "doc_id": doc_id,
+        "page": page_raw,
+        "chunk_index": chunk_index,
+    }
+
+
+def get_document_citation(citation_id: str) -> dict[str, Any]:
+    """Return source text and metadata for one uploaded-document citation."""
+    parsed = _parse_doc_citation_id(citation_id)
+    doc_id = str(parsed["doc_id"])
+    chunk_index = int(parsed["chunk_index"])
+
+    entry = get_doc_status(doc_id)
+    if not entry:
+        raise KeyError(f"Document '{doc_id}' not found")
+
+    collection = _get_collection()
+    result = collection.get(
+        where={"doc_id": doc_id},
+        include=["documents", "metadatas"],
+        limit=2000,
+    )
+    docs = result.get("documents", []) or []
+    metas = result.get("metadatas", []) or []
+    paired = [(doc, meta or {}) for doc, meta in zip(docs, metas)]
+    paired.sort(key=lambda p: int(p[1].get("chunk_index", 0) or 0))
+
+    target_pos = None
+    for i, (_doc, meta) in enumerate(paired):
+        try:
+            current = int(meta.get("chunk_index", -1))
+        except (TypeError, ValueError):
+            current = -1
+        if current == chunk_index:
+            target_pos = i
+            break
+    if target_pos is None:
+        raise KeyError(f"Citation chunk '{citation_id}' not found")
+
+    text, meta = paired[target_pos]
+    prev_text = paired[target_pos - 1][0] if target_pos > 0 else ""
+    next_text = paired[target_pos + 1][0] if target_pos + 1 < len(paired) else ""
+    return {
+        "citation_id": citation_id,
+        "doc_id": doc_id,
+        "document_version_id": f"{doc_id}:v1",
+        "filename": entry.get("filename") or meta.get("filename") or "document",
+        "page": meta.get("page"),
+        "chunk_index": chunk_index,
+        "citation_label": _make_doc_citation_label(meta),
+        "company": meta.get("doc_company") or entry.get("company") or "",
+        "ticker": meta.get("doc_ticker") or entry.get("ticker") or "",
+        "doc_type": meta.get("doc_type") or entry.get("doc_type") or "",
+        "fiscal_period": meta.get("fiscal_period") or entry.get("fiscal_period") or "",
+        "text": text or "",
+        "previous_text": prev_text or "",
+        "next_text": next_text or "",
+        "tables": _citation_tables(doc_id, meta),
+    }
+
+
+def hybrid_search(
+    query: str,
+    session_id: str,
+    n_results: int = 8,
+    doc_ids: list[str] | None = None,
+) -> list[dict]:
     _rag_emit("retrieve", "start", f"“{query[:50]}”")
     collection = _get_collection()
     total = collection.count()
@@ -850,7 +1153,8 @@ def hybrid_search(query: str, session_id: str, n_results: int = 8) -> list[dict]
     # ── Dense vector search (embeds query + ANN over chunk vectors) ─────────
     _rag_console("🔍", "Hybrid search", f"query=[cyan]{query[:80]}[/cyan]", style="blue")
     _rag_emit("embed_query", "start")
-    k = min(20, total)
+    selected_doc_ids = {str(doc_id) for doc_id in (doc_ids or []) if doc_id}
+    k = min(max(20, n_results * max(1, len(selected_doc_ids)) * 4), total)
     try:
         dense = collection.query(
             query_texts=[query],
@@ -862,7 +1166,7 @@ def hybrid_search(query: str, session_id: str, n_results: int = 8) -> list[dict]
         if _is_chroma_repairable(exc) and not _chroma_resetting:
             _reset_chroma_store(str(exc))
             if _chroma_checked:
-                return hybrid_search(query, session_id, n_results)
+                return hybrid_search(query, session_id, n_results, doc_ids=doc_ids)
         logger.exception("Chroma query failed for session=%s query=%r", session_id, query)
         _rag_emit("retrieve", "complete", "Search failed")
         return []
@@ -907,6 +1211,11 @@ def hybrid_search(query: str, session_id: str, n_results: int = 8) -> list[dict]
     _rag_emit("fuse", "start")
     top = sorted(combined, key=lambda i: combined[i], reverse=True)[:n_results]
     out = [{"text": docs[i], "metadata": metas[i]} for i in top]
+    if selected_doc_ids:
+        out = [
+            item for item in out
+            if str((item.get("metadata") or {}).get("doc_id") or "") in selected_doc_ids
+        ][:n_results]
     _rag_emit("fuse", "complete", f"{len(out)} best passages")
     _rag_emit("retrieve", "complete", f"Found {len(out)} relevant passage" + ("s" if len(out)!=1 else ""))
     _rag_console("  🔀", "RRF fusion", f"{len(out)} passages selected", style="cyan")
@@ -1266,6 +1575,47 @@ def extract_and_ingest_facts(
 
     # Ingest through the unified pipeline
     results = ingest_facts(document_facts, session_id=session_id)
+    try:
+        from evidence_memory import persist_financial_fact  # noqa: PLC0415
+
+        for fact, result in zip(document_facts, results):
+            evidence_refs = []
+            needle = " ".join((fact.value_text or "").lower().split())
+            for fallback_index, (chunk_text, metadata) in enumerate(paired):
+                normalized_chunk = " ".join((chunk_text or "").lower().split())
+                if needle and needle not in normalized_chunk:
+                    continue
+                metadata = metadata or {}
+                citation_id = _make_doc_citation_id(metadata, fallback_index)
+                evidence_refs.append({
+                    "evidence_id": citation_id,
+                    "document_id": doc_id,
+                    "document_version_id": f"{doc_id}:v1",
+                    "citation_id": citation_id,
+                    "filename": filename,
+                    "page": metadata.get("page"),
+                    "chunk_index": metadata.get("chunk_index", fallback_index),
+                    "text_span": fact.value_text or str(chunk_text or "")[:500],
+                })
+                break
+            result_status = getattr(result.status, "value", str(result.status))
+            fact_status = "disputed" if result_status == "contradiction" else (
+                "verified" if result_status == "accepted" and fact.confidence >= 0.85 else "extracted"
+            )
+            persist_financial_fact(
+                session_id=session_id,
+                thread_id=None,
+                subject_id=fact.ticker,
+                predicate=fact.field,
+                value=fact.value,
+                value_text=fact.value_text,
+                fiscal_period=fact.fiscal_period,
+                confidence=fact.confidence,
+                fact_status=fact_status,
+                evidence_refs=evidence_refs,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Durable fact persistence failed for %s: %s", doc_id, exc)
     _rag_console(
         "📊", "Facts → KG",
         f"{len(results)} facts: "
@@ -1330,6 +1680,8 @@ def _classify_rag_results(
         meta = r.get("metadata", {})
         chunks_summary.append({
             "chunk_id": i,
+            "citation_id": _make_doc_citation_id(meta, i),
+            "citation_label": _make_doc_citation_label(meta),
             "source": meta.get("filename", "unknown"),
             "company": meta.get("doc_company"),
             "ticker": meta.get("doc_ticker"),
@@ -1413,6 +1765,8 @@ def _classify_rag_results(
             text = text[:2000] + "…"
         chunks_out.append({
             "chunk_id": cid,
+            "citation_id": _make_doc_citation_id(meta, cid),
+            "citation_label": _make_doc_citation_label(meta),
             "source": meta.get("filename", "unknown"),
             "page": meta.get("page"),
             "company": meta.get("doc_company") or "",
@@ -1442,12 +1796,13 @@ def _make_search_documents_tool():
             skip_gate: set True to skip the relevance-classification gate model
                 (1-2s LLM call). Use when you already know what's in the docs
                 from prior turns and don't need the gate's mismatch detection.
-                When True, returns raw chunk_ids that you can fetch with
-                retrieve_tool_result.
+                When True, returns inline chunks without the gate call.
 
         Returns a relevance verdict. The relevant passages are INLINE in the
-        `chunks` array (each has full `text` + source/page/ticker) — read them
-        directly, there is no separate fetch step.
+        `chunks` array (each has full `text`, `citation_id`, `citation_label`,
+        source/page/ticker) — read them directly, there is no separate fetch
+        step. When answering from uploaded documents, cite claims inline with
+        the exact `citation_id`, for example [doc:doc_abc:p12:c4].
         - status 'relevant': all needed content found → answer from `chunks`
         - status 'partial': docs cover some topics; `missing` lists the rest → use `chunks` + search_web for the gaps
         - status 'mismatch': docs are about different entities than the query → tell the user about the discrepancy and ask for clarification
@@ -1492,6 +1847,8 @@ def _make_search_documents_tool():
                     text = text[:2000] + "…"
                 chunk_summaries.append({
                     "chunk_id": i,
+                    "citation_id": _make_doc_citation_id(meta, i),
+                    "citation_label": _make_doc_citation_label(meta),
                     "source": meta.get("filename", "unknown"),
                     "company": meta.get("doc_company") or "",
                     "ticker": meta.get("doc_ticker") or "",
@@ -1524,3 +1881,28 @@ def _make_search_documents_tool():
 
 
 search_documents = _make_search_documents_tool()
+
+
+async def _search_documents_async(query: str, skip_gate: bool = False) -> str:
+    from tool_runtime import write_tool_progress  # local import avoids startup cycle
+
+    write_tool_progress(
+        "Searching indexed documents",
+        partial={"query": query, "skip_gate": skip_gate},
+    )
+    result = await asyncio.to_thread(search_documents.func, query, skip_gate)
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    write_tool_progress(
+        str(payload.get("message") or "Document retrieval completed"),
+        partial={
+            "status": payload.get("status"),
+            "chunk_count": len(payload.get("chunks") or []),
+        },
+    )
+    return result
+
+
+search_documents.coroutine = _search_documents_async

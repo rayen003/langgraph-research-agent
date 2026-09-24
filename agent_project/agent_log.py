@@ -109,6 +109,40 @@ def intent_classified(intent: str, mode: str, dur: float | None = None) -> None:
     _console.print(f"{ts}  {b}  → {label}  {mode_str}{d}")
 
 
+def route_selected(
+    *,
+    level: str,
+    playbook_id: str | None,
+    outputs: list[str],
+    max_tool_calls: int,
+    reason: str,
+) -> None:
+    """Log semantic routing fields needed to reproduce a run."""
+    _row(
+        0,
+        "ROUTE",
+        "bold magenta",
+        f"level={level}  playbook={playbook_id or 'base'}  "
+        f"outputs={','.join(outputs) or 'answer'}  budget={max_tool_calls}  "
+        f"[dim]{_clip(reason, 72)}[/dim]",
+    )
+
+
+def playbook_loaded(playbook_id: str, kind: str | None, allowed_tools: int, max_tool_calls: int) -> None:
+    """Log effective runtime policy, not raw playbook source."""
+    _row(
+        0,
+        "PLAYBOOK",
+        "bold blue",
+        f"id={playbook_id}  kind={kind or 'base'}  tools={allowed_tools}  budget={max_tool_calls}",
+    )
+
+
+def artifact_created(path: str, *, source_tool: str) -> None:
+    """Log persisted artifact path after middleware confirms it."""
+    _row(1, "ARTIFACT", "bold green", f"{source_tool}  [dim]{path}[/dim]")
+
+
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 def chat_start() -> float:

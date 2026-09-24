@@ -85,6 +85,19 @@ def finalize_node(state: dict) -> dict:
         pptx_path=pptx_path,
         dcf_run_id=dcf_run_id,
     )
+    persistence_state = {**state, "deck_run_id": deck_run_id}
+    from .persistence import persist_deck_result  # noqa: PLC0415
+
+    result_object = persist_deck_result(
+        persistence_state,
+        payload=payload,
+        deck_output_path=deck_output_path,
+    )
+    payload["deck_context_version_id"] = state.get("deck_context_version_id")
+    payload["approved_outline_version_id"] = state.get("approved_outline_version_id")
+    payload["result_version_id"] = result_object["version_id"]
+    payload["deck_output_path"] = str(deck_output_path)
+    deck_output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     summary_line = f"Deck written: {Path(pptx_path).name if pptx_path else 'n/a'} ({len(slides)} slides)"
     emit_step("finalize_deck", "complete", parent_step_id, {
@@ -112,6 +125,7 @@ def finalize_node(state: dict) -> dict:
     return {
         "deck_output_path": str(deck_output_path),
         "deck_run_id": deck_run_id,
+        "result_version_id": result_object["version_id"],
     }
 
 

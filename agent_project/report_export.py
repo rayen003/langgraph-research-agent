@@ -81,7 +81,11 @@ def _md_inline_to_reportlab(text: str) -> str:
         text,
     )
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"_(.+?)_", r"<i>\1</i>", text)
+    # Only treat underscores as emphasis delimiters when they are not part of
+    # identifiers like fcff_margin, revenue_growth, or tax_rate. ReportLab's
+    # paragraph parser is strict XML-ish markup; converting snake_case into
+    # nested <i> tags can break surrounding <b> tags.
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)
     return text
 
 

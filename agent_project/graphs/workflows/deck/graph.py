@@ -21,11 +21,12 @@ import json
 import logging
 from typing import Any
 
-from langgraph.checkpoint.memory import MemorySaver
+from checkpointing import durable_checkpointer
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 
 from utils import get_run_dir
+from tracing import traced_node
 
 from .assemble import assemble_pptx_node
 from .finalize import finalize_node
@@ -49,13 +50,13 @@ __all__ = [
 
 _graph = StateGraph(DeckState)
 
-_graph.add_node("validate_sources", validate_sources_node)
-_graph.add_node("normalize_all", normalize_all_node)
-_graph.add_node("generate_outline", generate_outline_node)
-_graph.add_node("outline_review", outline_review_node)
-_graph.add_node("per_slide_generate", per_slide_generate_node)
-_graph.add_node("assemble_pptx", assemble_pptx_node)
-_graph.add_node("finalize_deck", finalize_node)
+_graph.add_node("validate_sources", traced_node("deck.validate_sources", validate_sources_node))
+_graph.add_node("normalize_all", traced_node("deck.normalize_all", normalize_all_node))
+_graph.add_node("generate_outline", traced_node("deck.generate_outline", generate_outline_node))
+_graph.add_node("outline_review", traced_node("deck.outline_review", outline_review_node))
+_graph.add_node("per_slide_generate", traced_node("deck.per_slide_generate", per_slide_generate_node))
+_graph.add_node("assemble_pptx", traced_node("deck.assemble_pptx", assemble_pptx_node))
+_graph.add_node("finalize_deck", traced_node("deck.finalize", finalize_node))
 
 _graph.add_edge(START, "validate_sources")
 _graph.add_edge("validate_sources", "normalize_all")
@@ -70,7 +71,7 @@ _graph.add_edge("per_slide_generate", "assemble_pptx")
 _graph.add_edge("assemble_pptx", "finalize_deck")
 _graph.add_edge("finalize_deck", END)
 
-deck_workflow_app = _graph.compile(checkpointer=MemorySaver())
+deck_workflow_app = _graph.compile(checkpointer=durable_checkpointer("deck_workflow"))
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,10 @@ def _build_initial_state(
         raise TypeError(f"brief must be dict or DeckBrief, got {type(brief).__name__}")
 
     return {
+        "thread_id": get_run_dir().name,
+        "deck_context_version_id": None,
+        "approved_outline_version_id": None,
+        "result_version_id": None,
         "sources": source_dicts,
         "brief": brief_dict,
         "blocks": [],
@@ -148,6 +153,10 @@ def run_deck_workflow_sync(
         session_id=session_id,
         parent_step_id=parent_step_id,
     )
+    from .persistence import persist_deck_context  # noqa: PLC0415
+
+    context_object = persist_deck_context(initial_state)
+    initial_state["deck_context_version_id"] = context_object["version_id"]
     config = {"configurable": {"thread_id": f"{get_run_dir().name}_deck"}}
 
     try:
@@ -198,6 +207,7 @@ def _build_hitl_envelope_from_exc(gi: GraphInterrupt) -> dict:
         "outline": payload.get("outline", {}),
         "blocks_preview": payload.get("blocks_preview", []),
         "hitl_mode": payload.get("hitl_mode"),
+        "deck_context_version_id": payload.get("deck_context_version_id"),
         "message": (
             "Deck outline ready for review. Present these slides to the user "
             "for approve/reject/edit. Resume with Command(resume={'action':'approve'})"
@@ -234,6 +244,7 @@ def _build_hitl_envelope_from_state(result: dict, graph_state: Any) -> dict:
         "outline": outline,
         "blocks_preview": blocks_preview,
         "hitl_mode": hitl_mode,
+        "deck_context_version_id": result.get("deck_context_version_id"),
         "message": (
             "Deck outline ready for review. Present these slides to the user "
             "for approve/reject/edit. Resume with Command(resume={'action':'approve'})"

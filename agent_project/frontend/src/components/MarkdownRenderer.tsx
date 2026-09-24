@@ -6,6 +6,51 @@ import type { Components } from 'react-markdown'
 // Track list nesting depth so we can style top-level vs nested items differently
 const ListDepthCtx = createContext(0)
 
+function docCitationLabel(citationId: string): string {
+  const match = citationId.match(/^doc:([^:]+):p([^:]+):c([^:]+)$/)
+  if (!match) return 'doc'
+  const page = match[2]
+  return page && page !== '?' ? `doc p.${page}` : 'doc'
+}
+
+function linkifyDocCitations(content: string): string {
+  return content.replace(/\[(doc:[^\]\s]+)\]/g, (_match, citationId: string) => {
+    const label = docCitationLabel(citationId)
+    return `[${label}](#doc-citation-${encodeURIComponent(citationId)})`
+  })
+}
+
+function DocCitationPill({
+  href,
+  children,
+  onClick,
+}: {
+  href?: string
+  children: React.ReactNode
+  onClick?: (citationId: string) => void
+}) {
+  const raw = String(href ?? '').replace(/^#doc-citation-/, '')
+  const citationId = decodeURIComponent(raw)
+  const className = "mx-0.5 inline-flex translate-y-[-1px] items-center rounded border border-indigo-500/30 bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-indigo-200"
+  return onClick ? (
+    <button
+      type="button"
+      onClick={() => onClick(citationId)}
+      title={citationId}
+      className={`${className} hover:border-indigo-400/60 hover:bg-indigo-500/20 hover:text-indigo-100`}
+    >
+      [{children}]
+    </button>
+  ) : (
+    <span
+      title={citationId}
+      className={className}
+    >
+      [{children}]
+    </span>
+  )
+}
+
 const components: Components = {
   // ── Headings ──────────────────────────────────────────────────────────────
   h1: ({ children }) => (
@@ -142,31 +187,37 @@ const components: Components = {
   hr: () => (
     <hr className="my-6 border-none h-px bg-surface-3" />
   ),
-  a: ({ href, children }) => (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="text-indigo-400 hover:text-indigo-300 underline underline-offset-2 decoration-indigo-500/30 transition-colors"
-    >
-      {children}
-    </a>
-  ),
+  a: ({ href, children }) => {
+    if (String(href ?? '').startsWith('#doc-citation-')) {
+      return <DocCitationPill href={href}>{children}</DocCitationPill>
+    }
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-indigo-400 hover:text-indigo-300 underline underline-offset-2 decoration-indigo-500/30 transition-colors"
+      >
+        {children}
+      </a>
+    )
+  },
 }
 
 interface Props {
   content: string
   streaming?: boolean
   onCitationClick?: (citationNumber: string) => void
+  onDocCitationClick?: (citationId: string) => void
 }
 
-export function MarkdownRenderer({ content, streaming = false, onCitationClick }: Props) {
-  const activeComponents: Components = onCitationClick
+export function MarkdownRenderer({ content, streaming = false, onCitationClick, onDocCitationClick }: Props) {
+  const activeComponents: Components = (onCitationClick || onDocCitationClick)
     ? {
         ...components,
         a: ({ href, children }) => {
           const match = String(href ?? '').match(/^#source-(\d+)$/)
-          if (match) {
+          if (match && onCitationClick) {
             return (
               <button
                 type="button"
@@ -176,6 +227,9 @@ export function MarkdownRenderer({ content, streaming = false, onCitationClick }
                 {children}
               </button>
             )
+          }
+          if (String(href ?? '').startsWith('#doc-citation-')) {
+            return <DocCitationPill href={href} onClick={onDocCitationClick}>{children}</DocCitationPill>
           }
           return (
             <a
@@ -194,7 +248,7 @@ export function MarkdownRenderer({ content, streaming = false, onCitationClick }
   return (
     <div className="min-w-0">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={activeComponents}>
-        {content}
+        {linkifyDocCitations(content)}
       </ReactMarkdown>
       {streaming && (
         <span className="inline-block w-0.5 h-[1.1em] bg-zinc-400 animate-blink align-middle ml-0.5 translate-y-px" />
