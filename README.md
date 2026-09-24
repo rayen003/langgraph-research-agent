@@ -57,6 +57,10 @@ LangGraph-based finance research workspace. Its most developed workflow is **DCF
 | Frontend | Vite + React + TypeScript + Tailwind |
 | Package mgr | `uv` |
 
+![AAPL historical price-series example](apple_stock_price_evolution.png)
+
+*Illustrative historical-price chart included in the repository. It is not a forecast, trading strategy, or measure of the agent's valuation accuracy.*
+
 ---
 
 <details>
@@ -103,13 +107,12 @@ KG ingestion, rendering, and audit hardening — driven by real upload/DCF sessi
 ```bash
 # from repo root
 uv sync
-cp agent_project/.env.example agent_project/.env  # fill in OPENAI_API_KEY, EXA_API_KEY, FMP_API_KEY
-./start.sh
-# backend  → http://localhost:8080
-# frontend → http://localhost:5174
+# Set OPENAI_API_KEY, EXA_API_KEY, and FMP_API_KEY in your environment
+# or in the ignored agent_project/.env file (see Configuration).
+./start.sh --no-kill
 ```
 
-`start.sh` kills stale processes on ports 8080 + 5174-5178, clears `__pycache__`, then launches uvicorn + Vite with coloured logs and graceful shutdown.
+The launcher prints the selected local URLs. With `--no-kill`, it leaves existing processes alone and chooses free ports from its configured ranges.
 
 To run a DCF programmatically:
 
